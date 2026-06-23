@@ -406,9 +406,12 @@ impl RequestForwarder {
         for provider in providers.iter() {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
-            let mut rectifier_retried = false;
-            let mut budget_rectifier_retried = false;
-            let mut media_rectifier_retried = false;
+           let mut rectifier_retried = false;
+           let mut budget_rectifier_retried = false;
+           let mut media_rectifier_retried = false;
+            // 同供应商超时重试计数器：首包超时通常是瞬时网络问题，最多重试 3 次
+            let mut timeout_retries = 0u32;
+            const MAX_TIMEOUT_RETRIES: u32 = 3;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
@@ -1053,14 +1056,112 @@ impl RequestForwarder {
                                 providers.len(),
                                 &e,
                             );
-                            log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+                           log::warn!("[{app_type_str}] [{log_code}] {log_message}");
 
-                           last_error = Some(e);
-                           last_provider = Some(provider.clone());
-                           // 继续尝试下一个供应商
-                           continue;
-                       }
-                        ErrorCategory::FailoverNeutral => {
+                           // 首包超时通常是瞬时网络问题，重试同一供应商最多 3 次
+                           while timeout_retries < MAX_TIMEOUT_RETRIES && matches!(e, ProxyError::Timeout(_)) {
+                               timeout_retries += 1;
+                               log::info!(
+                                   "[{app_type_str}] [FWD-011] 首包超时，重试同一供应商 {} (第 {}/{})",
+                                   provider.name, timeout_retries, MAX_TIMEOUT_RETRIES
+                               );
+
+                               // 释放当前 permit（避免 HalfOpen 名额泄漏）
+                               self.router
+                                   .release_permit_neutral(
+                                       &provider.id,
+                                       app_type_str,
+                                       used_half_open_permit,
+                                   )
+                                   .await;
+
+                               match self
+                                   .forward(
+                                       app_type,
+                                       &method,
+                                       provider,
+                                       endpoint,
+                                       &provider_body,
+                                       &headers,
+                                       &extensions,
+                                       adapter.as_ref(),
+                                   )
+                                   .await
+                               {
+                                   Ok((
+                                       response,
+                                       claude_api_format,
+                                       outbound_model,
+                                       codex_responses_to_chat,
+                                       codex_chat_to_responses,
+                                   )) => {
+                                       log::info!(
+                                           "[{app_type_str}] [FWD-012] 超时重试成功: {}",
+                                           provider.name
+                                       );
+                                       self.record_success_result(
+                                           &provider.id,
+                                           app_type_str,
+                                           false,
+                                       )
+                                       .await;
+
+                                       {
+                                           let mut current_providers =
+                                               self.current_providers.write().await;
+                                           current_providers.insert(
+                                               app_type_str.to_string(),
+                                               (provider.id.clone(), provider.name.clone()),
+                                           );
+                                       }
+
+                                       {
+                                           let mut status = self.status.write().await;
+                                           status.success_requests += 1;
+                                           status.last_error = None;
+                                       }
+
+                                       return Ok(ForwardResult {
+                                           response,
+                                           provider: provider.clone(),
+                                           claude_api_format,
+                                           outbound_model,
+                                           codex_responses_to_chat,
+                                           codex_chat_to_responses,
+                                           connection_guard: None,
+                                       });
+                                   }
+                                   Err(retry_err) => {
+                                       log::warn!(
+                                           "[{app_type_str}] [FWD-013] 超时重试第 {} 次仍失败: {retry_err}",
+                                           timeout_retries
+                                       );
+                                       if !matches!(retry_err, ProxyError::Timeout(_)) {
+                                           last_error = Some(retry_err);
+                                           last_provider = Some(provider.clone());
+                                           break;
+                                       }
+                                   }
+                               }
+                           }
+
+                           // 超时重试已执行：last_error 已在循环内设置（非超时错误）或需回退到原始错误
+                           if timeout_retries > 0 {
+                               if last_error.is_none() {
+                                   last_error = Some(e);
+                               }
+                               if last_provider.is_none() {
+                                   last_provider = Some(provider.clone());
+                               }
+                               continue;
+                           }
+
+                            last_error = Some(e);
+                            last_provider = Some(provider.clone());
+                            // 继续尝试下一个供应商
+                            continue;
+                        }
+                       ErrorCategory::FailoverNeutral => {
                             // 模型/端点级错误（如 404）：触发故障转移到下一家供应商，
                             // 但不污染熔断器健康度——该供应商对其他模型/端点可能完全正常。
                             self.router
