@@ -2088,15 +2088,17 @@ mod tests {
 
         // testConfig 启用并覆盖部分字段
         let mut p2 = make_provider(serde_json::json!({}));
-        p2.meta = Some(ProviderMeta {
-            test_config: Some(ProviderTestConfig {
-                enabled: true,
-                timeout_secs: Some(20),
-                degraded_threshold_ms: Some(3000),
-                max_retries: None,
-            }),
-            ..Default::default()
-        });
+       p2.meta = Some(ProviderMeta {
+           test_config: Some(ProviderTestConfig {
+               enabled: true,
+               timeout_secs: Some(20),
+               degraded_threshold_ms: Some(3000),
+               max_retries: None,
+               test_prompt: None,
+               test_model: None,
+           }),
+           ..Default::default()
+       });
         let merged2 = StreamCheckService::merge_provider_config(&p2, &global);
         assert_eq!(merged2.timeout_secs, 20);
         assert_eq!(merged2.degraded_threshold_ms, 3000);
@@ -2104,15 +2106,17 @@ mod tests {
 
         // testConfig 存在但未启用 → 忽略，用全局
         let mut p3 = make_provider(serde_json::json!({}));
-        p3.meta = Some(ProviderMeta {
-            test_config: Some(ProviderTestConfig {
-                enabled: false,
-                timeout_secs: Some(99),
-                degraded_threshold_ms: None,
-                max_retries: None,
-            }),
-            ..Default::default()
-        });
+       p3.meta = Some(ProviderMeta {
+           test_config: Some(ProviderTestConfig {
+               enabled: false,
+               timeout_secs: Some(99),
+               degraded_threshold_ms: None,
+               max_retries: None,
+               test_prompt: None,
+               test_model: None,
+           }),
+           ..Default::default()
+       });
         let merged3 = StreamCheckService::merge_provider_config(&p3, &global);
         assert_eq!(merged3.timeout_secs, global.timeout_secs);
     }

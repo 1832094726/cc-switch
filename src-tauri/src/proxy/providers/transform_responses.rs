@@ -487,16 +487,8 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                             }));
                         }
 
-                        "thinking" | "redacted_thinking" => {
-                            if let Some(text) = super::transform::degraded_thinking_text(block) {
-                                let content_type = if role == "assistant" {
-                                    "output_text"
-                                } else {
-                                    "input_text"
-                                };
-                                message_content.push(json!({ "type": content_type, "text": text }));
-                            }
-                        }
+                       "thinking" | "redacted_thinking" => {
+                       }
 
                         _ => {}
                     }

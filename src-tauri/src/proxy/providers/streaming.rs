@@ -4,6 +4,7 @@
 
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
+use crate::proxy::providers::codex_chat_common::extract_reasoning_field_text;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,6 +37,9 @@ struct Delta {
     // OpenRouter/Kimi/其它 使用 reasoning，DeepSeek 使用 reasoning_content
     #[serde(default, alias = "reasoning_content")]
     reasoning: Option<String>,
+    // MiMo/OpenRouter 等使用 reasoning_details 数组形态
+    #[serde(default)]
+    reasoning_details: Option<Value>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
@@ -265,7 +269,17 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                         }
 
                                         // 处理 reasoning（thinking）
-                                        if let Some(reasoning) = &choice.delta.reasoning {
+                                        let reasoning_text: Option<String> = choice.delta.reasoning.clone()
+                                            .filter(|r| !r.is_empty())
+                                            .or_else(|| {
+                                                // reasoning_details 数组/对象形态兜底（MiMo/OpenRouter 等）
+                                                choice.delta.reasoning_details.as_ref()
+                                                    .and_then(|rd| {
+                                                        let wrapped = json!({ "reasoning_details": rd });
+                                                        extract_reasoning_field_text(&wrapped)
+                                                    })
+                                            });
+                                        if let Some(reasoning) = &reasoning_text {
                                             if current_non_tool_block_type != Some("thinking") {
                                                 if let Some(index) = current_non_tool_block_index.take() {
                                                     let event = json!({

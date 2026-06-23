@@ -7,10 +7,6 @@ use crate::proxy::{error::ProxyError, json_canonical::canonical_json_string};
 use serde_json::{json, Value};
 
 const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
-const DEGRADED_THINKING_OPEN: &str = "<cc-switch:thinking>";
-const DEGRADED_THINKING_CLOSE: &str = "</cc-switch:thinking>";
-const DEGRADED_REDACTED_THINKING_OPEN: &str = "<cc-switch:redacted_thinking>";
-const DEGRADED_REDACTED_THINKING_CLOSE: &str = "</cc-switch:redacted_thinking>";
 const DEGRADED_TOOL_ERROR_OPEN: &str = r#"<cc-switch:tool_result is_error="true">"#;
 const DEGRADED_TOOL_ERROR_CLOSE: &str = "</cc-switch:tool_result>";
 
@@ -428,28 +424,22 @@ fn convert_message_to_openai(
                         "content": content_str
                     }));
                 }
-                "thinking" => {
-                    if let Some(text) = degraded_thinking_text(block) {
-                        content_parts.push(json!({"type": "text", "text": text}));
-                    }
-                    if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
-                        if !thinking.is_empty() {
-                            reasoning_parts.push(thinking.to_string());
-                        }
-                    }
-                }
-                "redacted_thinking" => {
-                    if let Some(text) = degraded_thinking_text(block) {
-                        content_parts.push(json!({"type": "text", "text": text}));
-                    }
-                    // Claude Code encrypts historical thinking into redacted_thinking blocks.
-                    // MiMo/DeepSeek require non-empty reasoning_content on assistant tool-call
-                    // messages, so inject a minimal placeholder when the real content is
-                    // unavailable.
-                    if preserve_reasoning_content {
-                        reasoning_parts.push("[redacted thinking]".to_string());
-                    }
-                }
+               "thinking" => {
+                   if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
+                       if !thinking.is_empty() {
+                           reasoning_parts.push(thinking.to_string());
+                       }
+                   }
+               }
+               "redacted_thinking" => {
+                   // Claude Code encrypts historical thinking into redacted_thinking blocks.
+                   // MiMo/DeepSeek require non-empty reasoning_content on assistant tool-call
+                   // messages, so inject a minimal placeholder when the real content is
+                   // unavailable.
+                   if preserve_reasoning_content {
+                       reasoning_parts.push("[redacted thinking]".to_string());
+                   }
+               }
                 _ => {}
             }
         }
@@ -496,50 +486,6 @@ fn convert_message_to_openai(
     result.push(json!({"role": role, "content": content}));
     Ok(result)
 }
-
-pub(crate) fn degraded_thinking_text(block: &Value) -> Option<String> {
-    match block.get("type").and_then(Value::as_str) {
-        Some("thinking") => {
-            let thinking = block
-                .get("thinking")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let signature = block
-                .get("signature")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if thinking.is_empty() && signature.is_empty() {
-                return None;
-            }
-
-            let mut parts = vec![DEGRADED_THINKING_OPEN.to_string()];
-            if !thinking.is_empty() {
-                parts.push(thinking.to_string());
-            }
-            if !signature.is_empty() {
-                parts.push(format!(
-                    "<cc-switch:signature>{signature}</cc-switch:signature>"
-                ));
-            }
-            parts.push(DEGRADED_THINKING_CLOSE.to_string());
-            Some(parts.join("\n"))
-        }
-        Some("redacted_thinking") => {
-            let data = block
-                .get("data")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if data.is_empty() {
-                return None;
-            }
-            Some(format!(
-                "{DEGRADED_REDACTED_THINKING_OPEN}\n{data}\n{DEGRADED_REDACTED_THINKING_CLOSE}"
-            ))
-        }
-        _ => None,
-    }
-}
-
 pub(crate) fn degraded_tool_result_content(block: &Value) -> String {
     let content = match block.get("content") {
         Some(Value::String(s)) => s.clone(),
@@ -1332,20 +1278,17 @@ mod tests {
             }]
         });
 
-        let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
-        let msg = &result["messages"][0];
-        assert_eq!(msg["role"], "assistant");
-        assert_eq!(msg["reasoning_content"], "I should call the tool.");
-        assert!(msg["content"]
+       let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
+       let msg = &result["messages"][0];
+       assert_eq!(msg["role"], "assistant");
+       assert_eq!(msg["reasoning_content"], "I should call the tool.");
+        // Thinking content must NOT leak into visible content.
+        assert!(msg["content"].is_null() || !msg["content"]
             .as_str()
-            .unwrap()
-            .contains("<cc-switch:thinking>"));
-        assert!(msg["content"]
-            .as_str()
-            .unwrap()
-            .contains("I should call the tool."));
-        assert!(msg.get("tool_calls").is_some());
-        assert_eq!(msg["tool_calls"][0]["id"], "call_123");
+            .map(|c| c.contains("cc-switch:thinking"))
+            .unwrap_or(false));
+       assert!(msg.get("tool_calls").is_some());
+       assert_eq!(msg["tool_calls"][0]["id"], "call_123");
     }
 
     #[test]
@@ -1383,14 +1326,15 @@ mod tests {
             }]
         });
 
-        let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
-        let msg = &result["messages"][0];
-        assert_eq!(msg["reasoning_content"], "[redacted thinking]");
-        assert!(msg["content"]
+       let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
+       let msg = &result["messages"][0];
+       assert_eq!(msg["reasoning_content"], "[redacted thinking]");
+        // Redacted thinking must NOT leak into visible content.
+        assert!(msg["content"].is_null() || !msg["content"]
             .as_str()
-            .unwrap()
-            .contains("<cc-switch:redacted_thinking>"));
-        assert_eq!(msg["tool_calls"][0]["id"], "call_123");
+            .map(|c| c.contains("cc-switch:redacted_thinking"))
+            .unwrap_or(false));
+       assert_eq!(msg["tool_calls"][0]["id"], "call_123");
     }
 
     #[test]
@@ -1407,43 +1351,38 @@ mod tests {
             }]
         });
 
-        let result = anthropic_to_openai(input).unwrap();
-        let msg = &result["messages"][0];
-        assert_eq!(msg["role"], "assistant");
-        assert!(msg.get("tool_calls").is_some());
-        assert!(msg.get("reasoning_content").is_none());
-        assert!(msg["content"]
+       let result = anthropic_to_openai(input).unwrap();
+       let msg = &result["messages"][0];
+       assert_eq!(msg["role"], "assistant");
+       assert!(msg.get("tool_calls").is_some());
+       assert!(msg.get("reasoning_content").is_none());
+        // Default path does not emit reasoning_content; thinking should not
+        // leak into content either.
+        assert!(msg["content"].is_null() || !msg["content"]
             .as_str()
-            .unwrap()
-            .contains("<cc-switch:thinking>"));
+            .map(|c| c.contains("cc-switch:thinking"))
+            .unwrap_or(false));
     }
 
     #[test]
-    fn test_anthropic_to_openai_degrades_thinking_only_message() {
-        let input = json!({
-            "model": "claude-3-opus",
-            "max_tokens": 1024,
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "No visible content yet."}
-                ]
-            }]
-        });
+   fn test_anthropic_to_openai_degrades_thinking_only_message() {
+       let input = json!({
+           "model": "claude-3-opus",
+           "max_tokens": 1024,
+           "messages": [{
+               "role": "assistant",
+               "content": [
+                   {"type": "thinking", "thinking": "No visible content yet."}
+               ]
+           }]
+       });
 
-        let result = anthropic_to_openai(input).unwrap();
-        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
-        let msg = &result["messages"][0];
-        assert_eq!(msg["role"], "assistant");
-        assert!(msg["content"]
-            .as_str()
-            .unwrap()
-            .contains("<cc-switch:thinking>"));
-        assert!(msg["content"]
-            .as_str()
-            .unwrap()
-            .contains("No visible content yet."));
-    }
+      let result = anthropic_to_openai(input).unwrap();
+       // Thinking content must NOT leak into visible content.
+       // A thinking-only message produces no content_parts and no tool_calls,
+       // so the entire message is dropped — thinking must not become visible.
+       assert!(result["messages"].as_array().unwrap().is_empty());
+   }
 
     #[test]
     fn test_anthropic_to_openai_tool_result() {
