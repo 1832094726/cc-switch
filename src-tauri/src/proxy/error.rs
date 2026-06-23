@@ -183,6 +183,9 @@ pub enum ErrorCategory {
     NonRetryable, // 认证失败、参数错误、4xx 错误
     #[allow(dead_code)]
     ClientAbort, // 客户端主动中断
+
+    /// 模型/端点级错误（404 / 特定模型 403）：触发故障转移但不计入熔断器健康度
+    FailoverNeutral,
 }
 
 /// 判断错误是否可重试

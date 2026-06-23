@@ -1055,12 +1055,38 @@ impl RequestForwarder {
                             );
                             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
 
+                           last_error = Some(e);
+                           last_provider = Some(provider.clone());
+                           // 继续尝试下一个供应商
+                           continue;
+                       }
+                        ErrorCategory::FailoverNeutral => {
+                            // 模型/端点级错误（如 404）：触发故障转移到下一家供应商，
+                            // 但不污染熔断器健康度——该供应商对其他模型/端点可能完全正常。
+                            self.router
+                                .release_permit_neutral(
+                                    &provider.id,
+                                    app_type_str,
+                                    used_half_open_permit,
+                                )
+                                .await;
+                            {
+                                let mut status = self.status.write().await;
+                                status.last_error = Some(format!(
+                                    "Provider {} 模型/端点不可用: {}",
+                                    provider.name, e
+                                ));
+                            }
+                            log::warn!(
+                                "[{app_type_str}] [FWD-009] Provider {} 返回模型/端点级错误（404），\
+                                 故障转移到下一家，不计入熔断器",
+                                provider.name
+                            );
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
-                            // 继续尝试下一个供应商
                             continue;
                         }
-                        ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
+                       ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
                             // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
                             self.router
                                 .release_permit_neutral(
@@ -2787,6 +2813,9 @@ impl RequestForwarder {
             // Retryable —— 换一家 provider 可能持有不同的 key、配额、地域或模型映射。
             ProxyError::UpstreamError { status, .. } => match *status {
                 400 | 405 | 406 | 413 | 414 | 415 | 422 | 501 => ErrorCategory::NonRetryable,
+                // 404 = 模型或端点不存在。换一家 provider 可能映射正确，所以仍触发故障转移，
+                // 但不计入熔断器健康度——该供应商对其他模型可能完全正常。
+                404 => ErrorCategory::FailoverNeutral,
                 _ => ErrorCategory::Retryable,
             },
             // Provider 级配置/转换问题：换一个 Provider 可能就能成功
