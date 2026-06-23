@@ -62,6 +62,9 @@ impl ProviderRouter {
 
             total_providers = ordered_ids.len();
 
+            // 记录被熔断的供应商（按优先级），用于全熔断 fallback
+            let mut tripped_providers: Vec<Provider> = Vec::new();
+
             for provider_id in ordered_ids {
                 let Some(provider) = all_providers.get(&provider_id).cloned() else {
                     continue;
@@ -74,7 +77,22 @@ impl ProviderRouter {
                     result.push(provider);
                 } else {
                     circuit_open_count += 1;
+                    tripped_providers.push(provider);
                 }
+            }
+
+            // 全熔断 fallback：强制将最高优先级供应商转为 HalfOpen 进行探测，
+            // 而不是直接拒绝请求。请求成功则恢复正常，失败则正常返回错误。
+            if result.is_empty() && !tripped_providers.is_empty() {
+                let first = &tripped_providers[0];
+                let circuit_key = format!("{app_type}:{}", first.id);
+                let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+                log::info!(
+                    "[{app_type}] [FO-006] 所有供应商已熔断，强制探测最高优先级供应商: {}",
+                    first.name
+                );
+                breaker.force_half_open().await;
+                result.push(tripped_providers.remove(0));
             }
         } else {
             // 故障转移关闭：仅使用当前供应商，跳过熔断器检查
@@ -515,9 +533,62 @@ mod tests {
             .release_permit_neutral("a", "claude", first.used_half_open_permit)
             .await;
 
-        // 第三次请求应被允许（名额已释放）
-        let third = router.allow_provider_request("a", "claude").await;
-        assert!(third.allowed);
-        assert!(third.used_half_open_permit);
+       // 第三次请求应被允许（名额已释放）
+       let third = router.allow_provider_request("a", "claude").await;
+       assert!(third.allowed);
+       assert!(third.used_half_open_permit);
+   }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_all_circuit_open_fallback_to_highest_priority() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        // 配置熔断器：1 次失败即熔断，3600 秒超时（保持 Open 状态不自动恢复）
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 3600,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        let provider_b =
+            Provider::with_id("b".to_string(), "Provider B".to_string(), json!({}), None);
+
+        db.save_provider("claude", &provider_a).unwrap();
+        db.save_provider("claude", &provider_b).unwrap();
+
+        db.add_to_failover_queue("claude", "a").unwrap();
+        db.add_to_failover_queue("claude", "b").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        // 触发两个供应商的熔断
+        router
+            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .await
+            .unwrap();
+        router
+            .record_result("b", "claude", false, false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        // 所有供应商都熔断时，select_providers 应返回最高优先级供应商（a）
+        // 而不是返回 AllProvidersCircuitOpen 错误
+        let providers = router.select_providers("claude").await.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "a");
+
+        // 最高优先级供应商被强制转为 HalfOpen，允许探测
+        let allow = router.allow_provider_request("a", "claude").await;
+        assert!(allow.allowed);
     }
 }

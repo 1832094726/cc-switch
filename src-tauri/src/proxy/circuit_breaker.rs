@@ -305,11 +305,15 @@ impl CircuitBreaker {
         }
     }
 
-    /// 重置熔断器（手动恢复）
-    #[allow(dead_code)]
-    pub async fn reset(&self) {
-        log::info!("[{}] 熔断器手动重置 → Closed", log_cb::MANUAL_RESET);
-        self.transition_to_closed().await;
+   /// 重置熔断器（手动恢复）
+   #[allow(dead_code)]
+   pub async fn reset(&self) {
+       log::info!("[{}] 熔断器手动重置 → Closed", log_cb::MANUAL_RESET);
+       self.transition_to_closed().await;
+   }
+    /// 强制转为半开状态，用于所有供应商熔断时给最高优先级供应商一个探测机会
+    pub async fn force_half_open(&self) {
+        self.transition_to_half_open().await;
     }
 
     fn allow_half_open_probe(&self) -> AllowResult {
