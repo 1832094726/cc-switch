@@ -1203,6 +1203,11 @@ impl RequestForwarder {
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
 
+        // 全局清除历史对话中残留的 <cc-switch:thinking> 文本标签。
+        // 旧版本生成的这些标签会缓存在客户端对话历史中并被回放，
+        // 导致 thinking 内容泄漏到可见对话内容。
+        mapped_body = super::copilot_optimizer::strip_thinking_blocks(mapped_body);
+
         if is_copilot {
             mapped_body =
                 super::providers::copilot_model_map::apply_copilot_model_normalization(mapped_body);
