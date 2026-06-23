@@ -108,9 +108,41 @@ cleanup_old_cc_switch_processes() {
 # ── 启动 ──────────────────────────────────────────────
 log "cargo target dir: $CARGO_TARGET_DIR"
 
+cleanup_stale_artifacts() {
+  local sweep_bin
+  sweep_bin="$(command -v cargo-sweep 2>/dev/null || true)"
+  if [[ -z "$sweep_bin" ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "$CARGO_TARGET_DIR/debug" ]]; then
+    return 0
+  fi
+
+  local max_size="${CC_SWITCH_DEV_TARGET_MAX_GB:-8}"
+  local before_bytes
+  before_bytes="$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1)"
+
+  local threshold_mb=$((max_size * 1024))
+  local current_mb=$((before_bytes / 1024))
+  if (( current_mb <= threshold_mb )); then
+    return 0
+  fi
+
+  log "target ${current_mb}MB > ${threshold_mb}MB, cleaning orphaned artifacts..."
+  "$sweep_bin" sweep --maxsize "${max_size}GB" "$CARGO_TARGET_DIR" 2>&1 | while IFS= read -r line; do
+    log "$line"
+  done
+  local after_bytes
+  after_bytes="$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1)"
+  local freed_mb=$(( (before_bytes - after_bytes) / 1024 ))
+  log "cleaned ${freed_mb}MB"
+}
+
 cleanup_old_cc_switch_processes
 cleanup_proxy_port
 cleanup_renderer_port
+cleanup_stale_artifacts
 
 # 手动重载模式：--no-watch 禁用 Tauri 的 Rust 文件监听。
 # 改完 Rust 代码后 Ctrl+C 停掉脚本、再重新运行即可。
