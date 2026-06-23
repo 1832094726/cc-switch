@@ -3107,15 +3107,29 @@ pub(crate) fn resolve_devin_model_route(
     let exact_model_entry = requested_model
         .as_ref()
         .and_then(|model| find_devin_model_entry(models, model, &requested_key));
-    let model_entry = exact_model_entry
-        .or_else(|| {
-            requested_model
-                .as_deref()
-                .filter(|model| !is_devin_primary_model_alias(model))
-                .and_then(|_| find_devin_small_model_entry(models))
-        })
-        .or_else(|| find_devin_fallback_model_entry(models, provider))
-        .or_else(|| models.first())?;
+   // 非主模型（小模型）请求不 fallback 到主模型条目，避免小模型被
+   // 路由到昂贵的上游（如 glm-5.2），产生意外费用。
+   // 小模型请求若无法在当前供应商解析路由则返回 None，请求会带着原始
+   // 模型名发往当前供应商（上游通常返回 404/400 触发故障转移）。
+    // picpi 是代理聚合服务，上游自行处理模型路由，保留原有 fallback 行为
+    let is_non_primary = requested_model
+       .as_deref()
+       .is_some_and(|m| !is_devin_primary_model_alias(m));
+    let is_picpi = is_picpi_devin_catalog(models, provider);
+    let model_entry = if is_non_primary && !is_picpi {
+       exact_model_entry.or_else(|| find_devin_small_model_entry(models))
+   } else {
+       exact_model_entry
+           .or_else(|| {
+               requested_model
+                   .as_deref()
+                   .filter(|model| !is_devin_primary_model_alias(model))
+                   .and_then(|_| find_devin_small_model_entry(models))
+           })
+           .or_else(|| find_devin_fallback_model_entry(models, provider))
+           .or_else(|| models.first())
+   };
+   let model_entry = model_entry?;
 
     let endpoint = resolve_devin_model_endpoint(model_entry, provider)?;
     let upstream_model = devin_upstream_model(model_entry, provider);
@@ -5892,32 +5906,75 @@ mod tests {
             );
             assert_eq!(route.thinking_enabled, Some(false));
         }
+   }
+
+    #[test]
+    fn devin_small_model_no_fallback_to_primary_on_non_picpi() {
+        // 非主模型（小模型）请求在没有小模型条目的非 picpi 供应商上
+        // 不应 fallback 到主模型条目，避免产生意外费用
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "swe-1-6-slow",
+                        "upstreamModel": "glm-5.2",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://open.bigmodel.cn"
+                    },
+                    {
+                        "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                        "upstreamModel": "glm-5.2",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://open.bigmodel.cn"
+                    }
+                ]
+            }
+        });
+
+        // 小模型请求在当前供应商没有匹配条目，应返回 None（不 fallback 到 glm-5.2）
+        let result = resolve_devin_model_route(
+            &provider,
+            &json!({ "model": "MODEL_GPT_5_NANO" }),
+        );
+        assert!(
+            result.is_none(),
+            "Small model request should not fall back to primary model on non-picpi provider"
+        );
+
+        // 主模型请求仍应正常路由
+        let route = resolve_devin_model_route(
+            &provider,
+            &json!({ "model": "swe-1-6-slow" }),
+        )
+        .unwrap();
+        assert_eq!(route.upstream_model.as_deref(), Some("glm-5.2"));
     }
 
     #[test]
     fn devin_unknown_non_primary_model_routes_to_small_model() {
         let mut provider = test_provider_with_type(Some("openai"));
         provider.settings_config = json!({
-            "modelCatalog": {
-                "models": [
-                    {
-                        "model": "MODEL_CLAUDE_4_SONNET_BYOK",
-                        "upstreamModel": "gpt-5.5",
-                        "endpoint": "/v1/responses",
-                        "baseUrl": "https://cn.picpi.top",
-                        "routes": [{ "name": "primary" }]
-                    },
-                    {
-                        "model": "MODEL_GPT_5_NANO",
-                        "upstreamModel": "deepseek-ai/DeepSeek-V3.2",
-                        "endpoint": "/v1/chat/completions",
-                        "baseUrl": "https://api.siliconflow.cn",
-                        "apiKey": "sk-test",
-                        "authHeader": "bearer",
-                        "routes": [{ "name": "devin-small-model" }]
-                    }
-                ]
-            }
+        "modelCatalog": {
+            "models": [
+                {
+                    "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                    "upstreamModel": "gpt-5.5",
+                    "endpoint": "/v1/responses",
+                    "baseUrl": "https://cn.picpi.top",
+                    "routes": [{ "name": "primary" }]
+                },
+                {
+                    "model": "MODEL_GPT_5_NANO",
+                    "upstreamModel": "deepseek-ai/DeepSeek-V3.2",
+                    "endpoint": "/v1/chat/completions",
+                    "baseUrl": "https://api.siliconflow.cn",
+                    "apiKey": "sk-test",
+                    "authHeader": "bearer",
+                    "routes": [{ "name": "devin-small-model" }]
+                }
+            ]
+        }
         });
 
         let route = resolve_devin_model_route(
