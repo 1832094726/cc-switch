@@ -1933,25 +1933,32 @@ impl StreamCheckService {
 
         let success_count = results.iter().filter(|r| r.success).count();
         let total = results.len();
-        let status = if success_count == total {
-            if results.iter().any(|r| r.status == HealthStatus::Degraded) {
+       let status = if success_count == total {
+           if results.iter().any(|r| r.status == HealthStatus::Degraded) {
+               HealthStatus::Degraded
+           } else {
+               HealthStatus::Operational
+           }
+       } else {
+            // Partial model failures (e.g. small models mapped to upstream
+            // models the provider doesn't support) should degrade, not fail.
+            if success_count > 0 {
                 HealthStatus::Degraded
             } else {
-                HealthStatus::Operational
+                HealthStatus::Failed
             }
-        } else {
-            HealthStatus::Failed
-        };
+       };
         let failed = results
             .iter()
             .filter(|r| !r.success)
             .map(|r| format!("{}: {}", r.model_used, r.message))
             .collect::<Vec<_>>();
 
-        StreamCheckResult {
-            status,
-            success: success_count == total,
-            message: if failed.is_empty() {
+       StreamCheckResult {
+           status,
+            // Provider is usable as long as at least one model passes.
+            success: success_count > 0,
+           message: if failed.is_empty() {
                 format!("All {total} models check succeeded")
             } else {
                 format!(
