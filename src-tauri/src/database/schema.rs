@@ -120,9 +120,9 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // 8. Proxy Config 表（三行结构，app_type 主键）
+        // 8. Proxy Config 表（按本地路由 app_type 分行，app_type 主键）
         conn.execute("CREATE TABLE IF NOT EXISTS proxy_config (
-            app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini')),
+            app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini','devin')),
             proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
             listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
@@ -136,11 +136,11 @@ impl Database {
             created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
-        // 初始化三行数据（每应用不同默认值）
+        // 初始化本地路由数据（每应用不同默认值）
         //
         // 兼容旧数据库：
-        // - 老版本 proxy_config 是单例表（没有 app_type 列），此时不能执行三行 seed insert；
-        // - 旧表会在 apply_schema_migrations() 中迁移为三行结构后再插入。
+        // - 老版本 proxy_config 是单例表（没有 app_type 列），此时不能执行 per-app seed insert；
+        // - 旧表会在 apply_schema_migrations() 中迁移为 per-app 结构后再插入。
         if Self::has_column(conn, "proxy_config", "app_type")? {
             conn.execute(
                 "INSERT OR IGNORE INTO proxy_config (app_type, max_retries,
@@ -166,6 +166,15 @@ impl Database {
                 circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
                 circuit_error_rate_threshold, circuit_min_requests)
                 VALUES ('gemini', 5, 60, 120, 600, 4, 2, 60, 0.6, 10)",
+                [],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+            conn.execute(
+                "INSERT OR IGNORE INTO proxy_config (app_type, max_retries,
+                streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
+                circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
+                circuit_error_rate_threshold, circuit_min_requests)
+                VALUES ('devin', 3, 60, 120, 600, 4, 2, 60, 0.6, 10)",
                 [],
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
@@ -333,7 +342,7 @@ impl Database {
             [],
         );
 
-        // 兼容：若旧版 proxy_config 仍为单例结构（无 app_type），则在启动时直接转换为三行结构
+        // 兼容：若旧版 proxy_config 仍为单例结构（无 app_type），则在启动时直接转换为 per-app 结构
         // 说明：user_version=2 时不会再触发 v1->v2 迁移，但新代码查询依赖 app_type 列。
         if Self::table_exists(conn, "proxy_config")?
             && !Self::has_column(conn, "proxy_config", "app_type")?
@@ -443,6 +452,11 @@ impl Database {
                         log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
                         Self::migrate_v10_to_v11(conn)?;
                         Self::set_user_version(conn, 11)?;
+                    }
+                    11 => {
+                        log::info!("迁移数据库从 v11 到 v12（添加 Devin 本地路由配置）");
+                        Self::migrate_v11_to_v12(conn)?;
+                        Self::set_user_version(conn, 12)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -660,13 +674,13 @@ impl Database {
         // 重构 skills 表（添加 app_type 字段）
         Self::migrate_skills_table(conn)?;
 
-        // 重构 proxy_config 为三行结构（每应用独立配置）
+        // 重构 proxy_config 为 per-app 结构（每应用独立配置）
         Self::migrate_proxy_config_to_per_app(conn)?;
 
         Ok(())
     }
 
-    /// 将 proxy_config 迁移为三行结构（每应用独立配置）
+    /// 将 proxy_config 迁移为 per-app 结构（每应用独立配置）
     fn migrate_proxy_config_to_per_app(conn: &Connection) -> Result<(), AppError> {
         // 检查是否已经是新表结构（幂等性）
         if !Self::table_exists(conn, "proxy_config")? {
@@ -675,8 +689,8 @@ impl Database {
         }
 
         if Self::has_column(conn, "proxy_config", "app_type")? {
-            // 已经是三行结构，跳过迁移
-            log::info!("proxy_config 已经是三行结构，跳过迁移");
+            // 已经是 per-app 结构，跳过迁移
+            log::info!("proxy_config 已经是 per-app 结构，跳过迁移");
             return Ok(());
         }
 
@@ -756,12 +770,25 @@ impl Database {
                 old_cb.3,
                 old_cb.4,
             ),
+            (
+                "devin",
+                get_bool("proxy_takeover_devin"),
+                get_bool("auto_failover_enabled_devin"),
+                3,
+                old_config.4,
+                old_config.5,
+                old_cb.0,
+                old_cb.1,
+                old_cb.2,
+                old_cb.3,
+                old_cb.4,
+            ),
         ];
 
         // 创建新表
         conn.execute("DROP TABLE IF EXISTS proxy_config_new", [])?;
         conn.execute("CREATE TABLE proxy_config_new (
-            app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini')),
+            app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini','devin')),
             proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
             listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
             enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
@@ -775,7 +802,7 @@ impl Database {
             created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )", [])?;
 
-        // 插入三行配置
+        // 插入每个本地路由的配置
         for (app, takeover, failover, retries, fb, idle, cb_f, cb_s, cb_t, cb_r, cb_m) in apps {
             conn.execute(
                 "INSERT INTO proxy_config_new (app_type, proxy_enabled, listen_address, listen_port, enable_logging,
@@ -799,7 +826,7 @@ impl Database {
             [],
         )?;
 
-        log::info!("proxy_config 已迁移为三行结构");
+        log::info!("proxy_config 已迁移为 per-app 结构");
         Ok(())
     }
 
@@ -1267,6 +1294,119 @@ impl Database {
         log::info!(
             "v10 -> v11 迁移完成：usage_daily_rollups 已保留 request_model/pricing_model 维度"
         );
+        Ok(())
+    }
+
+    /// v11 -> v12：添加 Devin 本地路由。
+    ///
+    /// 旧 proxy_config 表带 CHECK(app_type IN ('claude','codex','gemini'))，
+    /// 不能直接插入 devin，因此需要重建表并保留现有配置。
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
+        if !Self::table_exists(conn, "proxy_config")? {
+            return Ok(());
+        }
+
+        let column_or_default = |column: &str, default_expr: &str| -> Result<String, AppError> {
+            if Self::has_column(conn, "proxy_config", column)? {
+                Ok(column.to_string())
+            } else {
+                Ok(default_expr.to_string())
+            }
+        };
+
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS proxy_config_v12;
+             CREATE TABLE proxy_config_v12 (
+                app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini','devin')),
+                proxy_enabled INTEGER NOT NULL DEFAULT 0,
+                listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
+                listen_port INTEGER NOT NULL DEFAULT 15721,
+                enable_logging INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
+                streaming_idle_timeout INTEGER NOT NULL DEFAULT 120,
+                non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
+                circuit_failure_threshold INTEGER NOT NULL DEFAULT 4,
+                circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
+                circuit_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                circuit_error_rate_threshold REAL NOT NULL DEFAULT 0.6,
+                circuit_min_requests INTEGER NOT NULL DEFAULT 10,
+                default_cost_multiplier TEXT NOT NULL DEFAULT '1',
+                pricing_model_source TEXT NOT NULL DEFAULT 'response',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                live_takeover_active INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .map_err(|e| AppError::Database(format!("v11 -> v12 重建 proxy_config 失败: {e}")))?;
+
+        if Self::has_column(conn, "proxy_config", "app_type")? {
+            let insert_sql = format!(
+                "INSERT OR REPLACE INTO proxy_config_v12 (
+                    app_type, proxy_enabled, listen_address, listen_port, enable_logging,
+                    enabled, auto_failover_enabled, max_retries,
+                    streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
+                    circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
+                    circuit_error_rate_threshold, circuit_min_requests,
+                    default_cost_multiplier, pricing_model_source,
+                    created_at, updated_at, live_takeover_active
+                 )
+                 SELECT
+                    app_type, {}, {}, {}, {},
+                    {}, {}, {},
+                    {}, {}, {},
+                    {}, {}, {},
+                    {}, {},
+                    {}, {},
+                    {}, {}, {}
+                 FROM proxy_config
+                 WHERE app_type IN ('claude','codex','gemini','devin')",
+                column_or_default("proxy_enabled", "0")?,
+                column_or_default("listen_address", "'127.0.0.1'")?,
+                column_or_default("listen_port", "15721")?,
+                column_or_default("enable_logging", "1")?,
+                column_or_default("enabled", "0")?,
+                column_or_default("auto_failover_enabled", "0")?,
+                column_or_default("max_retries", "3")?,
+                column_or_default("streaming_first_byte_timeout", "60")?,
+                column_or_default("streaming_idle_timeout", "120")?,
+                column_or_default("non_streaming_timeout", "600")?,
+                column_or_default("circuit_failure_threshold", "4")?,
+                column_or_default("circuit_success_threshold", "2")?,
+                column_or_default("circuit_timeout_seconds", "60")?,
+                column_or_default("circuit_error_rate_threshold", "0.6")?,
+                column_or_default("circuit_min_requests", "10")?,
+                column_or_default("default_cost_multiplier", "'1'")?,
+                column_or_default("pricing_model_source", "'response'")?,
+                column_or_default("created_at", "datetime('now')")?,
+                column_or_default("updated_at", "datetime('now')")?,
+                column_or_default("live_takeover_active", "0")?,
+            );
+            conn.execute(&insert_sql, []).map_err(|e| {
+                AppError::Database(format!("v11 -> v12 复制 proxy_config 失败: {e}"))
+            })?;
+        }
+
+        conn.execute(
+            "INSERT OR IGNORE INTO proxy_config_v12 (
+                app_type, max_retries,
+                streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
+                circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
+                circuit_error_rate_threshold, circuit_min_requests
+             ) VALUES ('devin', 3, 60, 120, 600, 4, 2, 60, 0.6, 10)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("v11 -> v12 插入 Devin proxy_config 失败: {e}")))?;
+
+        conn.execute_batch(
+            "DROP TABLE proxy_config;
+             ALTER TABLE proxy_config_v12 RENAME TO proxy_config;",
+        )
+        .map_err(|e| AppError::Database(format!("v11 -> v12 替换 proxy_config 失败: {e}")))?;
+
+        log::info!("v11 -> v12 迁移完成：已添加 Devin 本地路由配置");
         Ok(())
     }
 

@@ -25,6 +25,7 @@ pub mod provider_router;
 pub mod providers;
 pub mod response_handler;
 pub mod response_processor;
+pub(crate) mod sensitive_redaction;
 pub(crate) mod server;
 pub mod session;
 pub(crate) mod sse;
@@ -34,6 +35,7 @@ pub mod thinking_optimizer;
 pub mod thinking_rectifier;
 pub(crate) mod types;
 pub mod usage;
+pub(crate) mod windsurf;
 
 // 公开导出给外部使用（commands, services等模块需要）
 #[allow(unused_imports)]

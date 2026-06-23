@@ -12,6 +12,7 @@ use std::time::Duration;
 
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
+static DIRECT_CLIENT: OnceCell<Client> = OnceCell::new();
 
 /// 当前代理 URL（用于日志和状态查询）
 static CURRENT_PROXY_URL: OnceCell<RwLock<Option<String>>> = OnceCell::new();
@@ -196,6 +197,18 @@ pub fn get() -> Client {
         })
 }
 
+/// 获取直连 HTTP 客户端。
+///
+/// 用于少数对本机系统代理不稳定的上游请求；不会读取 HTTP(S)_PROXY/ALL_PROXY。
+pub fn get_direct() -> Client {
+    DIRECT_CLIENT
+        .get_or_init(|| {
+            build_client_with_proxy_policy(None, ProxyPolicy::Direct)
+                .unwrap_or_else(|_| Client::new())
+        })
+        .clone()
+}
+
 /// 获取当前代理 URL
 ///
 /// 返回当前配置的代理 URL，None 表示直连。
@@ -214,6 +227,19 @@ pub fn is_proxy_enabled() -> bool {
 
 /// 构建 HTTP 客户端
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    build_client_with_proxy_policy(proxy_url, ProxyPolicy::ConfiguredOrSystem)
+}
+
+#[derive(Clone, Copy)]
+enum ProxyPolicy {
+    ConfiguredOrSystem,
+    Direct,
+}
+
+fn build_client_with_proxy_policy(
+    proxy_url: Option<&str>,
+    proxy_policy: ProxyPolicy,
+) -> Result<Client, String> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
@@ -225,8 +251,11 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_brotli()
         .no_deflate();
 
-    // 有代理地址则使用代理，否则跟随系统代理
-    if let Some(url) = proxy_url {
+    if matches!(proxy_policy, ProxyPolicy::Direct) {
+        builder = builder.no_proxy();
+        log::debug!("[GlobalProxy] Using direct HTTP client");
+    } else if let Some(url) = proxy_url {
+        // 有代理地址则使用代理，否则跟随系统代理
         // 先验证 URL 格式和 scheme
         let parsed = url::Url::parse(url)
             .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;

@@ -143,7 +143,7 @@ pub(crate) fn build_provider_from_request(
 ) -> Result<Provider, AppError> {
     let settings_config = match app_type {
         AppType::Claude | AppType::ClaudeDesktop => build_claude_settings(request),
-        AppType::Codex => build_codex_settings(request),
+        AppType::Codex | AppType::Devin => build_codex_settings(request),
         AppType::Gemini => build_gemini_settings(request),
         AppType::OpenCode => build_opencode_settings(request),
         AppType::OpenClaw => build_additive_app_settings(request),

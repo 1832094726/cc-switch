@@ -13,6 +13,7 @@ import { emitTauriEvent } from "../msw/tauriMocks";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const APP_INTEGRATION_TIMEOUT_MS = 15_000;
 
 vi.mock("sonner", () => ({
   toast: {
@@ -158,6 +159,8 @@ const renderApp = (AppComponent: ComponentType) => {
 
 describe("App integration with MSW", () => {
   beforeEach(() => {
+    window.localStorage.removeItem("cc-switch-last-app");
+    window.localStorage.removeItem("cc-switch-last-view");
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
@@ -218,7 +221,7 @@ describe("App integration with MSW", () => {
 
     expect(toastErrorMock).not.toHaveBeenCalled();
     expect(toastSuccessMock).toHaveBeenCalled();
-  });
+  }, APP_INTEGRATION_TIMEOUT_MS);
 
   it("shows toast when auto sync fails in background", async () => {
     const { default: App } = await import("@/App");

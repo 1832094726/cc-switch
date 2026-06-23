@@ -82,6 +82,57 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
                     typeof item?.context_window === "number"
                   ? item.context_window
                   : "",
+            upstreamModel:
+              typeof item?.upstreamModel === "string"
+                ? item.upstreamModel
+                : typeof item?.upstream_model === "string"
+                  ? item.upstream_model
+                  : "",
+            provider:
+              item?.provider === "anthropic" || item?.provider === "openai"
+                ? item.provider
+                : undefined,
+            endpoint:
+              item?.endpoint === "/v1/responses" ||
+              item?.endpoint === "/v1/chat/completions" ||
+              item?.endpoint === "/v1/messages"
+                ? item.endpoint
+                : undefined,
+            baseUrl:
+              typeof item?.baseUrl === "string"
+                ? item.baseUrl
+                : typeof item?.base_url === "string"
+                  ? item.base_url
+                  : Array.isArray(item?.routes) &&
+                      typeof item.routes[0]?.baseUrl === "string"
+                    ? item.routes[0].baseUrl
+                    : "",
+            apiKey:
+              typeof item?.apiKey === "string"
+                ? item.apiKey
+                : typeof item?.api_key === "string"
+                  ? item.api_key
+                  : Array.isArray(item?.routes) &&
+                      typeof item.routes[0]?.apiKey === "string"
+                    ? item.routes[0].apiKey
+                    : "",
+            routeName:
+              typeof item?.routeName === "string"
+                ? item.routeName
+                : typeof item?.route_name === "string"
+                  ? item.route_name
+                  : Array.isArray(item?.routes) &&
+                      typeof item.routes[0]?.name === "string"
+                    ? item.routes[0].name
+                    : "",
+            authHeader:
+              item?.authHeader === "x-api-key" || item?.authHeader === "bearer"
+                ? item.authHeader
+                : Array.isArray(item?.routes) &&
+                    (item.routes[0]?.authHeader === "x-api-key" ||
+                      item.routes[0]?.authHeader === "bearer")
+                  ? item.routes[0].authHeader
+                  : undefined,
           }))
           .filter((item: CodexCatalogModel) => item.model.trim()),
       );

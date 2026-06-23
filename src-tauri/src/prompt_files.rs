@@ -25,6 +25,15 @@ pub fn prompt_file_path(app: &AppType) -> Result<PathBuf, AppError> {
         AppType::OpenCode => get_opencode_dir(),
         AppType::OpenClaw => get_openclaw_dir(),
         AppType::Hermes => crate::hermes_config::get_hermes_dir(),
+        AppType::Devin => dirs::home_dir()
+            .map(|home| home.join(".devin"))
+            .ok_or_else(|| {
+                AppError::localized(
+                    "home_dir_not_found",
+                    "无法确定 .devin 配置目录：用户主目录不存在",
+                    "Cannot determine .devin config directory: user home not found",
+                )
+            })?,
         AppType::ClaudeDesktop => unreachable!("handled above"),
     };
 
@@ -32,7 +41,7 @@ pub fn prompt_file_path(app: &AppType) -> Result<PathBuf, AppError> {
         AppType::Claude => "CLAUDE.md",
         AppType::Codex => "AGENTS.md",
         AppType::Gemini => "GEMINI.md",
-        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => "AGENTS.md",
+        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes | AppType::Devin => "AGENTS.md",
         AppType::ClaudeDesktop => unreachable!("handled above"),
     };
 

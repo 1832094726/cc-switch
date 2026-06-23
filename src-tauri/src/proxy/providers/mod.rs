@@ -23,6 +23,7 @@ pub mod copilot_model_map;
 mod gemini;
 pub(crate) mod gemini_schema;
 pub mod gemini_shadow;
+mod joycode_anthropic;
 pub mod models;
 pub mod streaming;
 pub mod streaming_codex_chat;
@@ -48,9 +49,14 @@ pub use claude::{
 pub use codex::CodexAdapter;
 pub use codex::{
     apply_codex_chat_upstream_model, codex_provider_upstream_model,
-    resolve_codex_chat_reasoning_config, should_convert_codex_responses_to_chat,
+    is_origin_only_url, resolve_codex_chat_reasoning_config,
+    should_convert_codex_chat_to_responses, should_convert_codex_responses_to_chat,
 };
 pub use gemini::GeminiAdapter;
+pub(crate) use joycode_anthropic::{
+    JoyCodeAnthropicAdapter, JOYCODE_DEFAULT_LANGUAGE, JOYCODE_VSCODE_CLIENT,
+    JOYCODE_VSCODE_CLIENT_VERSION,
+};
 
 /// 供应商类型枚举
 ///
@@ -167,7 +173,7 @@ impl ProviderType {
                 }
                 ProviderType::Claude
             }
-            AppType::Codex => ProviderType::Codex,
+            AppType::Codex | AppType::Devin => ProviderType::Codex,
             AppType::Gemini => {
                 // 检测是否为 CLI 模式（OAuth）
                 let adapter = GeminiAdapter::new();
@@ -236,7 +242,7 @@ impl std::str::FromStr for ProviderType {
 pub fn get_adapter(app_type: &AppType) -> Box<dyn ProviderAdapter> {
     match app_type {
         AppType::Claude | AppType::ClaudeDesktop => Box::new(ClaudeAdapter::new()),
-        AppType::Codex => Box::new(CodexAdapter::new()),
+        AppType::Codex | AppType::Devin => Box::new(CodexAdapter::new()),
         AppType::Gemini => Box::new(GeminiAdapter::new()),
         AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => {
             // These apps don't support proxy, fallback to Codex adapter

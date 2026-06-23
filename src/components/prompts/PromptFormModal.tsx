@@ -34,6 +34,7 @@ const PromptFormModal: React.FC<PromptFormModalProps> = ({
     claude: "CLAUDE.md",
     "claude-desktop": "CLAUDE.md",
     codex: "AGENTS.md",
+    devin: "AGENTS.md",
     gemini: "GEMINI.md",
     opencode: "AGENTS.md",
     hermes: "AGENTS.md",

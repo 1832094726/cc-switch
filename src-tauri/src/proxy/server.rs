@@ -2,11 +2,11 @@
 //!
 //! 基于Axum的HTTP服务器，处理代理请求
 //!
-//! Uses a manual hyper HTTP/1.1 accept loop with `preserve_header_case(true)` so
-//! that the original header-name casing from the CLI client is captured in a
-//! `HeaderCaseMap` extension.  This map is later forwarded to the upstream via
-//! the hyper-based HTTP client, producing wire-level header casing identical to
-//! a direct (non-proxied) CLI request.
+//! Uses a manual hyper accept loop. HTTP/1.1 connections enable
+//! `preserve_header_case(true)` so the original header-name casing from the CLI
+//! client is captured in a `HeaderCaseMap` extension. HTTP/2 prior-knowledge
+//! clients (h2c) are served separately, which is required for Connect clients
+//! such as Devin/Windsurf.
 
 use super::{
     failover_switch::FailoverSwitchManager,
@@ -23,11 +23,89 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tokio::task::JoinHandle;
+
+const HTTP2_PREFACE_PREFIX: &[u8] = b"PRI * HTTP/2";
+const INITIAL_PEEK_BYTES: usize = 8192;
+const INITIAL_PROTOCOL_PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+const INITIAL_PROTOCOL_PEEK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Http2PrefaceMatch {
+    Full,
+    Partial,
+    No,
+}
+
+fn looks_like_http2_preface(bytes: &[u8]) -> bool {
+    bytes.len() >= HTTP2_PREFACE_PREFIX.len()
+        && bytes[..HTTP2_PREFACE_PREFIX.len()] == *HTTP2_PREFACE_PREFIX
+}
+
+fn classify_http2_preface(bytes: &[u8]) -> Http2PrefaceMatch {
+    if looks_like_http2_preface(bytes) {
+        return Http2PrefaceMatch::Full;
+    }
+
+    if bytes.len() < HTTP2_PREFACE_PREFIX.len() && HTTP2_PREFACE_PREFIX.starts_with(bytes) {
+        return Http2PrefaceMatch::Partial;
+    }
+
+    Http2PrefaceMatch::No
+}
+
+async fn inspect_initial_connection(
+    stream: &tokio::net::TcpStream,
+) -> (super::hyper_client::OriginalHeaderCases, bool) {
+    let deadline = tokio::time::Instant::now() + INITIAL_PROTOCOL_PEEK_TIMEOUT;
+    let mut last_cases = super::hyper_client::OriginalHeaderCases::default();
+
+    loop {
+        let mut peek_buf = vec![0u8; INITIAL_PEEK_BYTES];
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        let peek_result = if remaining.is_zero() {
+            stream.peek(&mut peek_buf).await
+        } else {
+            match tokio::time::timeout(remaining, stream.peek(&mut peek_buf)).await {
+                Ok(result) => result,
+                Err(_) => return (last_cases, false),
+            }
+        };
+
+        match peek_result {
+            Ok(n) => {
+                let bytes = &peek_buf[..n];
+                let cases = super::hyper_client::OriginalHeaderCases::from_raw_bytes(bytes);
+                log::debug!(
+                    "[ProxyServer] Peeked {} bytes, captured {} header casings",
+                    n,
+                    cases.cases.len()
+                );
+                last_cases = cases;
+
+                match classify_http2_preface(bytes) {
+                    Http2PrefaceMatch::Full => return (last_cases, true),
+                    Http2PrefaceMatch::No => return (last_cases, false),
+                    Http2PrefaceMatch::Partial => {
+                        if tokio::time::Instant::now() >= deadline {
+                            return (last_cases, false);
+                        }
+                        tokio::time::sleep(INITIAL_PROTOCOL_PEEK_INTERVAL).await;
+                    }
+                }
+            }
+            Err(e) => {
+                log::debug!("[ProxyServer] peek failed (non-fatal): {e}");
+                return (last_cases, false);
+            }
+        }
+    }
+}
 
 /// 代理服务器状态（共享）
 #[derive(Clone)]
@@ -156,23 +234,8 @@ impl ProxyServer {
                         tokio::spawn(async move {
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
-                            let original_cases = {
-                                let mut peek_buf = vec![0u8; 8192];
-                                match stream.peek(&mut peek_buf).await {
-                                    Ok(n) => {
-                                        let cases = super::hyper_client::OriginalHeaderCases::from_raw_bytes(&peek_buf[..n]);
-                                        log::debug!(
-                                            "[ProxyServer] Peeked {} bytes, captured {} header casings",
-                                            n, cases.cases.len()
-                                        );
-                                        cases
-                                    }
-                                    Err(e) => {
-                                        log::debug!("[ProxyServer] peek failed (non-fatal): {e}");
-                                        super::hyper_client::OriginalHeaderCases::default()
-                                    }
-                                }
-                            };
+                            let (original_cases, is_http2_prior_knowledge) =
+                                inspect_initial_connection(&stream).await;
 
                             // service_fn 将 axum Router（tower::Service）桥接到 hyper
                             let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
@@ -191,7 +254,14 @@ impl ProxyServer {
                                 }
                             });
 
-                            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                            if is_http2_prior_knowledge {
+                                if let Err(e) = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                    .serve_connection(TokioIo::new(stream), service)
+                                    .await
+                                {
+                                    log::debug!("[{SRV}] HTTP/2 connection error: {e}", SRV = log_srv::CONN_ERR);
+                                }
+                            } else if let Err(e) = hyper::server::conn::http1::Builder::new()
                                 .preserve_header_case(true)
                                 .serve_connection(TokioIo::new(stream), service)
                                 .await
@@ -296,6 +366,83 @@ impl ProxyServer {
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))
+            .route("/devin/v1/messages", post(handlers::handle_devin_messages))
+            // JoyCode Anthropic adapter endpoint
+            .route(
+                "/api/saas/anthropic/v1/messages",
+                post(handlers::handle_devin_messages),
+            )
+            // Devin / Windsurf Connect-RPC protobuf entrypoint.
+            .route(
+                "/exa.api_server_pb.ApiServerService/GetChatMessage",
+                post(handlers::handle_devin_windsurf_get_chat_message),
+            )
+            .route(
+                "/_route/api_server/exa.api_server_pb.ApiServerService/GetChatMessage",
+                post(handlers::handle_devin_windsurf_get_chat_message),
+            )
+            .route(
+                "/_route/inference/exa.api_server_pb.ApiServerService/GetChatMessage",
+                post(handlers::handle_devin_windsurf_get_chat_message),
+            )
+            .route(
+                "/devin/exa.api_server_pb.ApiServerService/GetChatMessage",
+                post(handlers::handle_devin_windsurf_get_chat_message),
+            )
+            .route(
+                "/exa.api_server_pb.ApiServerService/*path",
+                any(handlers::handle_devin_windsurf_root_passthrough),
+            )
+            .route(
+                "/_route/api_server/*path",
+                any(handlers::handle_devin_windsurf_api_server_passthrough),
+            )
+            .route(
+                "/_route/inference/*path",
+                any(handlers::handle_devin_windsurf_inference_passthrough),
+            )
+            .route("/login", any(handlers::handle_devin_windsurf_web_redirect))
+            .route(
+                "/login/*path",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route("/signup", any(handlers::handle_devin_windsurf_web_redirect))
+            .route(
+                "/signup/*path",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/profile",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/profile/*path",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/redirect/*path",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/changelog",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/changelog/*path",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/authorize",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/oauth/authorize",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
+            .route(
+                "/favicon.ico",
+                any(handlers::handle_devin_windsurf_web_redirect),
+            )
             // Claude Desktop 3P 本地 gateway（独立 provider namespace）
             .route(
                 "/claude-desktop/v1/models",
@@ -319,14 +466,23 @@ impl ProxyServer {
                 "/codex/v1/chat/completions",
                 post(handlers::handle_chat_completions),
             )
+            .route(
+                "/devin/v1/chat/completions",
+                post(handlers::handle_devin_chat_completions),
+            )
             // OpenAI Models API (Codex CLI reachability check)
             .route("/models", get(handlers::handle_models))
             .route("/v1/models", get(handlers::handle_models))
+            .route("/devin/v1/models", get(handlers::handle_devin_models))
             // OpenAI Responses API (Codex CLI，支持带前缀和不带前缀)
             .route("/responses", post(handlers::handle_responses))
             .route("/v1/responses", post(handlers::handle_responses))
             .route("/v1/v1/responses", post(handlers::handle_responses))
             .route("/codex/v1/responses", post(handlers::handle_responses))
+            .route(
+                "/devin/v1/responses",
+                post(handlers::handle_devin_responses),
+            )
             // OpenAI Responses Compact API (Codex CLI 远程压缩，透传)
             .route(
                 "/responses/compact",
@@ -343,6 +499,10 @@ impl ProxyServer {
             .route(
                 "/codex/v1/responses/compact",
                 post(handlers::handle_responses_compact),
+            )
+            .route(
+                "/devin/v1/responses/compact",
+                post(handlers::handle_devin_responses_compact),
             )
             // Gemini API (支持带前缀和不带前缀)
             //
@@ -391,5 +551,41 @@ impl ProxyServer {
             .provider_router
             .reset_provider_breaker(provider_id, app_type)
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_http2_preface, looks_like_http2_preface, Http2PrefaceMatch};
+
+    #[test]
+    fn detects_http2_prior_knowledge_preface() {
+        assert!(looks_like_http2_preface(
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_partial_or_http1_requests_as_http2() {
+        assert!(!looks_like_http2_preface(b"P"));
+        assert!(!looks_like_http2_preface(b"POST /v1/messages HTTP/1.1\r\n"));
+        assert!(!looks_like_http2_preface(b"PRI /health HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn classifies_partial_http2_preface_for_delayed_peek() {
+        assert_eq!(classify_http2_preface(b"P"), Http2PrefaceMatch::Partial);
+        assert_eq!(
+            classify_http2_preface(b"PRI * HTTP/"),
+            Http2PrefaceMatch::Partial
+        );
+        assert_eq!(
+            classify_http2_preface(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+            Http2PrefaceMatch::Full
+        );
+        assert_eq!(
+            classify_http2_preface(b"POST /v1/messages HTTP/1.1\r\n"),
+            Http2PrefaceMatch::No
+        );
     }
 }

@@ -102,6 +102,33 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     iconColor: "#00A67E",
   },
   {
+    name: "JoyCode",
+    websiteUrl: "https://joycode-api.jd.com",
+    category: "third_party",
+    auth: generateThirdPartyAuth("sk-joycode-proxy"),
+    config: `model_provider = "custom"
+model = "GPT 5.3-codex"
+review_model = "GPT 5.3-codex"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "joycode"
+base_url = "https://joycode-api.jd.com/api/saas/openai/v1"
+wire_api = "responses"
+requires_openai_auth = true`,
+    endpointCandidates: ["https://joycode-api.jd.com/api/saas/openai/v1"],
+    apiFormat: "openai_responses",
+    modelCatalog: modelCatalog([
+      {
+        model: "GPT 5.3-codex",
+        displayName: "GPT 5.3 Codex",
+        contextWindow: 256000,
+      },
+    ]),
+    icon: "openai",
+  },
+  {
     name: "Shengsuanyun",
     nameKey: "providerForm.presets.shengsuanyun",
     websiteUrl: "https://www.shengsuanyun.com/?from=CH_4HHXMRYF",
@@ -749,14 +776,14 @@ requires_openai_auth = true`,
     config: generateThirdPartyConfig(
       "siliconflow",
       "https://api.siliconflow.cn/v1",
-      "Pro/MiniMaxAI/MiniMax-M2.7",
+      "deepseek-ai/DeepSeek-V3.2",
     ),
     endpointCandidates: ["https://api.siliconflow.cn/v1"],
     apiFormat: "openai_chat",
     modelCatalog: modelCatalog([
       {
-        model: "Pro/MiniMaxAI/MiniMax-M2.7",
-        displayName: "Pro / MiniMax M2.7",
+        model: "deepseek-ai/DeepSeek-V3.2",
+        displayName: "DeepSeek V3.2",
         contextWindow: 200000,
       },
     ]),
@@ -774,14 +801,14 @@ requires_openai_auth = true`,
     config: generateThirdPartyConfig(
       "siliconflow_en",
       "https://api.siliconflow.com/v1",
-      "MiniMaxAI/MiniMax-M2.7",
+      "deepseek-ai/DeepSeek-V3.2",
     ),
     endpointCandidates: ["https://api.siliconflow.com/v1"],
     apiFormat: "openai_chat",
     modelCatalog: modelCatalog([
       {
-        model: "MiniMaxAI/MiniMax-M2.7",
-        displayName: "MiniMax M2.7",
+        model: "deepseek-ai/DeepSeek-V3.2",
+        displayName: "DeepSeek V3.2",
         contextWindow: 200000,
       },
     ]),
@@ -1297,6 +1324,34 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
     category: "aggregator",
     icon: "openrouter",
     iconColor: "#6566F1",
+  },
+  {
+    name: "Muyuan",
+    websiteUrl: "https://muyuan.do",
+    auth: generateThirdPartyAuth(""),
+    config: generateThirdPartyConfig("muyuan", "https://muyuan.do/v1", "gpt-5.5"),
+    endpointCandidates: ["https://muyuan.do/v1"],
+    category: "aggregator",
+    apiFormat: "openai_chat",
+    modelCatalog: modelCatalog([
+      {
+        model: "gpt-5.5",
+        displayName: "GPT 5.5",
+      },
+      {
+        model: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet 4.6",
+      },
+    ]),
+    codexChatReasoning: {
+      supportsThinking: true,
+      supportsEffort: true,
+      thinkingParam: "thinking",
+      effortParam: "reasoning_effort",
+      effortValueMode: "passthrough",
+      outputFormat: "reasoning_content",
+    },
+    icon: "newapi",
   },
   {
     name: "TheRouter",

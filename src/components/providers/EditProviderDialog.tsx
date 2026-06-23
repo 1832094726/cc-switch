@@ -69,7 +69,11 @@ export function EditProviderDialog({
       // OpenCode uses additive mode - each provider's config is stored independently in DB
       // Reading live config would return the full opencode.json (with $schema, provider, mcp etc.)
       // instead of just the provider fragment, causing incorrect nested structure on save
-      if (appId === "opencode") {
+      if (
+        appId === "opencode" ||
+        appId === "devin" ||
+        (appId === "codex" && provider.category !== "official")
+      ) {
         if (!cancelled) {
           setLiveSettings(null);
           setHasLoadedLive(true);
@@ -143,7 +147,7 @@ export function EditProviderDialog({
     // 若放任 Live 覆盖，编辑界面会显示空映射表，保存后连同数据库里的映射一起清空（数据丢失）。
     // 因此始终以数据库 SSOT 的 modelCatalog 为准，仅在数据库确实没有时才回退到 Live 反解结果。
     if (
-      appId === "codex" &&
+      (appId === "codex" || appId === "devin") &&
       liveSettings &&
       provider?.settingsConfig &&
       typeof provider.settingsConfig === "object"
@@ -189,7 +193,7 @@ export function EditProviderDialog({
         unknown
       >;
       const nextProviderId =
-        (appId === "opencode" || appId === "openclaw") &&
+        (appId === "opencode" || appId === "openclaw" || appId === "hermes") &&
         values.providerKey?.trim()
           ? values.providerKey.trim()
           : provider.id;

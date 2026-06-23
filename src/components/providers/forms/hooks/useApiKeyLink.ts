@@ -3,6 +3,7 @@ import type { AppId } from "@/lib/api";
 import type { ProviderCategory } from "@/types";
 import type { ProviderPreset } from "@/config/claudeProviderPresets";
 import type { CodexProviderPreset } from "@/config/codexProviderPresets";
+import type { DevinProviderPreset } from "@/config/devinProviderPresets";
 import type { GeminiProviderPreset } from "@/config/geminiProviderPresets";
 import type { OpenCodeProviderPreset } from "@/config/opencodeProviderPresets";
 
@@ -11,6 +12,7 @@ type PresetEntry = {
   preset:
     | ProviderPreset
     | CodexProviderPreset
+    | DevinProviderPreset
     | GeminiProviderPreset
     | OpenCodeProviderPreset;
 };
@@ -81,6 +83,7 @@ export function useApiKeyLink({
     shouldShowApiKeyLink:
       appId === "claude" ||
       appId === "codex" ||
+      appId === "devin" ||
       appId === "gemini" ||
       appId === "opencode"
         ? shouldShowApiKeyLink

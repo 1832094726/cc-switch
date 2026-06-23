@@ -5,6 +5,14 @@ import { FormLabel } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
@@ -26,6 +34,7 @@ import {
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
+import { DEVIN_WINDSURF_MODEL_OPTIONS } from "@/config/devinProviderPresets";
 import { cn } from "@/lib/utils";
 import type {
   CodexApiFormat,
@@ -39,6 +48,7 @@ interface EndpointCandidate {
 }
 
 interface CodexFormFieldsProps {
+  appId?: "codex" | "devin";
   providerId?: string;
   // API Key
   codexApiKey: string;
@@ -82,19 +92,84 @@ interface CodexFormFieldsProps {
 
 type CodexCatalogRow = CodexCatalogModel & { rowId: string };
 
+const DEVIN_CUSTOM_MODEL_VALUE = "__cc_switch_devin_custom_model__";
+const DEVIN_DEFAULT_AUTH_HEADER: NonNullable<CodexCatalogModel["authHeader"]> =
+  "bearer";
+const JOYCODE_DEVIN_ROUTE_DEFAULTS: Record<
+  string,
+  Pick<
+    CodexCatalogModel,
+    "upstreamModel" | "endpoint" | "authHeader" | "thinkingEnabled"
+  >
+> = {
+  "swe-1-6-slow": {
+    upstreamModel: "GPT 5.3-codex",
+    endpoint: "/v1/responses",
+    authHeader: "bearer",
+  },
+  MODEL_CLAUDE_4_SONNET_BYOK: {
+    upstreamModel: "Claude-Sonnet-4.6-hq",
+    endpoint: "/v1/chat/completions",
+    authHeader: "bearer",
+  },
+  MODEL_CLAUDE_4_OPUS_THINKING_BYOK: {
+    upstreamModel: "Claude-Opus-4.6-hq",
+    endpoint: "/v1/chat/completions",
+    authHeader: "bearer",
+  },
+  MODEL_CLAUDE_4_OPUS_BYOK: {
+    upstreamModel: "Claude-Opus-4.6-hq",
+    endpoint: "/v1/chat/completions",
+    authHeader: "bearer",
+  },
+};
+
 function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
+  const firstRoute = seed?.routes?.[0];
   return {
     rowId: crypto.randomUUID(),
     model: seed?.model ?? "",
     displayName: seed?.displayName ?? "",
     contextWindow: seed?.contextWindow ?? "",
+    upstreamModel: seed?.upstreamModel ?? "",
+    provider: seed?.provider,
+    endpoint: seed?.endpoint,
+    baseUrl: seed?.baseUrl ?? firstRoute?.baseUrl ?? "",
+    apiKey: seed?.apiKey ?? firstRoute?.apiKey ?? "",
+    routeName: seed?.routeName ?? firstRoute?.name ?? "",
+    authHeader: seed?.authHeader ?? firstRoute?.authHeader,
+    headers: seed?.headers ?? firstRoute?.headers,
+    responsesMode: seed?.responsesMode ?? firstRoute?.responsesMode,
+    responsesCodexCompat:
+      seed?.responsesCodexCompat ?? firstRoute?.responsesCodexCompat,
+    responsesFastMode: seed?.responsesFastMode ?? firstRoute?.responsesFastMode,
+    thinkingEnabled: seed?.thinkingEnabled ?? firstRoute?.thinkingEnabled,
   };
 }
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
 // so both sync effects can use the same equality definition.
 function catalogRowsMatchModels(
-  rows: Array<Pick<CodexCatalogRow, "model" | "displayName" | "contextWindow">>,
+  rows: Array<
+    Pick<
+      CodexCatalogRow,
+      | "model"
+      | "displayName"
+      | "contextWindow"
+      | "upstreamModel"
+      | "provider"
+      | "endpoint"
+      | "baseUrl"
+      | "apiKey"
+      | "routeName"
+      | "authHeader"
+      | "headers"
+      | "responsesMode"
+      | "responsesCodexCompat"
+      | "responsesFastMode"
+      | "thinkingEnabled"
+    >
+  >,
   models: CodexCatalogModel[],
 ): boolean {
   if (rows.length !== models.length) return false;
@@ -103,12 +178,43 @@ function catalogRowsMatchModels(
     return (
       row.model === (incoming.model ?? "") &&
       (row.displayName ?? "") === (incoming.displayName ?? "") &&
-      String(row.contextWindow ?? "") === String(incoming.contextWindow ?? "")
+      String(row.contextWindow ?? "") ===
+        String(incoming.contextWindow ?? "") &&
+      (row.upstreamModel ?? "") === (incoming.upstreamModel ?? "") &&
+      (row.provider ?? "") === (incoming.provider ?? "") &&
+      (row.endpoint ?? "") === (incoming.endpoint ?? "") &&
+      (row.baseUrl ?? "") ===
+        (incoming.baseUrl ?? incoming.routes?.[0]?.baseUrl ?? "") &&
+      (row.apiKey ?? "") ===
+        (incoming.apiKey ?? incoming.routes?.[0]?.apiKey ?? "") &&
+      (row.routeName ?? "") ===
+        (incoming.routeName ?? incoming.routes?.[0]?.name ?? "") &&
+      (row.authHeader ?? "") ===
+        (incoming.authHeader ?? incoming.routes?.[0]?.authHeader ?? "") &&
+      JSON.stringify(row.headers ?? {}) ===
+        JSON.stringify(
+          incoming.headers ?? incoming.routes?.[0]?.headers ?? {},
+        ) &&
+      (row.responsesMode ?? "") ===
+        (incoming.responsesMode ?? incoming.routes?.[0]?.responsesMode ?? "") &&
+      (row.responsesCodexCompat ?? undefined) ===
+        (incoming.responsesCodexCompat ??
+          incoming.routes?.[0]?.responsesCodexCompat ??
+          undefined) &&
+      (row.responsesFastMode ?? undefined) ===
+        (incoming.responsesFastMode ??
+          incoming.routes?.[0]?.responsesFastMode ??
+          undefined) &&
+      (row.thinkingEnabled ?? undefined) ===
+        (incoming.thinkingEnabled ??
+          incoming.routes?.[0]?.thinkingEnabled ??
+          undefined)
     );
   });
 }
 
 export function CodexFormFields({
+  appId = "codex",
   providerId,
   codexApiKey,
   onApiKeyChange,
@@ -141,7 +247,12 @@ export function CodexFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
-  const needsLocalRouting = apiFormat === "openai_chat";
+  const isDevin = appId === "devin";
+  const isJoyCodeDevinProvider =
+    isDevin &&
+    ((providerId ?? "").toLowerCase().includes("joycode") ||
+      /(?:127\.0\.0\.1|localhost):8081/.test(codexBaseUrl));
+  const needsLocalRouting = isDevin || apiFormat === "openai_chat";
   const canEditCatalog = Boolean(onCatalogModelsChange);
   const canEditReasoning = Boolean(onCodexChatReasoningChange);
   const supportsThinking =
@@ -183,13 +294,79 @@ export function CodexFormFields({
   useEffect(() => {
     if (!onCatalogModelsChange) return;
     const next: CodexCatalogModel[] = catalogRows.map(
-      ({ rowId: _rowId, ...rest }) => rest,
+      ({
+        rowId: _rowId,
+        baseUrl,
+        apiKey,
+        routeName,
+        authHeader,
+        endpoint,
+        provider,
+        ...rest
+      }) => {
+        if (!isDevin) return rest;
+        const normalizedEndpoint = endpoint ?? "/v1/responses";
+        const routeBaseUrl = (
+          isDevin ? codexBaseUrl || baseUrl : baseUrl
+        )?.trim();
+        const routeApiKey = (isDevin ? codexApiKey || apiKey : apiKey)?.trim();
+        const routeAuthHeader =
+          authHeader ??
+          (normalizedEndpoint === "/v1/messages" ? "x-api-key" : "bearer");
+        const responsesFields =
+          normalizedEndpoint === "/v1/responses"
+            ? {
+                ...(rest.responsesMode
+                  ? { responsesMode: rest.responsesMode }
+                  : {}),
+                ...(rest.responsesCodexCompat !== undefined
+                  ? { responsesCodexCompat: rest.responsesCodexCompat }
+                  : {}),
+                ...(rest.responsesFastMode !== undefined
+                  ? { responsesFastMode: rest.responsesFastMode }
+                  : {}),
+              }
+            : {};
+        const routeHeaders =
+          rest.headers && Object.keys(rest.headers).length > 0
+            ? rest.headers
+            : undefined;
+        return {
+          ...rest,
+          provider:
+            provider ??
+            (normalizedEndpoint === "/v1/messages" ? "anthropic" : "openai"),
+          endpoint: normalizedEndpoint,
+          ...(routeBaseUrl ? { baseUrl: routeBaseUrl } : {}),
+          ...(routeApiKey ? { apiKey: routeApiKey } : {}),
+          ...(routeAuthHeader ? { authHeader: routeAuthHeader } : {}),
+          ...responsesFields,
+          routes:
+            routeBaseUrl || routeApiKey
+              ? [
+                  {
+                    name: (routeName ?? "").trim() || "primary",
+                    baseUrl: routeBaseUrl,
+                    apiKey: routeApiKey,
+                    enabled: true,
+                    priority: 10,
+                    authHeader: routeAuthHeader,
+                    ...(routeHeaders ? { headers: routeHeaders } : {}),
+                    ...responsesFields,
+                    ...(rest.thinkingEnabled !== undefined
+                      ? { thinkingEnabled: rest.thinkingEnabled }
+                      : {}),
+                  },
+                ]
+              : undefined,
+        };
+      },
     );
     // 只有当数据真的变化时才通知父组件
-    if (catalogRowsMatchModels(catalogRows, lastSentModelsRef.current)) return;
+    if (catalogRowsMatchModels(next, lastSentModelsRef.current)) return;
     lastSentModelsRef.current = next;
     onCatalogModelsChange(next);
-  }, [catalogRows, onCatalogModelsChange]);
+  }, [catalogRows, codexApiKey, codexBaseUrl, isDevin, onCatalogModelsChange]);
 
   const handleLocalRoutingChange = useCallback(
     (checked: boolean) => {
@@ -260,8 +437,25 @@ export function CodexFormFields({
 
   const handleAddCatalogRow = useCallback(() => {
     if (!onCatalogModelsChange) return;
-    setCatalogRows((current) => [...current, createCatalogRow()]);
-  }, [onCatalogModelsChange]);
+    setCatalogRows((current) => [
+      ...current,
+      createCatalogRow(
+        isDevin
+          ? {
+              baseUrl: codexBaseUrl,
+              apiKey: codexApiKey,
+              endpoint:
+                apiFormat === "openai_chat"
+                  ? "/v1/chat/completions"
+                  : "/v1/responses",
+              provider: "openai",
+              authHeader: "bearer",
+              responsesMode: apiFormat === "openai_chat" ? undefined : "codex",
+            }
+          : undefined,
+      ),
+    ]);
+  }, [apiFormat, codexApiKey, codexBaseUrl, isDevin, onCatalogModelsChange]);
 
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
@@ -275,6 +469,43 @@ export function CodexFormFields({
   const handleRemoveCatalogRow = useCallback((index: number) => {
     setCatalogRows((current) => current.filter((_, i) => i !== index));
   }, []);
+
+  const devinModelOptions = DEVIN_WINDSURF_MODEL_OPTIONS;
+  const getDevinRoutePatch = (
+    model: string,
+    row?: CodexCatalogRow,
+  ): Partial<CodexCatalogModel> => {
+    const option = devinModelOptions.find((item) => item.model === model);
+    const joycodeDefaults = isJoyCodeDevinProvider
+      ? JOYCODE_DEVIN_ROUTE_DEFAULTS[model]
+      : undefined;
+    const isClaudeRoute = option?.family === "claude";
+    const endpoint: CodexCatalogModel["endpoint"] =
+      joycodeDefaults?.endpoint ??
+      (isClaudeRoute
+        ? "/v1/messages"
+        : apiFormat === "openai_chat"
+          ? "/v1/chat/completions"
+          : "/v1/responses");
+
+    return {
+      model,
+      displayName: option?.displayName ?? model,
+      upstreamModel:
+        joycodeDefaults?.upstreamModel ??
+        (isClaudeRoute ? "claude-sonnet-4-6" : "gpt-5.5"),
+      endpoint,
+      provider: endpoint === "/v1/messages" ? "anthropic" : "openai",
+      authHeader:
+        joycodeDefaults?.authHeader ??
+        row?.authHeader ??
+        DEVIN_DEFAULT_AUTH_HEADER,
+      responsesMode: endpoint === "/v1/responses" ? "codex" : undefined,
+      thinkingEnabled: joycodeDefaults?.thinkingEnabled ?? row?.thinkingEnabled,
+      baseUrl: row?.baseUrl || codexBaseUrl,
+      apiKey: row?.apiKey || codexApiKey,
+    };
+  };
 
   const renderCatalogActionButtons = (onAdd: () => void, addLabel: string) => (
     <div className="flex gap-1">
@@ -379,7 +610,7 @@ export function CodexFormFields({
           )}
           <CollapsibleContent className="space-y-3 pt-3">
             {/* 本地路由映射开关 —— 沿用 shouldShowSpeedTest 门控，cloud_provider 保持不可切换 */}
-            {shouldShowSpeedTest && (
+            {shouldShowSpeedTest && !isDevin && (
               <div className="flex items-center justify-between gap-4">
                 <div className="space-y-1">
                   <FormLabel>
@@ -409,7 +640,7 @@ export function CodexFormFields({
               </div>
             )}
 
-            {needsLocalRouting && canEditReasoning && (
+            {needsLocalRouting && canEditReasoning && !isDevin && (
               <div
                 className={cn(
                   "space-y-3",
@@ -510,125 +741,320 @@ export function CodexFormFields({
                     )}
                   </div>
                   <p className="text-xs leading-relaxed text-muted-foreground">
-                    {t("codexConfig.modelMappingHint", {
-                      defaultValue:
-                        "选择模型角色后，CC Switch 会自动生成 Codex 兼容路由；菜单显示名可以填 DeepSeek、Kimi 等品牌模型，实际请求模型按右侧填写内容发送。",
-                    })}
+                    {isDevin
+                      ? t("devinConfig.modelMappingHint", {
+                          defaultValue:
+                            "每行选择一个 Devin 请求模型，并填写对应的上游模型和端点；Base URL 和 API Key 使用上方配置。",
+                        })
+                      : t("codexConfig.modelMappingHint", {
+                          defaultValue:
+                            "选择模型角色后，CC Switch 会自动生成 Codex 兼容路由；菜单显示名可以填 DeepSeek、Kimi 等品牌模型，实际请求模型按右侧填写内容发送。",
+                        })}
                   </p>
                 </div>
 
                 {catalogRows.length > 0 && (
                   <div className="space-y-2">
                     {/* 列头：md+ 显示 */}
-                    <div className="hidden grid-cols-[1fr_1fr_140px_36px] gap-2 px-1 text-xs font-medium text-muted-foreground md:grid">
-                      <span>
-                        {t("codexConfig.catalogColumnDisplay", {
-                          defaultValue: "菜单显示名",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnModel", {
-                          defaultValue: "实际请求模型",
-                        })}
-                      </span>
-                      <span>
-                        {t("codexConfig.catalogColumnContext", {
-                          defaultValue: "上下文窗口",
-                        })}
-                      </span>
-                      <span />
+                    <div
+                      className={cn(
+                        "hidden gap-2 px-1 text-xs font-medium text-muted-foreground md:grid",
+                        isDevin
+                          ? "grid-cols-[minmax(220px,1fr)_minmax(260px,1.4fr)_120px_36px]"
+                          : "grid-cols-[1fr_1fr_140px_36px]",
+                      )}
+                    >
+                      {isDevin ? (
+                        <>
+                          <span>
+                            {t("devinConfig.requestModel", {
+                              defaultValue: "Devin 请求模型",
+                            })}
+                          </span>
+                          <span>
+                            {t("devinConfig.routeSummary", {
+                              defaultValue: "上游路由",
+                            })}
+                          </span>
+                          <span>Thinking</span>
+                          <span />
+                        </>
+                      ) : (
+                        <>
+                          <span>
+                            {t("codexConfig.catalogColumnDisplay", {
+                              defaultValue: "菜单显示名",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnModel", {
+                              defaultValue: "实际请求模型",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnContext", {
+                              defaultValue: "上下文窗口",
+                            })}
+                          </span>
+                          <span />
+                        </>
+                      )}
                     </div>
 
-                    {catalogRows.map((row, index) => (
-                      <div
-                        key={row.rowId}
-                        className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_36px]"
-                      >
-                        <Input
-                          value={row.displayName ?? ""}
-                          onChange={(event) =>
-                            handleUpdateCatalogRow(index, {
-                              displayName: event.target.value,
-                            })
-                          }
-                          placeholder={t(
-                            "codexConfig.catalogDisplayNamePlaceholder",
-                            {
-                              defaultValue: "例如: DeepSeek V4 Flash",
-                            },
-                          )}
-                          aria-label={t("codexConfig.catalogColumnDisplay", {
-                            defaultValue: "菜单显示名",
-                          })}
-                        />
-                        <div className="flex gap-1">
+                    {catalogRows.map((row, index) => {
+                      if (isDevin) {
+                        const isKnownDevinModel = devinModelOptions.some(
+                          (option) => option.model === row.model,
+                        );
+                        return (
+                          <div
+                            key={row.rowId}
+                            className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(220px,1fr)_minmax(260px,1.4fr)_120px_36px]"
+                          >
+                            <div className="grid gap-1">
+                              <Select
+                                value={
+                                  isKnownDevinModel
+                                    ? row.model
+                                    : DEVIN_CUSTOM_MODEL_VALUE
+                                }
+                                onValueChange={(value) => {
+                                  if (value === DEVIN_CUSTOM_MODEL_VALUE) {
+                                    handleUpdateCatalogRow(index, {
+                                      model: "",
+                                      displayName: "",
+                                    });
+                                    return;
+                                  }
+                                  handleUpdateCatalogRow(
+                                    index,
+                                    getDevinRoutePatch(value, row),
+                                  );
+                                }}
+                              >
+                                <SelectTrigger>
+                                  <SelectValue
+                                    placeholder={t("devinConfig.selectModel", {
+                                      defaultValue: "选择 Devin 请求模型",
+                                    })}
+                                  />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {devinModelOptions.map((option) => (
+                                    <SelectItem
+                                      key={option.model}
+                                      value={option.model}
+                                    >
+                                      {option.displayName}
+                                    </SelectItem>
+                                  ))}
+                                  <SelectSeparator />
+                                  <SelectItem value={DEVIN_CUSTOM_MODEL_VALUE}>
+                                    {t("common.custom", {
+                                      defaultValue: "自定义",
+                                    })}
+                                  </SelectItem>
+                                </SelectContent>
+                              </Select>
+                              {!isKnownDevinModel && (
+                                <Input
+                                  value={row.model}
+                                  onChange={(event) =>
+                                    handleUpdateCatalogRow(index, {
+                                      model: event.target.value,
+                                      displayName: event.target.value,
+                                    })
+                                  }
+                                  placeholder="MODEL_CLAUDE_4_SONNET_BYOK"
+                                  aria-label={t("devinConfig.requestModel", {
+                                    defaultValue: "Devin 请求模型",
+                                  })}
+                                />
+                              )}
+                            </div>
+                            <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(120px,1fr)_170px]">
+                              <div className="flex gap-1">
+                                <Input
+                                  value={row.upstreamModel ?? ""}
+                                  onChange={(event) =>
+                                    handleUpdateCatalogRow(index, {
+                                      upstreamModel: event.target.value,
+                                    })
+                                  }
+                                  placeholder="gpt-5.5"
+                                  aria-label={t("devinConfig.upstreamModel", {
+                                    defaultValue: "上游模型",
+                                  })}
+                                  className="flex-1"
+                                />
+                                {fetchedModels.length > 0 && (
+                                  <ModelDropdown
+                                    models={fetchedModels}
+                                    onSelect={(id) =>
+                                      handleUpdateCatalogRow(index, {
+                                        upstreamModel: id,
+                                      })
+                                    }
+                                  />
+                                )}
+                              </div>
+                              <Select
+                                value={row.endpoint ?? "/v1/responses"}
+                                onValueChange={(value) =>
+                                  handleUpdateCatalogRow(index, {
+                                    endpoint:
+                                      value as CodexCatalogModel["endpoint"],
+                                    provider:
+                                      value === "/v1/messages"
+                                        ? "anthropic"
+                                        : "openai",
+                                    authHeader:
+                                      row.authHeader ??
+                                      DEVIN_DEFAULT_AUTH_HEADER,
+                                  })
+                                }
+                              >
+                                <SelectTrigger>
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="/v1/responses">
+                                    /v1/responses
+                                  </SelectItem>
+                                  <SelectItem value="/v1/chat/completions">
+                                    /v1/chat/completions
+                                  </SelectItem>
+                                  <SelectItem value="/v1/messages">
+                                    /v1/messages
+                                  </SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                            <div className="flex h-9 items-center justify-between gap-2 rounded-md border border-border-default px-3">
+                              <span className="text-xs text-muted-foreground">
+                                Thinking
+                              </span>
+                              <Switch
+                                checked={row.thinkingEnabled !== false}
+                                onCheckedChange={(checked) =>
+                                  handleUpdateCatalogRow(index, {
+                                    thinkingEnabled: checked
+                                      ? undefined
+                                      : false,
+                                  })
+                                }
+                                aria-label="Thinking"
+                              />
+                            </div>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                              onClick={() => handleRemoveCatalogRow(index)}
+                              title={t("common.delete", {
+                                defaultValue: "删除",
+                              })}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div
+                          key={row.rowId}
+                          className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_36px]"
+                        >
                           <Input
-                            value={row.model}
+                            value={row.displayName ?? ""}
                             onChange={(event) =>
                               handleUpdateCatalogRow(index, {
-                                model: event.target.value,
+                                displayName: event.target.value,
                               })
                             }
                             placeholder={t(
-                              "codexConfig.catalogModelPlaceholder",
+                              "codexConfig.catalogDisplayNamePlaceholder",
                               {
-                                defaultValue: "例如: deepseek-v4-flash",
+                                defaultValue: "例如: DeepSeek V4 Flash",
                               },
                             )}
-                            aria-label={t("codexConfig.catalogColumnModel", {
-                              defaultValue: "实际请求模型",
+                            aria-label={t("codexConfig.catalogColumnDisplay", {
+                              defaultValue: "菜单显示名",
                             })}
-                            className="flex-1"
                           />
-                          {fetchedModels.length > 0 && (
-                            <ModelDropdown
-                              models={fetchedModels}
-                              onSelect={(id) =>
+                          <div className="flex gap-1">
+                            <Input
+                              value={row.model}
+                              onChange={(event) =>
                                 handleUpdateCatalogRow(index, {
-                                  model: id,
-                                  displayName: row.displayName?.trim()
-                                    ? row.displayName
-                                    : id,
+                                  model: event.target.value,
                                 })
                               }
+                              placeholder={t(
+                                "codexConfig.catalogModelPlaceholder",
+                                {
+                                  defaultValue: "例如: deepseek-v4-flash",
+                                },
+                              )}
+                              aria-label={t("codexConfig.catalogColumnModel", {
+                                defaultValue: "实际请求模型",
+                              })}
+                              className="flex-1"
                             />
-                          )}
+                            {fetchedModels.length > 0 && (
+                              <ModelDropdown
+                                models={fetchedModels}
+                                onSelect={(id) =>
+                                  handleUpdateCatalogRow(index, {
+                                    model: id,
+                                    displayName: row.displayName?.trim()
+                                      ? row.displayName
+                                      : id,
+                                  })
+                                }
+                              />
+                            )}
+                          </div>
+                          <Input
+                            type="number"
+                            min={1}
+                            inputMode="numeric"
+                            value={row.contextWindow ?? ""}
+                            onChange={(event) =>
+                              handleUpdateCatalogRow(index, {
+                                contextWindow: event.target.value.replace(
+                                  /[^\d]/g,
+                                  "",
+                                ),
+                              })
+                            }
+                            placeholder={t(
+                              "codexConfig.contextWindowPlaceholder",
+                              {
+                                defaultValue: "例如: 128000",
+                              },
+                            )}
+                            aria-label={t("codexConfig.catalogColumnContext", {
+                              defaultValue: "上下文窗口",
+                            })}
+                          />
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-9 w-9 text-muted-foreground hover:text-destructive"
+                            onClick={() => handleRemoveCatalogRow(index)}
+                            title={t("common.delete", {
+                              defaultValue: "删除",
+                            })}
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
                         </div>
-                        <Input
-                          type="number"
-                          min={1}
-                          inputMode="numeric"
-                          value={row.contextWindow ?? ""}
-                          onChange={(event) =>
-                            handleUpdateCatalogRow(index, {
-                              contextWindow: event.target.value.replace(
-                                /[^\d]/g,
-                                "",
-                              ),
-                            })
-                          }
-                          placeholder={t(
-                            "codexConfig.contextWindowPlaceholder",
-                            {
-                              defaultValue: "例如: 128000",
-                            },
-                          )}
-                          aria-label={t("codexConfig.catalogColumnContext", {
-                            defaultValue: "上下文窗口",
-                          })}
-                        />
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="h-9 w-9 text-muted-foreground hover:text-destructive"
-                          onClick={() => handleRemoveCatalogRow(index)}
-                          title={t("common.delete", { defaultValue: "删除" })}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

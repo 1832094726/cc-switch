@@ -1739,6 +1739,37 @@ model = "gpt-5.4"
     }
 
     #[test]
+    fn prepare_provider_live_config_overwrites_stale_provider_token() {
+        let input = r#"model_provider = "vendor_alpha"
+model = "gpt-5.4"
+
+[model_providers.vendor_alpha]
+name = "Vendor Alpha"
+base_url = "https://alpha.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-old"
+"#;
+
+        let result =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-new"}), input)
+                .expect("prepare live config");
+        let parsed: toml::Value = toml::from_str(&result).unwrap();
+
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|v| v.get("vendor_alpha"))
+                .and_then(|v| v.get("experimental_bearer_token"))
+                .and_then(|v| v.as_str()),
+            Some("sk-new")
+        );
+        assert!(
+            !result.contains("sk-old"),
+            "stale provider token should not survive live config generation"
+        );
+    }
+
+    #[test]
     fn backfill_preserves_live_model_provider_id() {
         let mut live_settings = json!({
             "auth": {},

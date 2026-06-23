@@ -3,6 +3,7 @@ use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
 use indexmap::IndexMap;
 use rusqlite::params;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
 type OmoProviderRow = (
@@ -705,6 +706,496 @@ impl Database {
 
         Ok(true)
     }
+
+    /// Repair built-in Devin provider catalogs after upgrades.
+    ///
+    /// Early Devin presets stored Windsurf aliases as direct upstream model names
+    /// (for example `MODEL_CLAUDE_4_SONNET_BYOK`), which made NewAPI-compatible
+    /// upstreams reject requests. This keeps user credentials and custom rows, but
+    /// refreshes known built-in routes to the current protobuf -> provider mapping.
+    pub fn repair_devin_builtin_provider_catalogs(&self) -> Result<usize, AppError> {
+        let providers = self.get_all_providers("devin")?;
+        let mut repaired = 0usize;
+
+        for (_, mut provider) in providers {
+            let Some(kind) = DevinBuiltinProviderKind::from_provider(&provider) else {
+                continue;
+            };
+
+            let base_url = infer_devin_catalog_base_url(&provider)
+                .unwrap_or_else(|| kind.default_base_url().to_string());
+            let api_key = infer_devin_catalog_api_key(&provider);
+            let desired = kind.catalog_models(&base_url, &api_key);
+
+            if merge_devin_catalog_models(&mut provider.settings_config, desired) {
+                self.save_provider("devin", &provider)?;
+                repaired += 1;
+            }
+        }
+
+        Ok(repaired)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevinBuiltinProviderKind {
+    JoyCodeProxy,
+    AnyRouter,
+    Muyuan,
+    LlmHubQzz,
+}
+
+impl DevinBuiltinProviderKind {
+    fn from_provider(provider: &Provider) -> Option<Self> {
+        let id = provider.id.to_ascii_lowercase();
+        let name = provider.name.to_ascii_lowercase();
+        let config = provider.settings_config.to_string().to_ascii_lowercase();
+
+        if id == "devin-joycode-proxy"
+            || name.contains("joycode")
+            || config.contains("joycode-api.jd.com")
+            || config.contains("127.0.0.1:8081")
+        {
+            return Some(Self::JoyCodeProxy);
+        }
+        if name.contains("any router")
+            || name.contains("anyrouter")
+            || config.contains("anyrouter.top")
+            || config.contains("fcapp.run")
+        {
+            return Some(Self::AnyRouter);
+        }
+        if id == "devin-muyuan" || name.contains("muyuan") || config.contains("muyuan.do") {
+            return Some(Self::Muyuan);
+        }
+        if name.contains("llmhub") || config.contains("llmhub.qzz.io") {
+            return Some(Self::LlmHubQzz);
+        }
+
+        None
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::JoyCodeProxy => "https://joycode-api.jd.com",
+            Self::AnyRouter => "https://a-ocnfniawgw.cn-shanghai.fcapp.run",
+            Self::Muyuan => "https://muyuan.do",
+            Self::LlmHubQzz => "https://llmhub.qzz.io",
+        }
+    }
+
+    fn catalog_models(self, base_url: &str, api_key: &str) -> Vec<Value> {
+        match self {
+            Self::JoyCodeProxy => windsurf_joycode_catalog_models(base_url, api_key),
+            Self::AnyRouter => {
+                let anyrouter_claude_model = "claude-haiku-4-5-20251001";
+                windsurf_split_catalog_models(
+                    base_url,
+                    api_key,
+                    "/v1/chat/completions",
+                    "gpt-5.5",
+                    "bearer",
+                    None,
+                    "/v1/chat/completions",
+                    anyrouter_claude_model,
+                    &[
+                        ("MODEL_CLAUDE_4_OPUS_BYOK", anyrouter_claude_model),
+                        ("MODEL_CLAUDE_4_OPUS_THINKING_BYOK", anyrouter_claude_model),
+                    ],
+                    "bearer",
+                    None,
+                )
+            }
+            Self::Muyuan => windsurf_split_catalog_models(
+                base_url,
+                api_key,
+                "/v1/chat/completions",
+                "gpt-5.5",
+                "bearer",
+                None,
+                "/v1/chat/completions",
+                "claude-sonnet-4-6",
+                &[
+                    ("MODEL_CLAUDE_4_OPUS_BYOK", "claude-sonnet-4-6"),
+                    ("MODEL_CLAUDE_4_OPUS_THINKING_BYOK", "claude-sonnet-4-6"),
+                ],
+                "bearer",
+                None,
+            ),
+            Self::LlmHubQzz => windsurf_split_catalog_models(
+                base_url,
+                api_key,
+                "/v1/chat/completions",
+                "gpt-5.5",
+                "bearer",
+                None,
+                "/v1/chat/completions",
+                "claude-sonnet-4-6",
+                &[
+                    ("MODEL_CLAUDE_4_OPUS_BYOK", "claude-sonnet-4-6"),
+                    ("MODEL_CLAUDE_4_OPUS_THINKING_BYOK", "claude-sonnet-4-6"),
+                ],
+                "bearer",
+                None,
+            ),
+        }
+    }
+}
+
+// Devin OpenAI-compatible model aliases (GPT/Responses endpoint)
+const DEVIN_OPENAI_ALIASES: &[(&str, &str)] = &[("swe-1-6-slow", "SWE 1.6 Slow")];
+
+// Devin Claude model aliases.
+const DEVIN_CLAUDE_ALIASES: &[(&str, &str)] = &[
+    (
+        "Claude Sonnet 4 Thinking BYOK",
+        "Claude Sonnet 4 Thinking BYOK",
+    ),
+    (
+        "MODEL_CLAUDE_4_SONNET_THINKING_BYOK",
+        "Claude Sonnet 4 Thinking BYOK",
+    ),
+    ("MODEL_CLAUDE_4_SONNET_BYOK", "Claude Sonnet 4 BYOK"),
+    (
+        "MODEL_CLAUDE_4_OPUS_THINKING_BYOK",
+        "Claude Opus 4 Thinking BYOK",
+    ),
+    ("MODEL_CLAUDE_4_OPUS_BYOK", "Claude Opus 4 BYOK"),
+];
+
+fn windsurf_joycode_catalog_models(base_url: &str, api_key: &str) -> Vec<Value> {
+    vec![
+        devin_catalog_model(
+            "swe-1-6-slow",
+            "SWE 1.6 Slow",
+            "GPT 5.3-codex",
+            "/api/saas/openai/v1/responses",
+            base_url,
+            api_key,
+            "bearer",
+            Some("codex"),
+            None,
+        ),
+        devin_catalog_model(
+            "MODEL_CLAUDE_4_SONNET_THINKING_BYOK",
+            "Claude Sonnet 4 Thinking BYOK",
+            "GLM-5.1",
+            "/v1/chat/completions",
+            base_url,
+            api_key,
+            "bearer",
+            None,
+            None,
+        ),
+        devin_catalog_model(
+            "MODEL_CLAUDE_4_SONNET_BYOK",
+            "Claude Sonnet 4 BYOK",
+            "GLM-5.1",
+            "/v1/chat/completions",
+            base_url,
+            api_key,
+            "bearer",
+            None,
+            None,
+        ),
+        devin_catalog_model(
+            "MODEL_CLAUDE_4_OPUS_THINKING_BYOK",
+            "Claude Opus 4 Thinking BYOK",
+            "GLM-5.1",
+            "/v1/chat/completions",
+            base_url,
+            api_key,
+            "bearer",
+            None,
+            None,
+        ),
+        devin_catalog_model(
+            "MODEL_CLAUDE_4_OPUS_BYOK",
+            "Claude Opus 4 BYOK",
+            "GLM-5.1",
+            "/v1/chat/completions",
+            base_url,
+            api_key,
+            "bearer",
+            None,
+            None,
+        ),
+    ]
+}
+
+fn windsurf_split_catalog_models(
+    base_url: &str,
+    api_key: &str,
+    openai_endpoint: &str,
+    openai_upstream_model: &str,
+    openai_auth_header: &str,
+    openai_responses_mode: Option<&str>,
+    claude_endpoint: &str,
+    claude_upstream_model: &str,
+    claude_alias_upstream_models: &[(&str, &str)],
+    claude_auth_header: &str,
+    claude_headers: Option<Value>,
+) -> Vec<Value> {
+    let mut models = Vec::new();
+
+    for (model, display_name) in DEVIN_OPENAI_ALIASES {
+        models.push(devin_catalog_model(
+            model,
+            display_name,
+            openai_upstream_model,
+            openai_endpoint,
+            base_url,
+            api_key,
+            openai_auth_header,
+            openai_responses_mode,
+            None,
+        ));
+    }
+
+    for (model, display_name) in DEVIN_CLAUDE_ALIASES {
+        let upstream = claude_alias_upstream_models
+            .iter()
+            .find_map(|(alias, upstream)| (*alias == *model).then_some(*upstream))
+            .unwrap_or(claude_upstream_model);
+        models.push(devin_catalog_model(
+            model,
+            display_name,
+            upstream,
+            claude_endpoint,
+            base_url,
+            api_key,
+            claude_auth_header,
+            None,
+            claude_headers.clone(),
+        ));
+    }
+
+    models
+}
+
+fn devin_catalog_model(
+    model: &str,
+    display_name: &str,
+    upstream_model: &str,
+    endpoint: &str,
+    base_url: &str,
+    api_key: &str,
+    auth_header: &str,
+    responses_mode: Option<&str>,
+    headers: Option<Value>,
+) -> Value {
+    let provider = if endpoint.ends_with("/messages") {
+        "anthropic"
+    } else {
+        "openai"
+    };
+
+    let mut item = json!({
+        "model": model,
+        "displayName": display_name,
+        "upstreamModel": upstream_model,
+        "provider": provider,
+        "endpoint": endpoint,
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "authHeader": auth_header,
+        "routes": [{
+            "name": "primary",
+            "baseUrl": base_url,
+            "apiKey": api_key,
+            "enabled": true,
+            "priority": 10,
+            "authHeader": auth_header
+        }]
+    });
+
+    if let Some(mode) = responses_mode {
+        item["responsesMode"] = json!(mode);
+        item["routes"][0]["responsesMode"] = json!(mode);
+    }
+    if let Some(headers) = headers {
+        item["headers"] = headers.clone();
+        item["routes"][0]["headers"] = headers;
+    }
+
+    item
+}
+
+fn is_devin_builtin_catalog_key(key: &str) -> bool {
+    matches!(
+        key,
+        "swe_1_6_slow"
+            | "claude sonnet 4 thinking byok"
+            | "model_claude_4_sonnet_thinking_byok"
+            | "model_claude_4_sonnet_byok"
+            | "model_claude_4_opus_byok"
+            | "model_claude_4_opus_thinking_byok"
+            | "joycode_gpt"
+            | "joycode_claude"
+            | "gpt_5_5"
+            | "gpt_5_codex"
+            | "gpt_5_3_codex"
+            | "gpt 5_3_codex"
+            | "claude_sonnet_4_5"
+            | "claude_opus_4_5"
+            | "claude_sonnet_4_5_20250929"
+            | "claude_opus_4_5_20251101"
+            | "claude_sonnet_4_6"
+            | "claude_opus_4_8"
+            | "model_private_11"
+            | "model_gpt_4o"
+            | "model_gpt_4o_mini"
+            | "model_gpt_5_nano"
+            | "model_google_gemini_2_5_flash"
+            | "gpt_4o"
+            | "gpt_4o_mini"
+            | "gpt_5_nano"
+            | "gpt_5_4_low"
+            | "gpt_5_4_high"
+            | "gpt_5_4_xhigh"
+            | "gpt_5_4_xhigh_priority"
+            | "swe_1_6_fast"
+            | "claude_haiku_4_5"
+            | "model_claude_haiku_4_5"
+            | "model_claude_haiku_4_5_byok"
+            | "model_swe_1_5"
+            | "model_swe_1_5_slow"
+            | "model_chat_11121"
+            | "claude_sonnet_4_6_thinking"
+            | "claude_opus_4_6_thinking"
+            | "model_google_gemini_2_5_pro"
+    )
+}
+
+fn merge_devin_catalog_models(settings_config: &mut Value, desired_models: Vec<Value>) -> bool {
+    let Some(root) = settings_config.as_object_mut() else {
+        return false;
+    };
+
+    let desired_keys: HashSet<String> = desired_models
+        .iter()
+        .filter_map(|model| {
+            model
+                .get("model")
+                .and_then(Value::as_str)
+                .map(canonical_catalog_model_key)
+        })
+        .collect();
+
+    let existing = root
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+
+    for item in existing {
+        let key = item
+            .get("model")
+            .and_then(Value::as_str)
+            .map(canonical_catalog_model_key);
+        if key.as_ref().is_some_and(|key| {
+            !desired_keys.contains(key.as_str()) && is_devin_builtin_catalog_key(key)
+        }) {
+            continue;
+        }
+        if let Some(key) = key {
+            if !seen.insert(key) {
+                continue;
+            }
+        }
+        merged.push(item);
+    }
+
+    for item in desired_models {
+        let Some(key) = item
+            .get("model")
+            .and_then(Value::as_str)
+            .map(canonical_catalog_model_key)
+        else {
+            continue;
+        };
+        if seen.insert(key) {
+            merged.push(item);
+        }
+    }
+
+    let next = json!({ "models": merged });
+    if root.get("modelCatalog") == Some(&next) {
+        return false;
+    }
+    root.insert("modelCatalog".to_string(), next);
+    true
+}
+
+fn infer_devin_catalog_base_url(provider: &Provider) -> Option<String> {
+    let catalog_base = provider
+        .settings_config
+        .pointer("/modelCatalog/models/0/baseUrl")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            provider
+                .settings_config
+                .pointer("/modelCatalog/models/0/routes/0/baseUrl")
+                .and_then(Value::as_str)
+        });
+
+    if let Some(base_url) = catalog_base {
+        return Some(normalize_devin_catalog_base_url(base_url)).filter(|value| !value.is_empty());
+    }
+
+    provider
+        .settings_config
+        .get("config")
+        .and_then(Value::as_str)
+        .and_then(crate::codex_config::extract_codex_base_url)
+        .map(|base_url| normalize_devin_catalog_base_url(&base_url))
+        .filter(|value| !value.is_empty())
+}
+
+fn infer_devin_catalog_api_key(provider: &Provider) -> String {
+    crate::codex_config::extract_codex_api_key(
+        provider.settings_config.get("auth"),
+        provider
+            .settings_config
+            .get("config")
+            .and_then(Value::as_str),
+    )
+    .unwrap_or_else(|| {
+        provider
+            .settings_config
+            .pointer("/modelCatalog/models/0/apiKey")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                provider
+                    .settings_config
+                    .pointer("/modelCatalog/models/0/routes/0/apiKey")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default()
+            .to_string()
+    })
+}
+
+fn normalize_devin_catalog_base_url(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn canonical_catalog_model_key(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|ch| if ch == '-' || ch == '.' { '_' } else { ch })
+        .collect::<String>()
 }
 
 #[cfg(test)]
@@ -782,5 +1273,243 @@ mod ensure_official_seed_tests {
         let result =
             db.ensure_official_seed_by_id(CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, AppType::Claude);
         assert!(result.is_err(), "(id, app_type) mismatch should be Err");
+    }
+}
+
+#[cfg(test)]
+mod devin_builtin_repair_tests {
+    use crate::database::Database;
+    use crate::provider::Provider;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn repair_updates_anyrouter_windsurf_routes_and_preserves_custom_models() {
+        let db = Database::memory().expect("memory db");
+        let provider = Provider::with_id(
+            "anyrouter-devin".to_string(),
+            "Any Router".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-test" },
+                "config": "model_provider = \"custom\"\nmodel = \"MODEL_CLAUDE_4_SONNET_BYOK\"\n\n[model_providers.custom]\nbase_url = \"https://anyrouter.top/v1\"\nwire_api = \"responses\"",
+                "modelCatalog": {
+                    "models": [
+                        {
+                            "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                            "displayName": "Broken Sonnet",
+                            "upstreamModel": "MODEL_CLAUDE_4_SONNET_BYOK",
+                            "endpoint": "/v1/responses",
+                            "baseUrl": "https://anyrouter.top",
+                            "apiKey": "old-key"
+                        },
+                        {
+                            "model": "gpt-5-codex",
+                            "displayName": "Old direct GPT",
+                            "upstreamModel": "gpt-5-codex",
+                            "endpoint": "/v1/responses"
+                        },
+                        {
+                            "model": "claude-sonnet-4-5",
+                            "displayName": "Old direct Sonnet",
+                            "upstreamModel": "claude-sonnet-4-5",
+                            "endpoint": "/v1/messages"
+                        },
+                        {
+                            "model": "claude-opus-4-5",
+                            "displayName": "Old direct Opus",
+                            "upstreamModel": "claude-opus-4-5",
+                            "endpoint": "/v1/messages"
+                        },
+                        {
+                            "model": "custom-devin-model",
+                            "displayName": "Custom",
+                            "upstreamModel": "custom-upstream",
+                            "endpoint": "/v1/chat/completions"
+                        }
+                    ]
+                }
+            }),
+            Some("https://anyrouter.top".to_string()),
+        );
+        db.save_provider("devin", &provider).expect("save provider");
+
+        let repaired = db
+            .repair_devin_builtin_provider_catalogs()
+            .expect("repair ok");
+        assert_eq!(repaired, 1);
+
+        let provider = db
+            .get_provider_by_id("anyrouter-devin", "devin")
+            .expect("query ok")
+            .expect("provider exists");
+        let models = provider
+            .settings_config
+            .pointer("/modelCatalog/models")
+            .and_then(Value::as_array)
+            .expect("models array");
+
+        let sonnet = models
+            .iter()
+            .find(|model| {
+                model.get("model").and_then(Value::as_str) == Some("MODEL_CLAUDE_4_SONNET_BYOK")
+            })
+            .expect("sonnet alias");
+        assert_eq!(sonnet["endpoint"], "/v1/chat/completions");
+        assert_eq!(sonnet["upstreamModel"], "claude-haiku-4-5-20251001");
+        assert_eq!(sonnet["apiKey"], "sk-test");
+        assert_eq!(sonnet["baseUrl"], "https://anyrouter.top");
+
+        let opus = models
+            .iter()
+            .find(|model| {
+                model.get("model").and_then(Value::as_str) == Some("MODEL_CLAUDE_4_OPUS_BYOK")
+            })
+            .expect("opus alias");
+        assert_eq!(opus["endpoint"], "/v1/chat/completions");
+        assert_eq!(opus["upstreamModel"], "claude-haiku-4-5-20251001");
+
+        assert!(!models
+            .iter()
+            .any(|model| { model.get("model").and_then(Value::as_str) == Some("gpt-5-codex") }));
+        assert!(!models.iter().any(|model| {
+            model.get("model").and_then(Value::as_str) == Some("claude-sonnet-4-5")
+        }));
+        assert!(!models.iter().any(|model| {
+            model.get("model").and_then(Value::as_str) == Some("claude-opus-4-5")
+        }));
+        assert!(models.iter().any(|model| {
+            model.get("model").and_then(Value::as_str) == Some("custom-devin-model")
+        }));
+    }
+
+    #[test]
+    fn repair_updates_joycode_to_model_list_routes() {
+        let db = Database::memory().expect("memory db");
+        let provider = Provider::with_id(
+            "devin-joycode-proxy".to_string(),
+            "JoyCode".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-joycode-proxy" },
+                "config": "model_provider = \"custom\"\nmodel = \"MODEL_CLAUDE_4_OPUS_BYOK\"\n\n[model_providers.custom]\nbase_url = \"https://joycode-api.jd.com/api/saas/openai/v2\"\nwire_api = \"responses\"",
+                "modelCatalog": {
+                    "models": [
+                        {
+                            "model": "MODEL_CLAUDE_4_OPUS_BYOK",
+                            "displayName": "Old JoyCode Claude",
+                            "upstreamModel": "joycode-claude",
+                            "endpoint": "/v1/messages",
+                            "authHeader": "x-api-key"
+                        },
+                        {
+                            "model": "joycode-claude",
+                            "displayName": "Old direct JoyCode Claude",
+                            "upstreamModel": "joycode-claude",
+                            "endpoint": "/v1/messages"
+                        }
+                    ]
+                }
+            }),
+            Some("https://joycode-api.jd.com".to_string()),
+        );
+        db.save_provider("devin", &provider).expect("save provider");
+
+        let repaired = db
+            .repair_devin_builtin_provider_catalogs()
+            .expect("repair ok");
+        assert_eq!(repaired, 1);
+
+        let provider = db
+            .get_provider_by_id("devin-joycode-proxy", "devin")
+            .expect("query ok")
+            .expect("provider exists");
+        let models = provider
+            .settings_config
+            .pointer("/modelCatalog/models")
+            .and_then(Value::as_array)
+            .expect("models array");
+
+        let sonnet = models
+            .iter()
+            .find(|model| {
+                model.get("model").and_then(Value::as_str) == Some("MODEL_CLAUDE_4_SONNET_BYOK")
+            })
+            .expect("sonnet alias");
+        assert_eq!(sonnet["endpoint"], "/v1/chat/completions");
+        assert_eq!(sonnet["upstreamModel"], "GLM-5.1");
+        assert_eq!(sonnet["authHeader"], "bearer");
+        assert!(sonnet.get("thinkingEnabled").is_none());
+
+        let sonnet_thinking = models
+            .iter()
+            .find(|model| {
+                model.get("model").and_then(Value::as_str)
+                    == Some("MODEL_CLAUDE_4_SONNET_THINKING_BYOK")
+            })
+            .expect("sonnet thinking alias");
+        assert_eq!(sonnet_thinking["endpoint"], "/v1/chat/completions");
+        assert_eq!(sonnet_thinking["upstreamModel"], "GLM-5.1");
+        assert_eq!(sonnet_thinking["authHeader"], "bearer");
+
+        let opus = models
+            .iter()
+            .find(|model| {
+                model.get("model").and_then(Value::as_str) == Some("MODEL_CLAUDE_4_OPUS_BYOK")
+            })
+            .expect("opus alias");
+        assert_eq!(opus["endpoint"], "/v1/messages");
+        assert_eq!(opus["upstreamModel"], "joycode-claude");
+        assert_eq!(opus["authHeader"], "x-api-key");
+
+        assert!(!models
+            .iter()
+            .any(|model| { model.get("model").and_then(Value::as_str) == Some("joycode-claude") }));
+    }
+
+    #[test]
+    fn repair_updates_llmhub_to_split_windsurf_routes() {
+        let db = Database::memory().expect("memory db");
+        let provider = Provider::with_id(
+            "llmhub-devin".to_string(),
+            "LLMHub QZZ".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "sk-old" },
+                "config": "model_provider = \"custom\"\nmodel = \"MODEL_CLAUDE_4_OPUS_BYOK\"\n\n[model_providers.custom]\nbase_url = \"https://llmhub.qzz.io/v1\"\nwire_api = \"responses\"",
+                "modelCatalog": {
+                    "models": [
+                        {
+                            "model": "MODEL_CLAUDE_4_OPUS_BYOK",
+                            "upstreamModel": "gpt-5.5",
+                            "endpoint": "/v1/chat/completions"
+                        }
+                    ]
+                }
+            }),
+            Some("https://llmhub.qzz.io".to_string()),
+        );
+        db.save_provider("devin", &provider).expect("save provider");
+
+        let repaired = db
+            .repair_devin_builtin_provider_catalogs()
+            .expect("repair ok");
+        assert_eq!(repaired, 1);
+
+        let provider = db
+            .get_provider_by_id("llmhub-devin", "devin")
+            .expect("query ok")
+            .expect("provider exists");
+        let models = provider
+            .settings_config
+            .pointer("/modelCatalog/models")
+            .and_then(Value::as_array)
+            .expect("models array");
+
+        let opus = models
+            .iter()
+            .find(|model| {
+                model.get("model").and_then(Value::as_str) == Some("MODEL_CLAUDE_4_OPUS_BYOK")
+            })
+            .expect("opus alias");
+        assert_eq!(opus["endpoint"], "/v1/chat/completions");
+        assert_eq!(opus["upstreamModel"], "claude-sonnet-4-6");
+        assert_eq!(opus["baseUrl"], "https://llmhub.qzz.io");
     }
 }

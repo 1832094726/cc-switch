@@ -1263,6 +1263,10 @@ impl ProviderService {
             state
                 .db
                 .set_current_provider(app_type.as_str(), &provider.id)?;
+            if matches!(app_type, AppType::Devin) {
+                crate::settings::set_current_provider(&app_type, Some(&provider.id))?;
+                return Ok(true);
+            }
             write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
         }
 
@@ -1426,6 +1430,10 @@ impl ProviderService {
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
         if is_current {
+            if matches!(app_type, AppType::Devin) {
+                return Ok(true);
+            }
+
             // 如果 Claude 代理接管处于激活状态，并且代理服务正在运行：
             // - 不直接走普通 Live 写入逻辑
             // - 改为更新 Live 备份，并在 Claude 下同步代理安全的 Live 配置
@@ -1640,14 +1648,16 @@ impl ProviderService {
         // restore backup. Serialize them per app, then decide from the locked
         // current state so a just-started takeover cannot be overwritten by a
         // normal live write.
-        let _switch_guard =
-            if matches!(app_type, AppType::Claude | AppType::Codex | AppType::Gemini) {
-                Some(futures::executor::block_on(
-                    state.proxy_service.lock_switch_for_app(app_type.as_str()),
-                ))
-            } else {
-                None
-            };
+        let _switch_guard = if matches!(
+            app_type,
+            AppType::Claude | AppType::Codex | AppType::Gemini | AppType::Devin
+        ) {
+            Some(futures::executor::block_on(
+                state.proxy_service.lock_switch_for_app(app_type.as_str()),
+            ))
+        } else {
+            None
+        };
 
         // Backup or live placeholders mean the live file is owned by proxy
         // takeover, even if the proxy server is temporarily stopped or is in the
@@ -1771,6 +1781,10 @@ impl ProviderService {
 
             // Update database is_current (as default for new devices)
             state.db.set_current_provider(app_type.as_str(), id)?;
+        }
+
+        if matches!(app_type, AppType::Devin) {
+            return Ok(result);
         }
 
         // Sync to live (write_gemini_live handles security flag internally for Gemini)
@@ -1985,7 +1999,9 @@ impl ProviderService {
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(&provider.settings_config),
             AppType::ClaudeDesktop => Ok(String::new()),
-            AppType::Codex => Self::extract_codex_common_config(&provider.settings_config),
+            AppType::Codex | AppType::Devin => {
+                Self::extract_codex_common_config(&provider.settings_config)
+            }
             AppType::Gemini => Self::extract_gemini_common_config(&provider.settings_config),
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
@@ -2001,7 +2017,7 @@ impl ProviderService {
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(settings_config),
             AppType::ClaudeDesktop => Ok(String::new()),
-            AppType::Codex => Self::extract_codex_common_config(settings_config),
+            AppType::Codex | AppType::Devin => Self::extract_codex_common_config(settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(settings_config),
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
@@ -2318,7 +2334,7 @@ impl ProviderService {
             AppType::ClaudeDesktop => {
                 crate::claude_desktop_config::validate_provider(provider)?;
             }
-            AppType::Codex => {
+            AppType::Codex | AppType::Devin => {
                 let settings = provider.settings_config.as_object().ok_or_else(|| {
                     AppError::localized(
                         "provider.codex.settings.not_object",
@@ -2463,7 +2479,7 @@ impl ProviderService {
                     crate::claude_desktop_config::direct_gateway_credentials(provider)?;
                 Ok((credentials.api_key, credentials.base_url))
             }
-            AppType::Codex => {
+            AppType::Codex | AppType::Devin => {
                 let _auth = provider
                     .settings_config
                     .get("auth")

@@ -9,10 +9,10 @@
 
 use super::{
     error_mapper::{get_error_message, map_proxy_error_to_status},
-    forwarder::ActiveConnectionGuard,
+    forwarder::{resolve_devin_model_route, ActiveConnectionGuard},
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
-        CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
+        CODEX_PARSER_CONFIG, DEVIN_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
     },
     handler_context::RequestContext,
     providers::{
@@ -25,22 +25,24 @@ use super::{
         transform_codex_chat, transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, process_response, read_decoded_body,
-        strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
-        usage_logging_enabled, SseUsageCollector,
+        create_logged_passthrough_stream, create_usage_collector, process_response,
+        read_decoded_body, strip_entity_headers_for_rebuilt_body,
+        strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{append_utf8_safe, strip_sse_field, take_sse_block},
     types::*,
     usage::parser::TokenUsage,
-    ProxyError,
+    windsurf, ProxyError,
 };
 use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -98,6 +100,471 @@ pub async fn handle_models() -> Result<Json<Value>, ProxyError> {
     Ok(Json(catalog))
 }
 
+/// GET /devin/v1/models — Devin local route model list.
+///
+/// Devin uses the same OpenAI-compatible wire formats as Codex here, but keeps
+/// an independent provider namespace so switching Devin does not affect Codex.
+pub async fn handle_devin_models(
+    State(state): State<ProxyState>,
+) -> Result<Json<Value>, ProxyError> {
+    let mut providers = state
+        .provider_router
+        .select_providers("devin")
+        .await
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+    let snippet = state
+        .db
+        .get_config_snippet("devin")
+        .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+    for provider in &mut providers {
+        crate::devin_variables::apply_devin_common_variables(provider, snippet.as_deref());
+    }
+    let provider = providers.first().ok_or(ProxyError::NoAvailableProvider)?;
+
+    let mut models = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(|models| models.as_array())
+        .cloned()
+        .unwrap_or_else(|| {
+            super::providers::codex_provider_upstream_model(provider)
+                .map(|model| vec![json!({ "model": model })])
+                .unwrap_or_default()
+        });
+    for model in &mut models {
+        super::sensitive_redaction::redact_sensitive_value(model);
+    }
+
+    Ok(Json(json!({ "models": models })))
+}
+
+/// POST /exa.api_server_pb.ApiServerService/GetChatMessage — Devin/Windsurf.
+///
+/// Windsurf sends a Connect-RPC protobuf request, not Chat/Responses/Messages
+/// JSON.  Decode the protobuf at the boundary, reuse Devin's provider/model
+/// routing inside cc-switch, then stream Windsurf protobuf chunks back.
+pub async fn handle_devin_windsurf_get_chat_message(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    let (parts, body) = request.into_parts();
+    let headers = parts.headers;
+    let extensions = parts.extensions;
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Failed to read Windsurf request body: {e}")))?
+        .to_bytes();
+
+    let message_id = uuid::Uuid::new_v4().to_string();
+    let windsurf_request = match windsurf::parse_get_chat_message_request(&body_bytes, &headers) {
+        Ok(request) => request,
+        Err(error) => {
+            log::warn!("[Devin/Windsurf] Failed to parse GetChatMessage protobuf: {error}");
+            return build_windsurf_error_response(&message_id, &error.to_string());
+        }
+    };
+
+    let requested_model = windsurf_request
+        .requested_model
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    log::debug!(
+        "[Devin/Windsurf] GetChatMessage model={}, messages={}, tools={}, initiator={}",
+        requested_model,
+        windsurf_request.messages.len(),
+        windsurf_request.tools.len(),
+        windsurf_request.initiator
+    );
+
+    let anthropic_body = windsurf_request.to_anthropic_body();
+
+    let mut ctx = match RequestContext::new(
+        &state,
+        &anthropic_body,
+        &headers,
+        AppType::Devin,
+        "Devin/Windsurf",
+        "devin",
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            log::warn!("[Devin/Windsurf] Failed to create request context: {error}");
+            return build_windsurf_error_response(&message_id, &error.to_string());
+        }
+    };
+
+    let endpoint = "/v1/messages";
+    let forwarder = ctx.create_forwarder(&state);
+    let mut result = match forwarder
+        .forward_with_retry(
+            &AppType::Devin,
+            axum::http::Method::POST,
+            endpoint,
+            anthropic_body.clone(),
+            headers,
+            extensions,
+            ctx.get_providers(),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(mut err) => {
+            if let Some(provider) = err.provider.take() {
+                ctx.provider = provider;
+            }
+            log_forward_error(&state, &ctx, true, &err.error);
+            return build_windsurf_error_response(&message_id, &err.error.to_string());
+        }
+    };
+
+    let connection_guard = result.connection_guard.take();
+    ctx.outbound_model = result.outbound_model.take();
+    ctx.provider = result.provider;
+
+    let route = resolve_devin_model_route(&ctx.provider, &anthropic_body);
+    let upstream_endpoint = route
+        .as_ref()
+        .map(|route| route.endpoint.as_str())
+        .unwrap_or_else(|| {
+            if result.codex_chat_to_responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            }
+        });
+    let wire_api = windsurf::UpstreamWireApi::from_endpoint(upstream_endpoint);
+    let model_uid = ctx
+        .outbound_model
+        .clone()
+        .or_else(|| {
+            route
+                .as_ref()
+                .and_then(|route| route.upstream_model.clone())
+        })
+        .unwrap_or_else(|| ctx.request_model.clone());
+
+    let response = result.response;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body_timeout = if ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let (_headers, _status, body_bytes) =
+            read_decoded_body(response, ctx.tag, body_timeout).await?;
+        let body_text = String::from_utf8_lossy(&body_bytes);
+        let error_text = format!("[API Error {}] {}", status.as_u16(), body_text.trim());
+        return build_windsurf_error_response(&message_id, &error_text);
+    }
+
+    let upstream_status = response.status().as_u16();
+    let logged_upstream = create_logged_passthrough_stream(
+        response.bytes_stream(),
+        ctx.tag,
+        create_usage_collector(&ctx, &state, upstream_status, &DEVIN_PARSER_CONFIG),
+        ctx.streaming_timeout_config(),
+        connection_guard,
+    );
+
+    let stream =
+        windsurf::connect_stream_from_sse(logged_upstream, wire_api, message_id, model_uid, None);
+    let body = axum::body::Body::from_stream(stream);
+    Ok((windsurf::stream_headers(), body).into_response())
+}
+
+const WINDSURF_API_SERVER_UPSTREAM: &str = "https://server.self-serve.windsurf.com";
+const WINDSURF_INFERENCE_UPSTREAM: &str = "https://inference.codeium.com";
+const WINDSURF_WEBSITE_HOST: &str = "windsurf.com";
+const WINDSURF_REGISTER_HOST: &str = "register.windsurf.com";
+
+pub async fn handle_devin_windsurf_api_server_passthrough(
+    State(_state): State<ProxyState>,
+    uri: axum::http::Uri,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_devin_windsurf_passthrough(
+        "api_server",
+        "/_route/api_server",
+        WINDSURF_API_SERVER_UPSTREAM,
+        uri,
+        request,
+    )
+    .await
+}
+
+pub async fn handle_devin_windsurf_inference_passthrough(
+    State(_state): State<ProxyState>,
+    uri: axum::http::Uri,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_devin_windsurf_passthrough(
+        "inference",
+        "/_route/inference",
+        WINDSURF_INFERENCE_UPSTREAM,
+        uri,
+        request,
+    )
+    .await
+}
+
+pub async fn handle_devin_windsurf_root_passthrough(
+    State(_state): State<ProxyState>,
+    uri: axum::http::Uri,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    let (route_name, upstream_base) = windsurf_root_passthrough_target(uri.path());
+    handle_devin_windsurf_passthrough(route_name, "", upstream_base, uri, request).await
+}
+
+pub async fn handle_devin_windsurf_web_redirect(
+    uri: axum::http::Uri,
+) -> Result<axum::response::Response, ProxyError> {
+    let location = windsurf_web_redirect_location(&uri).ok_or_else(|| {
+        ProxyError::InvalidRequest(format!(
+            "Unsupported Devin/Windsurf web path: {}",
+            uri.path()
+        ))
+    })?;
+
+    axum::response::Response::builder()
+        .status(StatusCode::FOUND)
+        .header(axum::http::header::LOCATION, location)
+        .body(axum::body::Body::empty())
+        .map_err(|e| ProxyError::Internal(format!("Failed to build Windsurf redirect: {e}")))
+}
+
+async fn handle_devin_windsurf_passthrough(
+    route_name: &str,
+    local_prefix: &str,
+    upstream_base: &str,
+    uri: axum::http::Uri,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    let (parts, body) = request.into_parts();
+    let method = parts.method.clone();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| {
+            ProxyError::Internal(format!("Failed to read Windsurf passthrough body: {e}"))
+        })?
+        .to_bytes();
+
+    let upstream_path = uri
+        .path()
+        .strip_prefix(local_prefix)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(uri.path());
+    let upstream_path = if upstream_path.starts_with('/') {
+        upstream_path.to_string()
+    } else {
+        format!("/{upstream_path}")
+    };
+    let upstream_path_and_query = uri
+        .query()
+        .map(|query| format!("{upstream_path}?{query}"))
+        .unwrap_or(upstream_path);
+    let upstream_url = format!(
+        "{}{}",
+        upstream_base.trim_end_matches('/'),
+        upstream_path_and_query
+    );
+
+    log::debug!(
+        "[Devin/Windsurf] passthrough route={} method={} path={} -> {}",
+        route_name,
+        method,
+        uri.path(),
+        upstream_url
+    );
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .map_err(|e| ProxyError::Internal(format!("Invalid passthrough method: {e}")))?;
+    let mut upstream_headers = reqwest::header::HeaderMap::new();
+    for (name, value) in parts.headers.iter() {
+        if should_forward_windsurf_request_header(name.as_str()) {
+            upstream_headers.append(name.clone(), value.clone());
+        }
+    }
+    upstream_headers.insert(
+        reqwest::header::CONTENT_LENGTH,
+        windsurf_content_length_header(body_bytes.len())?,
+    );
+
+    let upstream = crate::proxy::http_client::get()
+        .request(reqwest_method, upstream_url)
+        .headers(upstream_headers)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| {
+            ProxyError::ForwardFailed(format!("Windsurf {route_name} passthrough failed: {e}"))
+        })?;
+
+    let status = upstream.status();
+    let mut response_headers = upstream.headers().clone();
+    strip_hop_by_hop_response_headers(&mut response_headers);
+
+    if route_name.starts_with("api_server")
+        && status.is_success()
+        && windsurf_rpc_method(uri.path()) == "RegisterUser"
+    {
+        let raw_body = upstream.bytes().await.map_err(|e| {
+            ProxyError::ForwardFailed(format!(
+                "Windsurf {route_name} RegisterUser body read failed: {e}"
+            ))
+        })?;
+        let local_api_server_url = windsurf_local_api_server_url(&parts.headers);
+        let rewritten_body = match windsurf::rewrite_register_user_response_body(
+            &raw_body,
+            &local_api_server_url,
+        )? {
+            Some(rewritten) => {
+                log::debug!(
+                    "[Devin/Windsurf] RegisterUser api_server_url rewritten -> {}",
+                    local_api_server_url
+                );
+                strip_entity_headers_for_rebuilt_body(&mut response_headers);
+                Bytes::from(rewritten)
+            }
+            None => raw_body,
+        };
+
+        let mut builder = axum::response::Response::builder().status(status);
+        response_headers.remove(axum::http::header::CONTENT_LENGTH);
+        for (name, value) in response_headers.iter() {
+            builder = builder.header(name, value);
+        }
+        builder = builder.header(
+            axum::http::header::CONTENT_LENGTH,
+            rewritten_body.len().to_string(),
+        );
+        return builder
+            .body(axum::body::Body::from(rewritten_body))
+            .map_err(|e| {
+                ProxyError::Internal(format!(
+                    "Failed to build RegisterUser passthrough response: {e}"
+                ))
+            });
+    }
+
+    let response_stream = upstream
+        .bytes_stream()
+        .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())));
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (name, value) in response_headers.iter() {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(axum::body::Body::from_stream(response_stream))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build passthrough response: {e}")))
+}
+
+fn windsurf_root_passthrough_target(path: &str) -> (&'static str, &'static str) {
+    match windsurf_rpc_method(path) {
+        "GetCompletions" | "GetStreamingCompletions" | "GetStreamingExternalChatCompletions" => {
+            ("inference_root", WINDSURF_INFERENCE_UPSTREAM)
+        }
+        _ => ("api_server_root", WINDSURF_API_SERVER_UPSTREAM),
+    }
+}
+
+fn windsurf_local_api_server_url(headers: &axum::http::HeaderMap) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or("127.0.0.1:15721");
+    format!("http://{host}/_route/api_server")
+}
+
+fn windsurf_rpc_method(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or("")
+}
+
+fn windsurf_web_redirect_location(uri: &axum::http::Uri) -> Option<String> {
+    let host = if windsurf_uri_targets_register(uri) {
+        WINDSURF_REGISTER_HOST
+    } else if windsurf_uri_targets_website(uri.path()) {
+        WINDSURF_WEBSITE_HOST
+    } else {
+        return None;
+    };
+
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| uri.path());
+    Some(format!("https://{host}{path_and_query}"))
+}
+
+fn windsurf_uri_targets_register(uri: &axum::http::Uri) -> bool {
+    let path = uri.path();
+    if path == "/authorize" || path.ends_with("/authorize") {
+        return true;
+    }
+
+    uri.query().is_some_and(|query| {
+        query.contains("prompt=login")
+            || query.contains("scope=openid")
+            || query.contains("authorize")
+            || query.contains("client_id=codeium")
+    })
+}
+
+fn windsurf_uri_targets_website(path: &str) -> bool {
+    path == "/favicon.ico"
+        || path == "/login"
+        || path.starts_with("/login/")
+        || path == "/signup"
+        || path.starts_with("/signup/")
+        || path == "/profile"
+        || path.starts_with("/profile/")
+        || path == "/changelog"
+        || path.starts_with("/changelog/")
+        || path.starts_with("/redirect/")
+}
+
+fn should_forward_windsurf_request_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "content-length"
+            | "host"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn windsurf_content_length_header(
+    body_len: usize,
+) -> Result<reqwest::header::HeaderValue, ProxyError> {
+    reqwest::header::HeaderValue::from_str(&body_len.to_string()).map_err(|e| {
+        ProxyError::Internal(format!("Invalid Windsurf passthrough content-length: {e}"))
+    })
+}
+
+fn build_windsurf_error_response(
+    message_id: &str,
+    error_text: &str,
+) -> Result<axum::response::Response, ProxyError> {
+    let body = windsurf::error_response_body(message_id, error_text)?;
+    Ok((windsurf::stream_headers(), axum::body::Body::from(body)).into_response())
+}
+
 // ============================================================================
 // Claude API 处理器（包含格式转换逻辑）
 // ============================================================================
@@ -126,6 +593,21 @@ pub async fn handle_claude_desktop_messages(
         "Claude Desktop",
         "claude-desktop",
         Some("/claude-desktop"),
+    )
+    .await
+}
+
+pub async fn handle_devin_messages(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_messages_for_app(
+        state,
+        request,
+        AppType::Devin,
+        "Devin",
+        "devin",
+        Some("/devin"),
     )
     .await
 }
@@ -164,8 +646,11 @@ async fn handle_messages_for_app(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    if matches!(app_type, AppType::Devin) {
+        body = normalize_devin_messages_request(body)?;
+    }
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
@@ -235,15 +720,14 @@ async fn handle_messages_for_app(
         .await;
     }
 
+    let parser_config = if matches!(app_type, AppType::Devin) {
+        &DEVIN_PARSER_CONFIG
+    } else {
+        &CLAUDE_PARSER_CONFIG
+    };
+
     // 通用响应处理（透传模式）
-    process_response(
-        response,
-        &ctx,
-        &state,
-        &CLAUDE_PARSER_CONFIG,
-        connection_guard,
-    )
-    .await
+    process_response(response, &ctx, &state, parser_config, connection_guard).await
 }
 
 fn validate_claude_desktop_gateway_auth(
@@ -568,6 +1052,174 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
     }
 }
 
+fn normalize_devin_chat_request(body: Value) -> Result<Value, ProxyError> {
+    if is_anthropic_messages_request(&body) {
+        return transform::anthropic_to_openai(body);
+    }
+
+    if is_openai_responses_request(&body) {
+        return transform_codex_chat::responses_to_chat_completions(body);
+    }
+
+    if body.get("messages").and_then(Value::as_array).is_some() {
+        return Ok(body);
+    }
+
+    if let Some(prompt) = extract_devin_prompt_text(&body) {
+        return Ok(devin_prompt_to_chat_request(&body, prompt));
+    }
+
+    Ok(body)
+}
+
+fn normalize_devin_responses_request(body: Value) -> Result<Value, ProxyError> {
+    if is_openai_responses_request(&body) {
+        return Ok(body);
+    }
+
+    if is_anthropic_messages_request(&body) {
+        let chat_body = transform::anthropic_to_openai(body)?;
+        return transform_codex_chat::chat_completions_to_responses(chat_body);
+    }
+
+    if body.get("messages").and_then(Value::as_array).is_some() {
+        return transform_codex_chat::chat_completions_to_responses(body);
+    }
+
+    if let Some(prompt) = extract_devin_prompt_text(&body) {
+        let chat_body = devin_prompt_to_chat_request(&body, prompt);
+        return transform_codex_chat::chat_completions_to_responses(chat_body);
+    }
+
+    Ok(body)
+}
+
+fn normalize_devin_messages_request(body: Value) -> Result<Value, ProxyError> {
+    if is_anthropic_messages_request(&body) {
+        return Ok(body);
+    }
+
+    let chat_body = if is_openai_responses_request(&body) {
+        transform_codex_chat::responses_to_chat_completions(body)?
+    } else if body.get("messages").and_then(Value::as_array).is_some() {
+        body
+    } else if let Some(prompt) = extract_devin_prompt_text(&body) {
+        devin_prompt_to_chat_request(&body, prompt)
+    } else {
+        body
+    };
+
+    transform::openai_chat_request_to_anthropic(chat_body)
+}
+
+fn is_openai_responses_request(body: &Value) -> bool {
+    body.get("input").is_some()
+        || body.get("previous_response_id").is_some()
+        || body.get("max_output_tokens").is_some()
+}
+
+fn is_anthropic_messages_request(body: &Value) -> bool {
+    if body.get("system").is_some()
+        || body.get("anthropic_version").is_some()
+        || body.get("stop_sequences").is_some()
+        || body.get("thinking").is_some()
+        || body.get("output_config").is_some()
+    {
+        return true;
+    }
+
+    if body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(|tool| tool.get("input_schema").is_some()))
+    {
+        return true;
+    }
+
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| messages.iter().any(message_has_anthropic_content))
+}
+
+fn message_has_anthropic_content(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some(
+                        "image"
+                            | "document"
+                            | "tool_use"
+                            | "tool_result"
+                            | "server_tool_use"
+                            | "web_search_tool_result"
+                            | "thinking"
+                            | "redacted_thinking"
+                    )
+                ) || part.get("source").is_some()
+                    || part.get("cache_control").is_some()
+                    || part.get("input").is_some()
+                    || part.get("tool_use_id").is_some()
+            })
+        })
+}
+
+fn extract_devin_prompt_text(body: &Value) -> Option<&str> {
+    ["prompt", "query", "text", "message"]
+        .into_iter()
+        .find_map(|key| {
+            body.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        })
+}
+
+fn devin_prompt_to_chat_request(body: &Value, prompt: &str) -> Value {
+    let mut result = json!({
+        "messages": [{
+            "role": "user",
+            "content": prompt
+        }]
+    });
+
+    for key in [
+        "model",
+        "temperature",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "stream",
+        "metadata",
+        "user",
+    ] {
+        if let Some(value) = body.get(key) {
+            result[key] = value.clone();
+        }
+    }
+
+    if let Some(value) = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_output_tokens"))
+    {
+        result["max_tokens"] = value.clone();
+    }
+
+    if let Some(value) = body
+        .get("stop")
+        .or_else(|| body.get("stop_sequences"))
+        .filter(|value| !value.is_null())
+    {
+        result["stop"] = value.clone();
+    }
+
+    result
+}
+
 // ============================================================================
 // Codex API 处理器
 // ============================================================================
@@ -576,6 +1228,23 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
 pub async fn handle_chat_completions(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_chat_completions_for_app(state, request, AppType::Codex, "Codex", "codex").await
+}
+
+pub async fn handle_devin_chat_completions(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_chat_completions_for_app(state, request, AppType::Devin, "Devin", "devin").await
+}
+
+async fn handle_chat_completions_for_app(
+    state: ProxyState,
+    request: axum::extract::Request,
+    app_type: AppType,
+    tag: &'static str,
+    app_type_str: &'static str,
 ) -> Result<axum::response::Response, ProxyError> {
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
@@ -587,11 +1256,14 @@ pub async fn handle_chat_completions(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    if matches!(app_type, AppType::Devin) {
+        body = normalize_devin_chat_request(body)?;
+    }
 
     let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/chat/completions");
 
     let is_stream = body
@@ -602,7 +1274,7 @@ pub async fn handle_chat_completions(
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
-            &AppType::Codex,
+            &app_type,
             method,
             &endpoint,
             body,
@@ -626,6 +1298,28 @@ pub async fn handle_chat_completions(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    let response_is_sse = response.is_sse();
+    let should_transform_to_chat = result.codex_chat_to_responses
+        || (!is_stream && !response_is_sse)
+        || (matches!(app_type, AppType::Devin) && !is_stream);
+
+    if should_transform_to_chat {
+        log::debug!(
+            "[{tag}] Chat response transform: chat_to_responses={}, stream={}, upstream_sse={}",
+            result.codex_chat_to_responses,
+            is_stream,
+            response_is_sse
+        );
+        return handle_codex_responses_to_chat_transform(
+            response,
+            &ctx,
+            &state,
+            is_stream,
+            connection_guard,
+        )
+        .await;
+    }
 
     process_response(
         response,
@@ -642,6 +1336,23 @@ pub async fn handle_responses(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
+    handle_responses_for_app(state, request, AppType::Codex, "Codex", "codex").await
+}
+
+pub async fn handle_devin_responses(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_responses_for_app(state, request, AppType::Devin, "Devin", "devin").await
+}
+
+async fn handle_responses_for_app(
+    state: ProxyState,
+    request: axum::extract::Request,
+    app_type: AppType,
+    tag: &'static str,
+    app_type_str: &'static str,
+) -> Result<axum::response::Response, ProxyError> {
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
@@ -652,11 +1363,14 @@ pub async fn handle_responses(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+    if matches!(app_type, AppType::Devin) {
+        body = normalize_devin_responses_request(body)?;
+    }
 
     let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
 
     let is_stream = body
@@ -668,7 +1382,7 @@ pub async fn handle_responses(
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
-            &AppType::Codex,
+            &app_type,
             method,
             &endpoint,
             body,
@@ -693,7 +1407,7 @@ pub async fn handle_responses(
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+    if result.codex_responses_to_chat {
         return handle_codex_chat_to_responses_transform(
             response,
             &ctx,
@@ -720,6 +1434,23 @@ pub async fn handle_responses_compact(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
+    handle_responses_compact_for_app(state, request, AppType::Codex, "Codex", "codex").await
+}
+
+pub async fn handle_devin_responses_compact(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    handle_responses_compact_for_app(state, request, AppType::Devin, "Devin", "devin").await
+}
+
+async fn handle_responses_compact_for_app(
+    state: ProxyState,
+    request: axum::extract::Request,
+    app_type: AppType,
+    tag: &'static str,
+    app_type_str: &'static str,
+) -> Result<axum::response::Response, ProxyError> {
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
@@ -734,7 +1465,7 @@ pub async fn handle_responses_compact(
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     let is_stream = body
@@ -746,7 +1477,7 @@ pub async fn handle_responses_compact(
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
-            &AppType::Codex,
+            &app_type,
             method,
             &endpoint,
             body,
@@ -771,7 +1502,7 @@ pub async fn handle_responses_compact(
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+    if result.codex_responses_to_chat {
         return handle_codex_chat_to_responses_transform(
             response,
             &ctx,
@@ -791,6 +1522,481 @@ pub async fn handle_responses_compact(
         connection_guard,
     )
     .await
+}
+
+async fn handle_codex_responses_to_chat_transform(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    is_stream: bool,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+
+    if !status.is_success() {
+        return process_response(
+            response,
+            ctx,
+            state,
+            &OPENAI_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await;
+    }
+
+    if is_stream || response.is_sse() {
+        let stream = response.bytes_stream();
+        let chat_stream = create_chat_sse_stream_from_responses(stream);
+        let logged_stream = create_logged_passthrough_stream(
+            chat_stream,
+            ctx.tag,
+            None,
+            ctx.streaming_timeout_config(),
+            connection_guard,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((headers, body).into_response());
+    }
+
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (mut response_headers, status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let responses_response: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(_) if body_looks_like_sse(&body_str) => {
+            log::warn!("[Codex] 上游对非流请求返回未标记的 Responses SSE，按 SSE 聚合兜底");
+            responses_sse_to_response_value(&body_str).map_err(|e| {
+                log::error!("[Codex] Responses SSE 聚合兜底失败: {e}, body: {body_str}");
+                aggregate_fallback_error(e, &response_headers, &body_str)
+            })?
+        }
+        Err(e) => {
+            log::error!("[Codex] 解析 Responses 上游响应失败: {e}, body: {body_str}");
+            return Err(upstream_body_parse_error(
+                "Failed to parse upstream responses response",
+                &e,
+                &response_headers,
+                &body_str,
+            ));
+        }
+    };
+
+    let chat_response = if is_openai_responses_response(&responses_response) {
+        if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response)
+            .filter(TokenUsage::has_billable_tokens)
+        {
+            let model = responses_response
+                .get("model")
+                .and_then(|m| m.as_str())
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .or_else(|| ctx.outbound_model.clone())
+                .unwrap_or_else(|| ctx.request_model.clone());
+            let request_model = ctx.request_model.clone();
+            let outbound_model = ctx
+                .outbound_model
+                .clone()
+                .unwrap_or_else(|| ctx.request_model.clone());
+            let app_type_str = ctx.app_type_str;
+            tokio::spawn({
+                let state = state.clone();
+                let provider_id = ctx.provider.id.clone();
+                let session_id = ctx.session_id.clone();
+                let latency_ms = ctx.latency_ms();
+                async move {
+                    log_usage(
+                        &state,
+                        &provider_id,
+                        app_type_str,
+                        &model,
+                        &request_model,
+                        &outbound_model,
+                        usage,
+                        latency_ms,
+                        None,
+                        false,
+                        status.as_u16(),
+                        Some(session_id),
+                    )
+                    .await;
+                }
+            });
+        }
+
+        transform_codex_chat::responses_to_chat_completion(responses_response).map_err(|e| {
+            log::error!("[Codex] Responses → Chat 响应转换失败: {e}");
+            e
+        })?
+    } else if is_anthropic_message_response(&responses_response) {
+        transform::anthropic_message_to_openai_chat_completion(responses_response).map_err(|e| {
+            log::error!("[Codex] Anthropic Message → Chat 响应转换失败: {e}");
+            e
+        })?
+    } else {
+        let buffered_response =
+            super::hyper_client::ProxyResponse::buffered(status, response_headers, body_bytes);
+        return process_response(
+            buffered_response,
+            ctx,
+            state,
+            &OPENAI_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await;
+    };
+
+    let _connection_guard = connection_guard;
+
+    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    response_headers.remove(axum::http::header::CONTENT_TYPE);
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    let response_body = serde_json::to_vec(&chat_response).map_err(|e| {
+        log::error!("[Codex] 序列化 Chat 响应失败: {e}");
+        ProxyError::TransformError(format!("Failed to serialize chat response: {e}"))
+    })?;
+
+    builder
+        .body(axum::body::Body::from(response_body))
+        .map_err(|e| {
+            log::error!("[Codex] 构建 Chat 响应失败: {e}");
+            ProxyError::Internal(format!("Failed to build response: {e}"))
+        })
+}
+
+fn is_openai_responses_response(value: &Value) -> bool {
+    value.get("object").and_then(|object| object.as_str()) == Some("response")
+        || (value.get("output").is_some() && value.get("status").is_some())
+        || value.get("output_text").is_some()
+}
+
+fn is_anthropic_message_response(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("message")
+        || (value.get("content").is_some()
+            && value.get("role").and_then(Value::as_str) == Some("assistant"))
+}
+
+#[derive(Default)]
+struct ResponsesToChatSseState {
+    id: Option<String>,
+    model: Option<String>,
+    created: Option<i64>,
+    role_sent: bool,
+    done_sent: bool,
+}
+
+fn create_chat_sse_stream_from_responses(
+    stream: impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    futures::stream::unfold(
+        (
+            Box::pin(stream),
+            String::new(),
+            Vec::<u8>::new(),
+            ResponsesToChatSseState::default(),
+            VecDeque::<Bytes>::new(),
+        ),
+        |(mut stream, mut buffer, mut utf8_remainder, mut state, mut pending)| async move {
+            loop {
+                if let Some(bytes) = pending.pop_front() {
+                    return Some((Ok(bytes), (stream, buffer, utf8_remainder, state, pending)));
+                }
+
+                while let Some(block) = take_sse_block(&mut buffer) {
+                    let chunks = responses_sse_block_to_chat_chunks(&block, &mut state);
+                    pending.extend(chunks);
+                    if let Some(bytes) = pending.pop_front() {
+                        return Some((Ok(bytes), (stream, buffer, utf8_remainder, state, pending)));
+                    }
+                }
+
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    }
+                    Some(Err(err)) => {
+                        return Some((Err(err), (stream, buffer, utf8_remainder, state, pending)));
+                    }
+                    None => {
+                        if !state.done_sent {
+                            state.done_sent = true;
+                            return Some((
+                                Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                                (stream, buffer, utf8_remainder, state, pending),
+                            ));
+                        }
+                        return None;
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn responses_sse_block_to_chat_chunks(
+    block: &str,
+    state: &mut ResponsesToChatSseState,
+) -> Vec<Bytes> {
+    let (event, data) = parse_sse_event_block(block);
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed == "[DONE]" {
+        state.done_sent = true;
+        return vec![Bytes::from_static(b"data: [DONE]\n\n")];
+    }
+
+    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+        return Vec::new();
+    };
+    update_chat_sse_state_from_responses_event(&value, state);
+
+    let event_name = event
+        .as_deref()
+        .or_else(|| value.get("type").and_then(|value| value.as_str()))
+        .unwrap_or_default();
+
+    let mut chunks = Vec::new();
+    if !state.role_sent && should_emit_chat_role(event_name) {
+        state.role_sent = true;
+        chunks.push(chat_sse_chunk(
+            state,
+            json!({ "role": "assistant" }),
+            None,
+            None,
+        ));
+    }
+
+    match event_name {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(delta) = value.get("delta").and_then(|value| value.as_str()) {
+                chunks.push(chat_sse_chunk(
+                    state,
+                    json!({ "content": delta }),
+                    None,
+                    None,
+                ));
+            }
+        }
+        name if name.contains("reasoning") && name.ends_with(".delta") => {
+            if let Some(delta) = value.get("delta").and_then(|value| value.as_str()) {
+                chunks.push(chat_sse_chunk(
+                    state,
+                    json!({ "reasoning_content": delta }),
+                    None,
+                    None,
+                ));
+            }
+        }
+        "response.output_item.added" => {
+            if let Some(item) = value.get("item") {
+                if item.get("type").and_then(|value| value.as_str()) == Some("function_call") {
+                    let index = value
+                        .get("output_index")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("call_0");
+                    let name = item
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default();
+                    chunks.push(chat_sse_chunk(
+                        state,
+                        json!({
+                            "tool_calls": [{
+                                "index": index,
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": ""
+                                }
+                            }]
+                        }),
+                        None,
+                        None,
+                    ));
+                }
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            let index = value
+                .get("output_index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let delta = value
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            chunks.push(chat_sse_chunk(
+                state,
+                json!({
+                    "tool_calls": [{
+                        "index": index,
+                        "function": {
+                            "arguments": delta
+                        }
+                    }]
+                }),
+                None,
+                None,
+            ));
+        }
+        "response.completed" => {
+            let usage = value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .map(responses_usage_value_to_chat_usage);
+            chunks.push(chat_sse_chunk(state, json!({}), Some("stop"), usage));
+            chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+            state.done_sent = true;
+        }
+        "response.failed" | "response.incomplete" => {
+            chunks.push(chat_sse_chunk(state, json!({}), Some("length"), None));
+            chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+            state.done_sent = true;
+        }
+        _ => {}
+    }
+
+    chunks
+}
+
+fn parse_sse_event_block(block: &str) -> (Option<String>, String) {
+    let mut event = None;
+    let mut data_lines = Vec::new();
+
+    for line in block.lines() {
+        if let Some(value) = strip_sse_field(line.trim_start(), "event") {
+            event = Some(value.trim().to_string());
+        } else if let Some(value) = strip_sse_field(line.trim_start(), "data") {
+            data_lines.push(value.to_string());
+        }
+    }
+
+    (event, data_lines.join("\n"))
+}
+
+fn update_chat_sse_state_from_responses_event(value: &Value, state: &mut ResponsesToChatSseState) {
+    let response = value.get("response").unwrap_or(value);
+
+    if state.id.is_none() {
+        state.id = response
+            .get("id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                value
+                    .get("item")
+                    .and_then(|item| item.get("id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            });
+    }
+    if state.model.is_none() {
+        state.model = response
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+    }
+    if state.created.is_none() {
+        state.created = response
+            .get("created")
+            .or_else(|| response.get("created_at"))
+            .and_then(|value| value.as_i64());
+    }
+}
+
+fn should_emit_chat_role(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "response.created"
+            | "response.output_text.delta"
+            | "response.refusal.delta"
+            | "response.output_item.added"
+    ) || (event_name.contains("reasoning") && event_name.ends_with(".delta"))
+}
+
+fn chat_sse_chunk(
+    state: &ResponsesToChatSseState,
+    delta: Value,
+    finish_reason: Option<&str>,
+    usage: Option<Value>,
+) -> Bytes {
+    let mut chunk = json!({
+        "id": state
+            .id
+            .clone()
+            .unwrap_or_else(|| "chatcmpl-ccswitch".to_string()),
+        "object": "chat.completion.chunk",
+        "created": state.created.unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        "model": state.model.clone().unwrap_or_default(),
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    });
+
+    if let Some(usage) = usage {
+        chunk["usage"] = usage;
+    }
+
+    Bytes::from(format!("data: {chunk}\n\n"))
+}
+
+fn responses_usage_value_to_chat_usage(usage: &Value) -> Value {
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens
+    })
 }
 
 async fn handle_codex_chat_to_responses_transform(
@@ -911,7 +2117,7 @@ async fn handle_codex_chat_to_responses_transform(
     let (mut response_headers, status, body_bytes) =
         read_decoded_body(response, ctx.tag, body_timeout).await?;
     let body_str = String::from_utf8_lossy(&body_bytes);
-    let chat_response: Value = match serde_json::from_slice(&body_bytes) {
+    let upstream_response: Value = match serde_json::from_slice(&body_bytes) {
         Ok(value) => value,
         // 与 Claude 侧 handle_claude_transform 对称的兜底嗅探（#2234）：
         // 上游对 stream:false 返回未标记 Content-Type 的 SSE 体时按 SSE 聚合。
@@ -932,6 +2138,14 @@ async fn handle_codex_chat_to_responses_transform(
                 &body_str,
             ));
         }
+    };
+    let chat_response = if is_anthropic_message_response(&upstream_response) {
+        transform::anthropic_message_to_openai_chat_completion(upstream_response).map_err(|e| {
+            log::error!("[Codex] Anthropic Message → Chat 响应转换失败: {e}");
+            e
+        })?
+    } else {
+        upstream_response
     };
     let responses_response = transform_codex_chat::chat_completion_to_response_with_context(
         chat_response,
@@ -1920,12 +3134,14 @@ fn log_forward_error(
     let status_code = map_proxy_error_to_status(error);
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
+    let (model, request_model) = forward_error_log_models(ctx);
 
     if let Err(e) = logger.log_error_with_context(
         request_id,
         ctx.provider.id.clone(),
         ctx.app_type_str.to_string(),
-        ctx.request_model.clone(),
+        model,
+        request_model,
         status_code,
         error_message,
         ctx.latency_ms(),
@@ -1935,6 +3151,26 @@ fn log_forward_error(
     ) {
         log::warn!("记录失败请求日志失败: {e}");
     }
+}
+
+fn forward_error_log_models(ctx: &RequestContext) -> (String, String) {
+    let request_model = ctx.request_model.clone();
+    let model = ctx
+        .outbound_model
+        .clone()
+        .or_else(|| {
+            matches!(ctx.app_type, AppType::Devin).then(|| {
+                resolve_devin_model_route(
+                    &ctx.provider,
+                    &json!({ "model": request_model.as_str() }),
+                )
+                .and_then(|route| route.upstream_model)
+            })?
+        })
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| request_model.clone());
+
+    (model, request_model)
 }
 
 /// 记录请求使用量
@@ -1999,9 +3235,58 @@ mod tests {
     use super::{
         body_looks_like_sse, body_snippet, chat_sse_to_response_value, codex_proxy_error_json,
         responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        upstream_body_parse_error, windsurf_content_length_header,
+        windsurf_root_passthrough_target, windsurf_web_redirect_location,
+        WINDSURF_API_SERVER_UPSTREAM, WINDSURF_INFERENCE_UPSTREAM,
     };
     use crate::proxy::ProxyError;
+
+    #[test]
+    fn windsurf_root_passthrough_sends_completion_methods_to_inference() {
+        assert_eq!(
+            windsurf_root_passthrough_target(
+                "/exa.api_server_pb.ApiServerService/GetStreamingCompletions"
+            ),
+            ("inference_root", WINDSURF_INFERENCE_UPSTREAM)
+        );
+        assert_eq!(
+            windsurf_root_passthrough_target("/exa.api_server_pb.ApiServerService/GetCompletions"),
+            ("inference_root", WINDSURF_INFERENCE_UPSTREAM)
+        );
+    }
+
+    #[test]
+    fn windsurf_root_passthrough_sends_status_methods_to_api_server() {
+        assert_eq!(
+            windsurf_root_passthrough_target("/exa.api_server_pb.ApiServerService/GetUserStatus"),
+            ("api_server_root", WINDSURF_API_SERVER_UPSTREAM)
+        );
+        assert_eq!(
+            windsurf_root_passthrough_target("/exa.api_server_pb.ApiServerService/RegisterUser"),
+            ("api_server_root", WINDSURF_API_SERVER_UPSTREAM)
+        );
+    }
+
+    #[test]
+    fn windsurf_web_redirect_keeps_login_off_local_proxy() {
+        let login_uri: axum::http::Uri = "/login?foo=bar".parse().unwrap();
+        assert_eq!(
+            windsurf_web_redirect_location(&login_uri).as_deref(),
+            Some("https://windsurf.com/login?foo=bar")
+        );
+
+        let auth_uri: axum::http::Uri = "/oauth/authorize?client_id=codeium".parse().unwrap();
+        assert_eq!(
+            windsurf_web_redirect_location(&auth_uri).as_deref(),
+            Some("https://register.windsurf.com/oauth/authorize?client_id=codeium")
+        );
+    }
+
+    #[test]
+    fn windsurf_passthrough_sets_exact_content_length() {
+        let value = windsurf_content_length_header(5).unwrap();
+        assert_eq!(value.to_str().unwrap(), "5");
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {

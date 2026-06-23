@@ -40,7 +40,12 @@ pub struct UsageParserConfig {
 // ============================================================================
 
 pub fn claude_stream_usage_event_filter(data: &str) -> bool {
-    data.contains("\"message_start\"") || data.contains("\"message_delta\"")
+    data.contains("message_start")
+        || data.contains("message_delta")
+        || data.contains("input_tokens")
+        || data.contains("output_tokens")
+        || data.contains("cache_read_input_tokens")
+        || data.contains("cache_creation_input_tokens")
 }
 
 fn openai_stream_usage_event_filter(data: &str) -> bool {
@@ -49,6 +54,10 @@ fn openai_stream_usage_event_filter(data: &str) -> bool {
 
 pub fn codex_stream_usage_event_filter(data: &str) -> bool {
     data.contains("\"response.completed\"") || data.contains("\"usage\"")
+}
+
+pub fn devin_stream_usage_event_filter(data: &str) -> bool {
+    claude_stream_usage_event_filter(data) || codex_stream_usage_event_filter(data)
 }
 
 fn gemini_stream_usage_event_filter(data: &str) -> bool {
@@ -120,6 +129,28 @@ fn codex_auto_model_extractor(events: &[Value], fallback_model: &str) -> String 
         .to_string()
 }
 
+fn devin_model_extractor(events: &[Value], fallback_model: &str) -> String {
+    if let Some(usage) = TokenUsage::from_claude_stream_events(events)
+        .or_else(|| TokenUsage::from_codex_stream_events_auto(events))
+    {
+        if let Some(model) = usage.model.filter(|m| !m.is_empty()) {
+            return model;
+        }
+    }
+
+    events
+        .iter()
+        .find_map(|event| {
+            event
+                .get("model")
+                .or_else(|| event.pointer("/response/model"))?
+                .as_str()
+                .filter(|m| !m.is_empty())
+        })
+        .unwrap_or(fallback_model)
+        .to_string()
+}
+
 /// Gemini 流式响应模型提取（优先使用 usage.model）
 fn gemini_model_extractor(events: &[Value], fallback_model: &str) -> String {
     // 首先尝试从解析的 usage 中获取模型
@@ -160,6 +191,24 @@ pub const CODEX_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
     model_extractor: codex_auto_model_extractor,
     stream_event_filter: Some(codex_stream_usage_event_filter),
     app_type_str: "codex",
+};
+
+fn parse_devin_stream_usage(events: &[Value]) -> Option<TokenUsage> {
+    TokenUsage::from_claude_stream_events(events)
+        .or_else(|| TokenUsage::from_codex_stream_events_auto(events))
+}
+
+fn parse_devin_response_usage(body: &Value) -> Option<TokenUsage> {
+    TokenUsage::from_claude_response(body).or_else(|| TokenUsage::from_codex_response_auto(body))
+}
+
+/// Devin/Windsurf can be routed to Anthropic Messages, OpenAI Chat, or Responses.
+pub const DEVIN_PARSER_CONFIG: UsageParserConfig = UsageParserConfig {
+    stream_parser: parse_devin_stream_usage,
+    response_parser: parse_devin_response_usage,
+    model_extractor: devin_model_extractor,
+    stream_event_filter: Some(devin_stream_usage_event_filter),
+    app_type_str: "devin",
 };
 
 /// Gemini API 解析配置
@@ -217,6 +266,74 @@ pub const CODEX_RESPONSES_HANDLER_CONFIG: HandlerConfig = HandlerConfig {
     app_type_str: "codex",
     parser_config: &CODEX_PARSER_CONFIG,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn devin_parser_reads_openai_chat_usage() {
+        let body = json!({
+            "model": "Claude-Sonnet-4.6-hq",
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens": 5,
+                "total_tokens": 13
+            }
+        });
+
+        let usage = (DEVIN_PARSER_CONFIG.response_parser)(&body).expect("usage");
+
+        assert_eq!(usage.input_tokens, 8);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.model.as_deref(), Some("Claude-Sonnet-4.6-hq"));
+    }
+
+    #[test]
+    fn devin_parser_reads_claude_stream_usage() {
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {
+                        "input_tokens": 11,
+                        "cache_read_input_tokens": 3
+                    }
+                }
+            }),
+            json!({
+                "type": "message_delta",
+                "usage": {
+                    "output_tokens": 7
+                }
+            }),
+        ];
+
+        let usage = (DEVIN_PARSER_CONFIG.stream_parser)(&events).expect("usage");
+        let model = (DEVIN_PARSER_CONFIG.model_extractor)(&events, "fallback");
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cache_read_tokens, 3);
+        assert_eq!(model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn devin_filter_collects_joycode_claude_usage_delta() {
+        let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":63967,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":592}}"#;
+        assert!(devin_stream_usage_event_filter(data));
+
+        let event = serde_json::from_str::<serde_json::Value>(data).unwrap();
+        let usage = (DEVIN_PARSER_CONFIG.stream_parser)(&[event]).expect("usage");
+        assert_eq!(usage.input_tokens, 63967);
+        assert_eq!(usage.output_tokens, 592);
+        assert_eq!(usage.cache_creation_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
+    }
+}
 
 /// Gemini Handler 配置
 #[allow(dead_code)]

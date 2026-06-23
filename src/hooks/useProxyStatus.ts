@@ -130,9 +130,11 @@ export function useProxyStatus() {
           ? "Claude"
           : variables.appType === "codex"
             ? "Codex"
-            : variables.appType === "gemini"
-              ? "Gemini"
-              : "OpenCode";
+            : variables.appType === "devin"
+              ? "Devin"
+              : variables.appType === "gemini"
+                ? "Gemini"
+                : "OpenCode";
 
       toast.success(
         variables.enabled
@@ -214,6 +216,7 @@ export function useProxyStatus() {
     isTakeoverActive:
       takeoverStatus?.claude ||
       takeoverStatus?.codex ||
+      takeoverStatus?.devin ||
       takeoverStatus?.gemini ||
       false,
 

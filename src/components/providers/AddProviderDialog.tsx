@@ -16,6 +16,7 @@ import { UniversalProviderFormModal } from "@/components/universal/UniversalProv
 import { UniversalProviderPanel } from "@/components/universal";
 import { providerPresets } from "@/config/claudeProviderPresets";
 import { codexProviderPresets } from "@/config/codexProviderPresets";
+import { devinProviderPresets } from "@/config/devinProviderPresets";
 import { geminiProviderPresets } from "@/config/geminiProviderPresets";
 import { claudeDesktopProviderPresets } from "@/config/claudeDesktopProviderPresets";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
@@ -47,6 +48,7 @@ export function AddProviderDialog({
     appId !== "opencode" &&
     appId !== "openclaw" &&
     appId !== "hermes" &&
+    appId !== "devin" &&
     appId !== "claude-desktop";
   const [activeTab, setActiveTab] = useState<"app-specific" | "universal">(
     "app-specific",
@@ -172,6 +174,19 @@ export function AddProviderDialog({
                 preset.endpointCandidates.forEach(addUrl);
               }
             }
+          } else if (appId === "devin") {
+            const presets = devinProviderPresets;
+            const presetIndex = parseInt(values.presetId.replace("devin-", ""));
+            if (
+              !isNaN(presetIndex) &&
+              presetIndex >= 0 &&
+              presetIndex < presets.length
+            ) {
+              const preset = presets[presetIndex];
+              if (Array.isArray(preset.endpointCandidates)) {
+                preset.endpointCandidates.forEach(addUrl);
+              }
+            }
           } else if (appId === "gemini") {
             const presets = geminiProviderPresets;
             const presetIndex = parseInt(
@@ -216,7 +231,7 @@ export function AddProviderDialog({
           if (env?.ANTHROPIC_BASE_URL) {
             addUrl(env.ANTHROPIC_BASE_URL);
           }
-        } else if (appId === "codex") {
+        } else if (appId === "codex" || appId === "devin") {
           const config = parsedConfig.config as string | undefined;
           if (config) {
             const extractedBaseUrl = extractCodexBaseUrl(config);

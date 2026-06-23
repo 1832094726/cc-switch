@@ -51,7 +51,7 @@ fn validate_common_config_snippet(app_type: &str, snippet: &str) -> Result<(), S
             serde_json::from_str::<serde_json::Value>(snippet)
                 .map_err(invalid_json_format_error)?;
         }
-        "codex" => {
+        "codex" | "devin" => {
             snippet
                 .parse::<toml_edit::DocumentMut>()
                 .map_err(invalid_toml_format_error)?;
@@ -90,6 +90,10 @@ pub async fn get_config_status(
 
             Ok(ConfigStatus { exists, path })
         }
+        AppType::Devin => Ok(ConfigStatus {
+            exists: false,
+            path: String::new(),
+        }),
         AppType::Gemini => {
             let env_path = crate::gemini_config::get_gemini_env_path();
             let exists = env_path.exists();
@@ -142,6 +146,9 @@ pub async fn get_config_dir(app: String) -> Result<String, String> {
             crate::claude_desktop_config::get_config_library_path().map_err(|e| e.to_string())?
         }
         AppType::Codex => codex_config::get_codex_config_dir(),
+        AppType::Devin => {
+            return Err("Devin local route does not have a client config directory".to_string())
+        }
         AppType::Gemini => crate::gemini_config::get_gemini_dir(),
         AppType::OpenCode => crate::opencode_config::get_opencode_dir(),
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),
@@ -159,6 +166,9 @@ pub async fn open_config_folder(handle: AppHandle, app: String) -> Result<bool, 
             crate::claude_desktop_config::get_config_library_path().map_err(|e| e.to_string())?
         }
         AppType::Codex => codex_config::get_codex_config_dir(),
+        AppType::Devin => {
+            return Err("Devin local route does not have a client config directory".to_string())
+        }
         AppType::Gemini => crate::gemini_config::get_gemini_dir(),
         AppType::OpenCode => crate::opencode_config::get_opencode_dir(),
         AppType::OpenClaw => crate::openclaw_config::get_openclaw_dir(),

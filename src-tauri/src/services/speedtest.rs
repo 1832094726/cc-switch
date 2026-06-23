@@ -70,37 +70,79 @@ impl SpeedtestService {
         let tasks = valid_targets.into_iter().map(|(idx, trimmed, parsed_url)| {
             let client = client.clone();
             async move {
+                // 构建健康检查 URL：优先使用 /v1/models 端点
+                let health_check_url =
+                    if parsed_url.path().ends_with("/v1") || parsed_url.path().ends_with("/v1/") {
+                        parsed_url.join("models").ok()
+                    } else {
+                        parsed_url.join("v1/models").ok()
+                    }
+                    .unwrap_or_else(|| parsed_url.clone());
+
                 // 先进行一次热身请求，忽略结果，仅用于复用连接/绕过首包惩罚。
                 let _ = client
-                    .get(parsed_url.clone())
+                    .get(health_check_url.clone())
                     .timeout(request_timeout)
                     .send()
                     .await;
 
                 // 第二次请求开始计时，并将其作为结果返回。
                 let start = Instant::now();
-                let latency = match client.get(parsed_url).timeout(request_timeout).send().await {
-                    Ok(resp) => EndpointLatency {
-                        url: trimmed,
-                        latency: Some(start.elapsed().as_millis()),
-                        status: Some(resp.status().as_u16()),
-                        error: None,
-                    },
+                let latency = match client
+                    .get(health_check_url)
+                    .timeout(request_timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status_code = resp.status().as_u16();
+                        // 401 说明端点存在，只是需要认证，视为成功
+                        let is_success = status_code < 500 || status_code == 401;
+
+                        EndpointLatency {
+                            url: trimmed,
+                            latency: if is_success {
+                                Some(start.elapsed().as_millis())
+                            } else {
+                                None
+                            },
+                            status: Some(status_code),
+                            error: if is_success {
+                                None
+                            } else {
+                                Some(format!("HTTP {}", status_code))
+                            },
+                        }
+                    }
                     Err(err) => {
                         let status = err.status().map(|s| s.as_u16());
+                        // 401 也视为成功（说明端点存在）
+                        let is_auth_error = status == Some(401);
+
                         let error_message = if err.is_timeout() {
                             "请求超时".to_string()
                         } else if err.is_connect() {
                             "连接失败".to_string()
+                        } else if is_auth_error {
+                            // 401 不显示错误
+                            String::new()
                         } else {
                             err.to_string()
                         };
 
                         EndpointLatency {
                             url: trimmed,
-                            latency: None,
+                            latency: if is_auth_error {
+                                Some(start.elapsed().as_millis())
+                            } else {
+                                None
+                            },
                             status,
-                            error: Some(error_message),
+                            error: if error_message.is_empty() {
+                                None
+                            } else {
+                                Some(error_message)
+                            },
                         }
                     }
                 };

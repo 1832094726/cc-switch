@@ -2,12 +2,13 @@ import { useMemo } from "react";
 import type { AppId } from "@/lib/api";
 import type { ProviderPreset } from "@/config/claudeProviderPresets";
 import type { CodexProviderPreset } from "@/config/codexProviderPresets";
+import type { DevinProviderPreset } from "@/config/devinProviderPresets";
 import type { ProviderMeta, EndpointCandidate } from "@/types";
 import { extractCodexBaseUrl } from "@/utils/providerConfigUtils";
 
 type PresetEntry = {
   id: string;
-  preset: ProviderPreset | CodexProviderPreset;
+  preset: ProviderPreset | CodexProviderPreset | DevinProviderPreset;
 };
 
 interface UseSpeedTestEndpointsProps {
@@ -105,7 +106,7 @@ export function useSpeedTestEndpoints({
   }, [appId, baseUrl, initialData, selectedPresetId, presetEntries]);
 
   const codexEndpoints = useMemo<EndpointCandidate[]>(() => {
-    if (appId !== "codex") return [];
+    if (appId !== "codex" && appId !== "devin") return [];
 
     const map = new Map<string, EndpointCandidate>();
     // 候选端点标记为 isCustom: false，表示来自预设或配置
@@ -138,7 +139,7 @@ export function useSpeedTestEndpoints({
     if (selectedPresetId && selectedPresetId !== "custom") {
       const entry = presetEntries.find((item) => item.id === selectedPresetId);
       if (entry) {
-        const preset = entry.preset as CodexProviderPreset;
+        const preset = entry.preset as CodexProviderPreset | DevinProviderPreset;
         // 添加预设自己的 baseUrl
         const presetConfig = preset.config || "";
         const presetBaseUrl = extractCodexBaseUrl(presetConfig);
@@ -155,5 +156,7 @@ export function useSpeedTestEndpoints({
     return Array.from(map.values());
   }, [appId, codexBaseUrl, initialData, selectedPresetId, presetEntries]);
 
-  return appId === "codex" ? codexEndpoints : claudeEndpoints;
+  return appId === "codex" || appId === "devin"
+    ? codexEndpoints
+    : claudeEndpoints;
 }

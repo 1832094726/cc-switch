@@ -131,7 +131,7 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
+        let mut providers = state
             .provider_router
             .select_providers(app_type_str)
             .await
@@ -142,6 +142,28 @@ impl RequestContext {
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
+
+        if matches!(app_type, AppType::Devin) {
+            let snippet = state
+                .db
+                .get_config_snippet("devin")
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+            log::debug!(
+                "[HandlerContext] Devin config snippet: {}",
+                snippet
+                    .as_ref()
+                    .map(|value| format!("present(len={})", value.len()))
+                    .unwrap_or_else(|| "absent".to_string())
+            );
+            for provider in &mut providers {
+                log::debug!(
+                    "[HandlerContext] Applying variables to provider: {} (id: {})",
+                    provider.name,
+                    provider.id
+                );
+                crate::devin_variables::apply_devin_common_variables(provider, snippet.as_deref());
+            }
+        }
 
         let provider = providers
             .first()

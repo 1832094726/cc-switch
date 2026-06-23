@@ -44,6 +44,7 @@ pub(crate) fn provider_exists_in_live_config(
             .map(|providers| providers.contains_key(provider_id)),
         AppType::Hermes => crate::hermes_config::get_providers()
             .map(|providers| providers.contains_key(provider_id)),
+        AppType::Devin => Ok(false),
         _ => Ok(false),
     }
 }
@@ -317,7 +318,7 @@ fn settings_contain_common_config(app_type: &AppType, settings: &Value, snippet:
             Ok(source) if source.is_object() => json_is_subset(settings, &source),
             _ => false,
         },
-        AppType::Codex => {
+        AppType::Codex | AppType::Devin => {
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             if config_toml.trim().is_empty() {
                 return false;
@@ -386,7 +387,7 @@ pub(crate) fn remove_common_config_from_settings(
             json_deep_remove(&mut result, &source);
             Ok(result)
         }
-        AppType::Codex => {
+        AppType::Codex | AppType::Devin => {
             let mut result = settings.clone();
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             let mut target_doc = if config_toml.trim().is_empty() {
@@ -441,7 +442,7 @@ fn apply_common_config_to_settings(
             json_deep_merge(&mut result, &source);
             Ok(result)
         }
-        AppType::Codex => {
+        AppType::Codex | AppType::Devin => {
             let mut result = settings.clone();
             let config_toml = settings.get("config").and_then(Value::as_str).unwrap_or("");
             let mut target_doc = if config_toml.trim().is_empty() {
@@ -875,6 +876,13 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             crate::hermes_config::set_provider(&provider.id, provider.settings_config.clone())?;
             log::debug!("Hermes provider '{}' written to live config", provider.id);
         }
+        AppType::Devin => {
+            return Err(AppError::localized(
+                "devin.live.unsupported",
+                "Devin 本地路由不写入外部 Live 配置",
+                "Devin local route does not write an external live config.",
+            ));
+        }
     }
     Ok(())
 }
@@ -1124,6 +1132,11 @@ pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
             let config = crate::hermes_config::yaml_to_json(&yaml_config)?;
             Ok(config)
         }
+        AppType::Devin => Err(AppError::localized(
+            "devin.live.read_unsupported",
+            "Devin 本地路由没有可导入的外部 Live 配置",
+            "Devin local route has no external live config to import.",
+        )),
     }
 }
 
@@ -1220,6 +1233,9 @@ pub fn import_default_config(state: &AppState, app_type: AppType) -> Result<bool
         // OpenCode, OpenClaw and Hermes use additive mode and are handled by early return above
         AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => {
             unreachable!("additive mode apps are handled by early return")
+        }
+        AppType::Devin => {
+            return Ok(false);
         }
     };
 

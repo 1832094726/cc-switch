@@ -342,6 +342,446 @@ pub fn responses_to_chat_completions_with_reasoning(
     Ok(result)
 }
 
+/// Convert an OpenAI Chat Completions request into an OpenAI Responses request.
+///
+/// Devin may speak Chat Completions while a selected provider only exposes the
+/// Responses wire API. Keep this conversion in the Codex provider adapter path
+/// so the provider's `apiFormat`/`wire_api` controls when it is applied.
+pub fn chat_completions_to_responses(body: Value) -> Result<Value, ProxyError> {
+    let mut result = json!({});
+
+    if let Some(model) = body.get("model") {
+        result["model"] = model.clone();
+    }
+
+    let messages = body
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+        .ok_or_else(|| {
+            ProxyError::TransformError(
+                "Chat Completions request missing messages array".to_string(),
+            )
+        })?;
+
+    let mut instructions = Vec::new();
+    let mut input = Vec::new();
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("user");
+
+        if matches!(role, "system" | "developer") {
+            let text = chat_content_plain_text(message.get("content"));
+            if !text.is_empty() {
+                instructions.push(text);
+            }
+            continue;
+        }
+
+        if role == "tool" {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": chat_content_plain_text(message.get("content"))
+            }));
+            continue;
+        }
+
+        let content = chat_content_to_responses_content(message.get("content"), role);
+        if !content.is_empty() {
+            input.push(json!({
+                "role": if role == "assistant" { "assistant" } else { "user" },
+                "content": content
+            }));
+        }
+
+        if role == "assistant" {
+            append_chat_tool_calls_as_responses_items(message, &mut input);
+        }
+    }
+
+    if !instructions.is_empty() {
+        result["instructions"] = Value::String(instructions.join("\n\n"));
+    }
+    result["input"] = Value::Array(input);
+
+    if let Some(max_tokens) = body
+        .get("max_completion_tokens")
+        .or_else(|| body.get("max_tokens"))
+    {
+        result["max_output_tokens"] = max_tokens.clone();
+    }
+
+    for key in [
+        "temperature",
+        "top_p",
+        "stream",
+        "parallel_tool_calls",
+        "metadata",
+        "store",
+        "service_tier",
+        "user",
+    ] {
+        if let Some(value) = body.get(key) {
+            result[key] = value.clone();
+        }
+    }
+
+    if let Some(reasoning) = body.get("reasoning") {
+        result["reasoning"] = reasoning.clone();
+    } else if let Some(effort) = body.get("reasoning_effort") {
+        result["reasoning"] = json!({ "effort": effort });
+    }
+
+    if result.get("store").is_none() {
+        result["store"] = json!(false);
+    }
+    ensure_responses_include(&mut result, "reasoning.encrypted_content");
+
+    if let Some(tools) = body.get("tools").and_then(|tools| tools.as_array()) {
+        let converted_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(chat_tool_to_responses_tool)
+            .collect();
+        if !converted_tools.is_empty() {
+            result["tools"] = Value::Array(converted_tools);
+        }
+    }
+
+    if let Some(tool_choice) = body.get("tool_choice") {
+        result["tool_choice"] = chat_tool_choice_to_responses(tool_choice);
+    }
+
+    Ok(result)
+}
+
+fn ensure_responses_include(body: &mut Value, marker: &str) {
+    match body.get_mut("include") {
+        Some(Value::Array(items)) => {
+            if !items.iter().any(|item| item.as_str() == Some(marker)) {
+                items.push(Value::String(marker.to_string()));
+            }
+        }
+        Some(Value::String(existing)) if existing == marker => {}
+        Some(existing) => {
+            let previous = existing.clone();
+            *existing = json!([previous, marker]);
+        }
+        None => {
+            body["include"] = json!([marker]);
+        }
+    }
+}
+
+fn chat_content_plain_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|value| value.as_str())
+                    .or_else(|| part.get("content").and_then(|value| value.as_str()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(value) if !value.is_null() => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn chat_content_to_responses_content(content: Option<&Value>, role: &str) -> Vec<Value> {
+    let text_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+
+    match content {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![json!({ "type": text_type, "text": text })]
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| chat_content_part_to_responses_part(part, text_type))
+            .collect(),
+        Some(value) if !value.is_null() => {
+            vec![json!({ "type": text_type, "text": value.to_string() })]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn chat_content_part_to_responses_part(part: &Value, text_type: &str) -> Option<Value> {
+    let part_type = part.get("type").and_then(|value| value.as_str());
+
+    match part_type {
+        Some("text" | "input_text" | "output_text") => part
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(|text| json!({ "type": text_type, "text": text })),
+        Some("image_url") => {
+            let image_url = part
+                .get("image_url")
+                .and_then(|value| {
+                    value
+                        .get("url")
+                        .and_then(|url| url.as_str())
+                        .or_else(|| value.as_str())
+                })
+                .unwrap_or_default();
+            if image_url.is_empty() {
+                None
+            } else {
+                Some(json!({ "type": "input_image", "image_url": image_url }))
+            }
+        }
+        Some("input_image") => Some(part.clone()),
+        Some("file" | "input_file") => {
+            if part.get("file_id").is_some() || part.get("filename").is_some() {
+                Some(json!({
+                    "type": "input_file",
+                    "file_id": part.get("file_id").cloned().unwrap_or(Value::Null),
+                    "filename": part.get("filename").cloned().unwrap_or(Value::Null)
+                }))
+            } else {
+                None
+            }
+        }
+        _ => part
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(|text| json!({ "type": text_type, "text": text })),
+    }
+}
+
+fn append_chat_tool_calls_as_responses_items(message: &Value, input: &mut Vec<Value>) {
+    let Some(tool_calls) = message.get("tool_calls").and_then(|value| value.as_array()) else {
+        return;
+    };
+
+    for call in tool_calls {
+        let function = call.get("function").unwrap_or(&Value::Null);
+        let name = function
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let call_id = call
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let arguments = function
+            .get("arguments")
+            .and_then(|value| value.as_str())
+            .unwrap_or("{}");
+        input.push(json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": canonicalize_json_string_if_parseable(arguments)
+        }));
+    }
+}
+
+fn chat_tool_to_responses_tool(tool: &Value) -> Option<Value> {
+    if tool.get("type").and_then(|value| value.as_str()) != Some("function") {
+        return None;
+    }
+    let function = tool.get("function")?;
+    let name = function.get("name").and_then(|value| value.as_str())?;
+    let mut converted = json!({
+        "type": "function",
+        "name": name,
+        "parameters": function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }))
+    });
+    if let Some(description) = function.get("description") {
+        converted["description"] = description.clone();
+    }
+    if let Some(strict) = function.get("strict") {
+        converted["strict"] = strict.clone();
+    }
+    Some(converted)
+}
+
+fn chat_tool_choice_to_responses(tool_choice: &Value) -> Value {
+    if let Some(choice) = tool_choice.as_str() {
+        return Value::String(choice.to_string());
+    }
+
+    if tool_choice.get("type").and_then(|value| value.as_str()) == Some("function") {
+        if let Some(name) = tool_choice
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(|value| value.as_str())
+        {
+            return json!({ "type": "function", "name": name });
+        }
+    }
+
+    tool_choice.clone()
+}
+
+/// Convert a non-streaming OpenAI Responses response into Chat Completions.
+pub fn responses_to_chat_completion(body: Value) -> Result<Value, ProxyError> {
+    if body.get("error").is_some_and(|error| !error.is_null()) {
+        return Ok(body);
+    }
+
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    collect_responses_output_for_chat(&body, &mut content_parts, &mut tool_calls);
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content_parts.join("")
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+
+    let finish_reason = if message
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tool_calls| !tool_calls.is_empty())
+    {
+        "tool_calls"
+    } else {
+        match body.get("status").and_then(|value| value.as_str()) {
+            Some("incomplete") => "length",
+            _ => "stop",
+        }
+    };
+
+    Ok(json!({
+        "id": body
+            .get("id")
+            .cloned()
+            .unwrap_or_else(|| {
+                let body_text = body.to_string();
+                json!(format!("chatcmpl-{}", short_sha256_hex(body_text.as_bytes())))
+            }),
+        "object": "chat.completion",
+        "created": body
+            .get("created")
+            .or_else(|| body.get("created_at"))
+            .cloned()
+            .unwrap_or_else(|| json!(chrono::Utc::now().timestamp())),
+        "model": body.get("model").cloned().unwrap_or_else(|| json!("")),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": responses_usage_to_chat_usage(body.get("usage"))
+    }))
+}
+
+fn collect_responses_output_for_chat(
+    body: &Value,
+    content_parts: &mut Vec<String>,
+    tool_calls: &mut Vec<Value>,
+) {
+    let Some(output) = body.get("output").and_then(|value| value.as_array()) else {
+        if let Some(text) = body.get("output_text").and_then(|value| value.as_str()) {
+            content_parts.push(text.to_string());
+        }
+        return;
+    };
+
+    for item in output {
+        match item.get("type").and_then(|value| value.as_str()) {
+            Some("message") => {
+                if let Some(content) = item.get("content").and_then(|value| value.as_array()) {
+                    for part in content {
+                        if let Some(text) = part
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| part.get("delta").and_then(|value| value.as_str()))
+                        {
+                            content_parts.push(text.to_string());
+                        }
+                    }
+                }
+            }
+            Some("output_text" | "text") => {
+                if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                    content_parts.push(text.to_string());
+                }
+            }
+            Some("function_call") => {
+                let name = item
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("call_0");
+                let arguments = item
+                    .get("arguments")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("{}");
+                tool_calls.push(json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn responses_usage_to_chat_usage(usage: Option<&Value>) -> Value {
+    let Some(usage) = usage else {
+        return json!({
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        });
+    };
+
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens
+    })
+}
+
 fn apply_reasoning_options(
     result: &mut Value,
     body: &Value,
@@ -359,8 +799,11 @@ fn apply_reasoning_options(
 
     let supports_effort = config.supports_effort.unwrap_or(false);
     let supports_thinking = config.supports_thinking.unwrap_or(false) || supports_effort;
-    let Some(reasoning_enabled) = reasoning_requested(body) else {
-        return;
+    let explicit_effort = body.pointer("/reasoning/effort").and_then(|v| v.as_str());
+    let reasoning_enabled = match reasoning_requested(body) {
+        Some(enabled) => enabled,
+        None if config.default_enabled == Some(true) => true,
+        None => return,
     };
 
     if supports_thinking {
@@ -413,9 +856,7 @@ fn apply_reasoning_options(
         return;
     }
 
-    let Some(effort) = body.pointer("/reasoning/effort").and_then(|v| v.as_str()) else {
-        return;
-    };
+    let effort = explicit_effort.unwrap_or("high");
     let Some(mapped) = map_reasoning_effort(effort, config.effort_value_mode.as_deref()) else {
         return;
     };
@@ -1793,6 +2234,93 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_to_responses_maps_messages_tools_and_limits() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {"role": "system", "content": "Be concise."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Weather?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "18C"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+            "max_tokens": 128,
+            "stream": true
+        });
+
+        let result = chat_completions_to_responses(input).unwrap();
+
+        assert_eq!(result["model"], "gpt-5.5");
+        assert_eq!(result["instructions"], "Be concise.");
+        assert_eq!(result["max_output_tokens"], 128);
+        assert_eq!(result["stream"], true);
+        assert_eq!(result["store"], false);
+        assert_eq!(result["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(result["input"][0]["role"], "user");
+        assert_eq!(result["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(result["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(result["input"][1]["type"], "function_call");
+        assert_eq!(result["input"][2]["type"], "function_call_output");
+        assert_eq!(result["tools"][0]["name"], "get_weather");
+        assert_eq!(result["tool_choice"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn responses_response_to_chat_maps_text_tools_and_usage() {
+        let input = json!({
+            "id": "resp_123",
+            "model": "gpt-5.5",
+            "status": "completed",
+            "error": null,
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"x\"}"
+                }
+            ],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15
+            }
+        });
+
+        let result = responses_to_chat_completion(input).unwrap();
+
+        assert_eq!(result["object"], "chat.completion");
+        assert_eq!(result["choices"][0]["message"]["content"], "Done");
+        assert_eq!(
+            result["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(result["usage"]["prompt_tokens"], 10);
+        assert_eq!(result["usage"]["completion_tokens"], 5);
+    }
+
+    #[test]
     fn responses_request_maps_input_file_content_parts() {
         let input = json!({
             "model": "gpt-5.4",
@@ -2106,6 +2634,7 @@ mod tests {
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("reasoning_effort".to_string()),
             effort_value_mode: Some("deepseek".to_string()),
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         };
 
@@ -2125,6 +2654,7 @@ mod tests {
             thinking_param: Some("none".to_string()),
             effort_param: Some("reasoning.effort".to_string()),
             effort_value_mode: Some("openrouter".to_string()),
+            default_enabled: None,
             output_format: Some("auto".to_string()),
         };
 
@@ -2166,6 +2696,7 @@ mod tests {
             thinking_param: Some("none".to_string()),
             effort_param: Some("reasoning.effort".to_string()),
             effort_value_mode: Some("openrouter".to_string()),
+            default_enabled: None,
             output_format: Some("auto".to_string()),
         };
 
@@ -2193,6 +2724,7 @@ mod tests {
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("reasoning_effort".to_string()),
             effort_value_mode: Some("deepseek".to_string()),
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         };
 
@@ -2222,6 +2754,7 @@ mod tests {
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         };
 
@@ -2244,12 +2777,57 @@ mod tests {
             thinking_param: Some("enable_thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         };
 
         let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
 
         assert_eq!(result["enable_thinking"], true);
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_defaults_reasoning_when_model_row_enables_thinking() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": "hello"
+        });
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("deepseek".to_string()),
+            default_enabled: Some(true),
+            output_format: Some("reasoning_content".to_string()),
+        };
+
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+
+        assert_eq!(result["thinking"]["type"], "enabled");
+        assert_eq!(result["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_to_chat_respects_disabled_default_reasoning() {
+        let input = json!({
+            "model": "deepseek-v4-pro",
+            "input": "hello"
+        });
+        let config = CodexChatReasoningConfig {
+            supports_thinking: Some(true),
+            supports_effort: Some(true),
+            thinking_param: Some("thinking".to_string()),
+            effort_param: Some("reasoning_effort".to_string()),
+            effort_value_mode: Some("deepseek".to_string()),
+            default_enabled: Some(false),
+            output_format: Some("reasoning_content".to_string()),
+        };
+
+        let result = responses_to_chat_completions_with_reasoning(input, Some(&config)).unwrap();
+
+        assert!(result.get("thinking").is_none());
         assert!(result.get("reasoning_effort").is_none());
     }
 

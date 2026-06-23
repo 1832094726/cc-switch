@@ -1,0 +1,5 @@
+[build]
+incremental = true
+
+[target.aarch64-apple-darwin]
+linker = "cc"

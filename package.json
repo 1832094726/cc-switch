@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "pnpm tauri dev",
+    "dev:fast": "TAURI_DEV_FAST=1 pnpm tauri dev",
     "build": "pnpm tauri build",
     "tauri": "tauri",
     "dev:renderer": "vite",

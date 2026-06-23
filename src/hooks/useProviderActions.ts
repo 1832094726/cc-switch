@@ -155,7 +155,7 @@ export function useProviderActions(
         activeApp === "claude" &&
         provider.meta?.providerType === "github_copilot";
       const isCodexChatFormat =
-        activeApp === "codex" &&
+        (activeApp === "codex" || activeApp === "devin") &&
         (provider.meta?.apiFormat === "openai_chat" ||
           (typeof (provider.settingsConfig as Record<string, any>)?.config ===
             "string" &&
@@ -199,7 +199,9 @@ export function useProviderActions(
           });
         } else if (
           provider.meta?.isFullUrl &&
-          (activeApp === "claude" || activeApp === "codex")
+          (activeApp === "claude" ||
+            activeApp === "codex" ||
+            activeApp === "devin")
         ) {
           proxyRequiredReason = t("notifications.proxyReasonFullUrl", {
             defaultValue: "开启了完整 URL 连接模式",

@@ -53,7 +53,7 @@ export function useBaseUrlState({
 
   // 从配置同步到 state（Codex）
   useEffect(() => {
-    if (appType !== "codex") return;
+    if (appType !== "codex" && appType !== "devin") return;
     // 只有 official 类别不显示 Base URL 输入框，其他类别都需要回填
     if (category === "official") return;
     if (isUpdatingRef.current) return;

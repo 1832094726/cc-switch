@@ -3,10 +3,11 @@ import type { AppId } from "@/lib/api";
 import type { CustomEndpoint } from "@/types";
 import type { ProviderPreset } from "@/config/claudeProviderPresets";
 import type { CodexProviderPreset } from "@/config/codexProviderPresets";
+import type { DevinProviderPreset } from "@/config/devinProviderPresets";
 
 type PresetEntry = {
   id: string;
-  preset: ProviderPreset | CodexProviderPreset;
+  preset: ProviderPreset | CodexProviderPreset | DevinProviderPreset;
 };
 
 interface UseCustomEndpointsProps {
@@ -58,7 +59,7 @@ export function useCustomEndpoints({
     }
 
     // 3. 当前 Base URL
-    if (appId === "codex") {
+    if (appId === "codex" || appId === "devin") {
       push(codexBaseUrl);
     } else {
       push(baseUrl);

@@ -19,6 +19,7 @@ import {
 } from "@/components/ui/select";
 import { useRequestLogs } from "@/lib/query/usage";
 import {
+  getEffectiveInputTokens,
   getFreshInputTokens,
   isUnpricedUsage,
   type LogFilters,
@@ -238,18 +239,34 @@ export function RequestLogTable({
                         <TableCell className="text-center px-1.5">
                           {(() => {
                             const freshInput = getFreshInputTokens(log);
+                            const effectiveInput = getEffectiveInputTokens(log);
+                            const hasCacheTokens =
+                              log.cacheReadTokens > 0 ||
+                              log.cacheCreationTokens > 0;
                             const isCacheInclusive =
                               log.inputTokens !== freshInput;
                             return (
                               <div
                                 className="tabular-nums"
                                 title={
-                                  isCacheInclusive
-                                    ? `Raw: ${log.inputTokens.toLocaleString()}`
+                                  hasCacheTokens || isCacheInclusive
+                                    ? [
+                                        `Fresh: ${freshInput.toLocaleString()}`,
+                                        `Context: ${effectiveInput.toLocaleString()}`,
+                                        isCacheInclusive &&
+                                          `Raw: ${log.inputTokens.toLocaleString()}`,
+                                      ]
+                                        .filter(Boolean)
+                                        .join(" · ")
                                     : undefined
                                 }
                               >
-                                {fmtInt(freshInput, locale)}
+                                {hasCacheTokens
+                                  ? `${fmtInt(freshInput, locale)} / ${fmtInt(
+                                      effectiveInput,
+                                      locale,
+                                    )}`
+                                  : fmtInt(freshInput, locale)}
                               </div>
                             );
                           })()}

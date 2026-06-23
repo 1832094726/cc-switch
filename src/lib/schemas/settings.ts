@@ -30,6 +30,7 @@ export const settingsSchema = z.object({
   currentProviderClaude: z.string().optional(),
   currentProviderClaudeDesktop: z.string().optional(),
   currentProviderCodex: z.string().optional(),
+  currentProviderDevin: z.string().optional(),
   currentProviderGemini: z.string().optional(),
 
   // Skill 同步设置

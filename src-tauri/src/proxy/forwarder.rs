@@ -7,12 +7,15 @@ use super::{
     body_filter::filter_private_params_with_whitelist,
     error::*,
     failover_switch::FailoverSwitchManager,
-    json_canonical::{canonicalize_value, short_value_hash},
+    json_canonical::{
+        canonical_json_string, canonicalize_value, short_sha256_hex, short_value_hash,
+    },
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{
         codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
-        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
+        AuthInfo, AuthStrategy, JoyCodeAnthropicAdapter, ProviderAdapter, ProviderType,
+        JOYCODE_VSCODE_CLIENT, JOYCODE_VSCODE_CLIENT_VERSION,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -25,10 +28,15 @@ use crate::commands::{CodexOAuthState, CopilotAuthState};
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use crate::{app_config::AppType, provider::Provider};
+use bytes::Bytes;
 use futures::StreamExt;
+use hmac::{Hmac, Mac};
 use http::Extensions;
+use regex::Regex;
 use serde_json::Value;
+use std::error::Error;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
@@ -43,6 +51,10 @@ pub struct ForwardResult {
     /// usage 归因不能依赖 ctx.request_model（映射前的客户端别名）：上游响应
     /// 缺失 model 或回显别名时，接管流量会被记成 claude-* 并按其定价计费。
     pub outbound_model: Option<String>,
+    /// 本次上游调用是否把本地 Responses 请求转换成 Chat Completions。
+    pub(crate) codex_responses_to_chat: bool,
+    /// 本次上游调用是否把本地 Chat Completions 请求转换成 Responses。
+    pub(crate) codex_chat_to_responses: bool,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -468,7 +480,13 @@ impl RequestForwarder {
                 )
                 .await
             {
-                Ok((response, claude_api_format, outbound_model)) => {
+                Ok((
+                    response,
+                    claude_api_format,
+                    outbound_model,
+                    codex_responses_to_chat,
+                    codex_chat_to_responses,
+                )) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
                     self.record_success_result(&provider.id, app_type_str, used_half_open_permit)
@@ -517,6 +535,8 @@ impl RequestForwarder {
                         provider: provider.clone(),
                         claude_api_format,
                         outbound_model,
+                        codex_responses_to_chat,
+                        codex_chat_to_responses,
                         connection_guard: None,
                     });
                 }
@@ -567,7 +587,13 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    codex_responses_to_chat,
+                                    codex_chat_to_responses,
+                                )) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
                                     );
@@ -620,6 +646,8 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        codex_responses_to_chat,
+                                        codex_chat_to_responses,
                                         connection_guard: None,
                                     });
                                 }
@@ -713,7 +741,13 @@ impl RequestForwarder {
                                     )
                                     .await
                                 {
-                                    Ok((response, claude_api_format, outbound_model)) => {
+                                    Ok((
+                                        response,
+                                        claude_api_format,
+                                        outbound_model,
+                                        codex_responses_to_chat,
+                                        codex_chat_to_responses,
+                                    )) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
                                             &provider.id,
@@ -769,6 +803,8 @@ impl RequestForwarder {
                                             provider: provider.clone(),
                                             claude_api_format,
                                             outbound_model,
+                                            codex_responses_to_chat,
+                                            codex_chat_to_responses,
                                             connection_guard: None,
                                         });
                                     }
@@ -879,7 +915,13 @@ impl RequestForwarder {
                                 )
                                 .await
                             {
-                                Ok((response, claude_api_format, outbound_model)) => {
+                                Ok((
+                                    response,
+                                    claude_api_format,
+                                    outbound_model,
+                                    codex_responses_to_chat,
+                                    codex_chat_to_responses,
+                                )) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
                                         &provider.id,
@@ -929,6 +971,8 @@ impl RequestForwarder {
                                         provider: provider.clone(),
                                         claude_api_format,
                                         outbound_model,
+                                        codex_responses_to_chat,
+                                        codex_chat_to_responses,
                                         connection_guard: None,
                                     });
                                 }
@@ -1087,8 +1131,8 @@ impl RequestForwarder {
 
     /// 转发单个请求（使用适配器）
     ///
-    /// 成功时返回 `(response, claude_api_format, outbound_model)`，其中
-    /// `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
+    /// 成功时返回 `(response, claude_api_format, outbound_model, codex_responses_to_chat, codex_chat_to_responses)`。
+    /// 其中 `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
@@ -1100,7 +1144,7 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>, bool, bool), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1141,6 +1185,28 @@ impl RequestForwarder {
         } else {
             mapped_body =
                 super::model_mapper::strip_one_m_suffix_for_upstream_from_body(mapped_body);
+        }
+
+        let model_catalog_route = if matches!(app_type, AppType::Devin) {
+            None
+        } else {
+            resolve_model_catalog_route(provider, &mapped_body)
+        };
+
+        if let Some(route) = model_catalog_route.as_ref() {
+            if let Some(route_base_url) = route.base_url.as_deref() {
+                base_url = route_base_url.to_string();
+            }
+            if let Some(upstream_model) = route.upstream_model.as_deref() {
+                mapped_body["model"] = Value::String(upstream_model.to_string());
+            }
+            log::debug!(
+                "[ModelCatalog] Route: requested={} upstream={} endpoint={} base_url={}",
+                route.requested_model.as_deref().unwrap_or("<none>"),
+                route.upstream_model.as_deref().unwrap_or("<same>"),
+                route.endpoint.as_deref().unwrap_or("<provider>"),
+                route.base_url.as_deref().unwrap_or("<provider>")
+            );
         }
 
         // --- Copilot 优化器：分类 + 请求体优化（在格式转换之前执行） ---
@@ -1275,10 +1341,17 @@ impl RequestForwarder {
             }
         }
         let resolved_claude_api_format = if adapter.name() == "Claude" {
-            Some(
-                self.resolve_claude_api_format(provider, &mapped_body, is_copilot)
-                    .await,
-            )
+            if let Some(api_format) = model_catalog_route
+                .as_ref()
+                .and_then(|route| route.api_format.clone())
+            {
+                Some(api_format)
+            } else {
+                Some(
+                    self.resolve_claude_api_format(provider, &mapped_body, is_copilot)
+                        .await,
+                )
+            }
         } else {
             None
         };
@@ -1292,14 +1365,119 @@ impl RequestForwarder {
                 self.apply_media_prevention(&mut mapped_body, provider);
             }
         }
+        let devin_route = if matches!(app_type, AppType::Devin) {
+            resolve_devin_model_route(provider, &mapped_body)
+        } else {
+            None
+        };
+
+        if let Some(route) = devin_route.as_ref() {
+            if let Some(route_base_url) = route.base_url.as_deref() {
+                base_url = route_base_url.to_string();
+            }
+            if let Some(upstream_model) = route.upstream_model.as_deref() {
+                mapped_body["model"] = Value::String(upstream_model.to_string());
+            }
+            log::debug!(
+                "[Devin] Model route: requested={} upstream={} endpoint={} route={}",
+                route.requested_model.as_deref().unwrap_or("<none>"),
+                route.upstream_model.as_deref().unwrap_or("<same>"),
+                route.endpoint,
+                route.name.as_deref().unwrap_or("default")
+            );
+        }
+
+        let devin_upstream_is_messages = devin_route
+            .as_ref()
+            .is_some_and(|route| is_messages_endpoint(&route.endpoint));
+        let devin_upstream_is_chat = devin_route
+            .as_ref()
+            .is_some_and(|route| is_chat_completions_endpoint(&route.endpoint));
+        let devin_upstream_is_responses = devin_route
+            .as_ref()
+            .is_some_and(|route| is_responses_endpoint(&route.endpoint));
+        let is_joycode_upstream = is_joycode_provider(provider, &base_url);
+        let is_joycode_anthropic_route = is_joycode_upstream
+            && (devin_upstream_is_messages
+                || model_catalog_route
+                    .as_ref()
+                    .and_then(|route| route.endpoint.as_deref())
+                    .is_some_and(is_messages_endpoint)
+                || (!matches!(app_type, AppType::Devin) && is_messages_endpoint(endpoint)));
+        let devin_responses_codex_compat = devin_route
+            .as_ref()
+            .is_some_and(|route| route.responses_codex_compat);
+        let devin_responses_fast_mode = devin_route
+            .as_ref()
+            .is_some_and(|route| route.responses_fast_mode);
+
         let needs_transform = match resolved_claude_api_format.as_deref() {
             Some(api_format) => super::providers::claude_api_format_needs_transform(api_format),
             None => adapter.needs_transform(provider),
         };
-        let codex_responses_to_chat = matches!(app_type, AppType::Codex)
-            && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
-        let (effective_endpoint, passthrough_query) = if codex_responses_to_chat {
+        let devin_local_is_messages =
+            matches!(app_type, AppType::Devin) && is_messages_endpoint(endpoint);
+        let devin_messages_to_chat =
+            devin_local_is_messages && devin_route.is_some() && devin_upstream_is_chat;
+        let devin_messages_to_responses =
+            devin_local_is_messages && devin_route.is_some() && devin_upstream_is_responses;
+        let devin_route_to_responses = matches!(app_type, AppType::Devin)
+            && devin_route.is_some()
+            && devin_upstream_is_responses
+            && !value_is_openai_responses_request(&mapped_body);
+        let codex_responses_to_chat = if matches!(app_type, AppType::Devin) && devin_route.is_some()
+        {
+            is_responses_endpoint(endpoint)
+                && (devin_upstream_is_chat || devin_upstream_is_messages)
+        } else if model_catalog_route.as_ref().is_some_and(|route| {
+            route
+                .endpoint
+                .as_deref()
+                .is_some_and(is_chat_completions_endpoint)
+        }) {
+            is_responses_endpoint(endpoint)
+        } else {
+            matches!(app_type, AppType::Codex | AppType::Devin)
+                && super::providers::should_convert_codex_responses_to_chat(provider, endpoint)
+        };
+        let codex_chat_to_responses = if matches!(app_type, AppType::Devin) && devin_route.is_some()
+        {
+            is_chat_completions_endpoint(endpoint) && devin_upstream_is_responses
+        } else if model_catalog_route
+            .as_ref()
+            .is_some_and(|route| route.endpoint.as_deref().is_some_and(is_responses_endpoint))
+        {
+            is_chat_completions_endpoint(endpoint)
+        } else {
+            matches!(app_type, AppType::Codex | AppType::Devin)
+                && super::providers::should_convert_codex_chat_to_responses(provider, endpoint)
+        };
+        let (effective_endpoint, passthrough_query) = if let Some(route) = devin_route.as_ref() {
+            (
+                replace_endpoint_path_preserve_query(endpoint, &route.endpoint),
+                split_endpoint_and_query(endpoint)
+                    .1
+                    .map(ToString::to_string),
+            )
+        } else if let Some(route) = model_catalog_route.as_ref().filter(|route| {
+            route
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| !endpoint.is_empty())
+        }) {
+            (
+                replace_endpoint_path_preserve_query(
+                    endpoint,
+                    route.endpoint.as_deref().unwrap_or(endpoint),
+                ),
+                split_endpoint_and_query(endpoint)
+                    .1
+                    .map(ToString::to_string),
+            )
+        } else if codex_responses_to_chat {
             rewrite_codex_responses_endpoint_to_chat(endpoint)
+        } else if codex_chat_to_responses {
+            rewrite_codex_chat_endpoint_to_responses(endpoint)
         } else if needs_transform && adapter.name() == "Claude" {
             let api_format = resolved_claude_api_format
                 .as_deref()
@@ -1320,7 +1498,13 @@ impl RequestForwarder {
                 .to_ascii_lowercase()
                 .ends_with("/chat/completions");
 
-        let url = if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
+        let url = if is_joycode_anthropic_route {
+            build_joycode_color_gateway_url("anthropic_completions")
+        } else if is_joycode_upstream && devin_upstream_is_responses {
+            build_joycode_color_gateway_url("responses_completions")
+        } else if is_joycode_upstream && devin_upstream_is_chat {
+            build_joycode_color_gateway_url("chat_completions")
+        } else if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
             super::gemini_url::resolve_gemini_native_url(
                 &base_url,
                 &effective_endpoint,
@@ -1341,8 +1525,70 @@ impl RequestForwarder {
             .filter(|m| !m.is_empty())
             .map(str::to_string);
 
+        if devin_route
+            .as_ref()
+            .is_some_and(|route| route.thinking_enabled == Some(false))
+        {
+            mapped_body = strip_devin_route_thinking(mapped_body);
+        }
+
         // 转换请求体（如果需要）
-        let mut request_body = if codex_responses_to_chat {
+        let mut request_body = if devin_upstream_is_messages {
+            let (anthropic_body, _) = prepare_devin_anthropic_body(
+                devin_request_to_anthropic_messages(mapped_body)?,
+                provider,
+                devin_route.as_ref(),
+            );
+            normalize_anthropic_temperature_for_thinking(anthropic_body)
+        } else if devin_messages_to_responses || devin_route_to_responses {
+            let (anthropic_body, cache_key) = prepare_devin_anthropic_body(
+                devin_request_to_anthropic_messages(mapped_body)?,
+                provider,
+                devin_route.as_ref(),
+            );
+            super::providers::transform_responses::anthropic_to_responses(
+                anthropic_body,
+                cache_key.as_deref(),
+                devin_responses_codex_compat,
+                devin_responses_fast_mode,
+            )?
+        } else if devin_messages_to_chat {
+            let (anthropic_body, _) = prepare_devin_anthropic_body(
+                devin_request_to_anthropic_messages(mapped_body)?,
+                provider,
+                devin_route.as_ref(),
+            );
+            let mut chat_body = super::providers::transform::anthropic_to_openai(anthropic_body)?;
+            super::providers::transform::inject_openai_stream_include_usage(&mut chat_body);
+            if !is_joycode_upstream {
+                inject_devin_chat_cache_key(&mut chat_body, provider, devin_route.as_ref());
+            }
+            chat_body
+        } else if matches!(app_type, AppType::Devin)
+            && codex_chat_to_responses
+            && devin_route.is_some()
+        {
+            let (anthropic_body, cache_key) = prepare_devin_anthropic_body(
+                devin_request_to_anthropic_messages(mapped_body)?,
+                provider,
+                devin_route.as_ref(),
+            );
+            super::providers::transform_responses::anthropic_to_responses(
+                anthropic_body,
+                cache_key.as_deref(),
+                devin_responses_codex_compat,
+                devin_responses_fast_mode,
+            )?
+        } else if matches!(app_type, AppType::Devin)
+            && devin_upstream_is_responses
+            && devin_responses_codex_compat
+            && is_responses_endpoint(endpoint)
+        {
+            let mut body =
+                apply_devin_codex_responses_compat(mapped_body, devin_responses_fast_mode);
+            inject_devin_responses_cache_key(&mut body, provider, devin_route.as_ref());
+            body
+        } else if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let restored = self
                 .codex_chat_history
@@ -1360,6 +1606,10 @@ impl RequestForwarder {
                 mapped_body,
                 reasoning_config.as_ref(),
             )?
+        } else if codex_chat_to_responses {
+            super::providers::transform_codex_chat::chat_completions_to_responses(mapped_body)?
+        } else if matches!(app_type, AppType::Devin) && value_is_openai_chat_request(&mapped_body) {
+            compact_devin_openai_chat_context(mapped_body)
         } else if needs_transform {
             if adapter.name() == "Claude" {
                 let api_format = resolved_claude_api_format
@@ -1380,13 +1630,18 @@ impl RequestForwarder {
             mapped_body
         };
 
-        if matches!(app_type, AppType::Codex) {
+        if matches!(app_type, AppType::Codex | AppType::Devin) {
             self.apply_media_prevention(&mut request_body, provider);
         }
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
-        let filtered_body = prepare_upstream_request_body(request_body);
+        let mut filtered_body = prepare_upstream_request_body(request_body);
+        let sensitive_rewrite_map = if matches!(app_type, AppType::Devin) {
+            super::sensitive_redaction::pseudonymize_sensitive_value(&mut filtered_body)
+        } else {
+            super::sensitive_redaction::SensitiveRewriteMap::default()
+        };
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
             .get("model")
@@ -1403,17 +1658,43 @@ impl RequestForwarder {
             &filtered_body,
             self.session_client_provided,
         );
+        if matches!(app_type, AppType::Devin) {
+            log_devin_chat_prefix_trace(provider, &effective_endpoint, &filtered_body);
+        }
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
-        let force_identity_encoding =
-            needs_transform || codex_responses_to_chat || request_is_streaming;
+        let force_identity_encoding = needs_transform
+            || devin_messages_to_chat
+            || devin_messages_to_responses
+            || codex_responses_to_chat
+            || codex_chat_to_responses
+            || is_joycode_upstream
+            || (request_is_streaming && !is_joycode_anthropic_route);
 
         // Codex OAuth 需要注入的 ChatGPT-Account-Id（在动态 token 获取期间填充）
         let mut codex_oauth_account_id: Option<String> = None;
         let mut should_send_codex_oauth_session_headers = false;
 
         // 获取认证头（提前准备，用于内联替换）
-        let mut auth_headers = if let Some(mut auth) = adapter.extract_auth(provider) {
+        let mut auth_headers = if is_joycode_anthropic_route {
+            Vec::new()
+        } else if let Some(route) = devin_route.as_ref().filter(|route| {
+            route
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|key| !key.is_empty())
+        }) {
+            devin_route_auth_headers(route)?
+        } else if let Some(route) = model_catalog_route.as_ref().filter(|route| {
+            route
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|key| !key.is_empty())
+        }) {
+            model_catalog_route_auth_headers(route)?
+        } else if let Some(mut auth) = adapter.extract_auth(provider) {
             // GitHub Copilot 特殊处理：从 CopilotAuthManager 获取真实 token
             if auth.strategy == AuthStrategy::GitHubCopilot {
                 if let Some(app_handle) = &self.app_handle {
@@ -1548,6 +1829,37 @@ impl RequestForwarder {
                 .as_ref()
                 .and_then(|meta| meta.custom_user_agent_header().ok().flatten())
         };
+        let devin_extra_headers = devin_route
+            .as_ref()
+            .map(|route| route.extra_headers.clone())
+            .unwrap_or_default();
+        if matches!(app_type, AppType::Devin) && !devin_extra_headers.is_empty() {
+            log::debug!(
+                "[Devin] Extra headers from route: {} headers",
+                devin_extra_headers.len()
+            );
+            for (name, value) in &devin_extra_headers {
+                log::debug!(
+                    "[Devin] Route header: {}: {}",
+                    name,
+                    redact_header_value_for_log(name, value)
+                );
+            }
+        }
+        let devin_default_user_agent =
+            if matches!(app_type, AppType::Devin) && devin_route.is_some() {
+                if is_joycode_anthropic_route {
+                    None
+                } else if devin_upstream_is_messages {
+                    Some(http::HeaderValue::from_static(
+                        "claude-cli/2.1.2 (external, cli)",
+                    ))
+                } else {
+                    Some(http::HeaderValue::from_static("codex_cli_rs/0.80.0"))
+                }
+            } else {
+                None
+            };
 
         // --- Copilot 优化器：动态 header 注入 ---
         if let Some((ref classification, ref det_request_id, ref interaction_id)) =
@@ -1614,28 +1926,127 @@ impl RequestForwarder {
             .ok()
             .and_then(|u| u.authority().map(|a| a.to_string()));
 
-        let should_send_anthropic_headers = adapter.name() == "Claude"
-            && matches!(resolved_claude_api_format.as_deref(), Some("anthropic"));
+        let should_send_anthropic_headers = !is_joycode_anthropic_route
+            && ((adapter.name() == "Claude"
+                && matches!(resolved_claude_api_format.as_deref(), Some("anthropic")))
+                || devin_upstream_is_messages);
+        let rebuild_json_headers_for_devin = matches!(app_type, AppType::Devin)
+            && devin_route.is_some()
+            && (devin_messages_to_chat
+                || devin_messages_to_responses
+                || devin_route_to_responses
+                || devin_upstream_is_responses
+                || devin_upstream_is_messages);
 
         // 预计算 anthropic-beta 值（仅 Claude）
         let anthropic_beta_value = if should_send_anthropic_headers {
             const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
-            Some(if let Some(beta) = headers.get("anthropic-beta") {
+            let mut beta_parts = vec![CLAUDE_CODE_BETA.to_string()];
+            if let Some(beta) = headers.get("anthropic-beta") {
                 if let Ok(beta_str) = beta.to_str() {
-                    if beta_str.contains(CLAUDE_CODE_BETA) {
-                        beta_str.to_string()
-                    } else {
-                        format!("{CLAUDE_CODE_BETA},{beta_str}")
-                    }
-                } else {
-                    CLAUDE_CODE_BETA.to_string()
+                    append_anthropic_beta_tokens(&mut beta_parts, beta_str);
                 }
-            } else {
-                CLAUDE_CODE_BETA.to_string()
-            })
+            }
+            for (_, value) in devin_extra_headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+            {
+                append_anthropic_beta_tokens(&mut beta_parts, value);
+            }
+            Some(beta_parts.join(","))
         } else {
             None
         };
+
+        // ============================================================
+        // JoyCode Anthropic 特殊处理：调用 prepare 获取 X-Model-Token
+        // ============================================================
+        let mut joycode_model_token: Option<String> = None;
+        let mut joycode_chat_id: Option<String> = None;
+        let joycode_provider_headers = if is_joycode_upstream {
+            collect_joycode_provider_headers(provider)
+        } else {
+            Vec::new()
+        };
+        let joycode_auth_params = if is_joycode_upstream {
+            let mut headers = joycode_provider_headers.clone();
+            headers.extend(devin_extra_headers.clone());
+            extract_joycode_auth_params(&headers)
+        } else {
+            None
+        };
+        if is_joycode_upstream {
+            let prepare_base_url = devin_route
+                .as_ref()
+                .and_then(|route| route.base_url.as_deref())
+                .unwrap_or(&base_url);
+            if is_joycode_anthropic_route {
+                log::debug!("[JoyCode] Detected Anthropic endpoint, calling prepare API");
+            } else {
+                log::debug!("[JoyCode] Detected JoyCode endpoint, calling prepare API");
+            }
+            log::debug!(
+                "[JoyCode] Available extra_headers count: {}",
+                devin_extra_headers.len()
+            );
+            for (k, v) in &devin_extra_headers {
+                log::debug!(
+                    "[JoyCode]   header: {} = {}",
+                    k,
+                    if k.eq_ignore_ascii_case("cookie")
+                        || k.eq_ignore_ascii_case("ptKey")
+                        || k.eq_ignore_ascii_case("ptkey")
+                        || k.eq_ignore_ascii_case("pt_key")
+                        || k.eq_ignore_ascii_case("x-pt-key")
+                    {
+                        format!("<redacted,len={}>", v.len())
+                    } else {
+                        v.clone()
+                    }
+                );
+            }
+
+            if let Some((pt_key, login_type, tenant)) = joycode_auth_params.as_ref() {
+                log::debug!(
+                    "[JoyCode] Extracted auth: pt_key=<redacted,len={}>, loginType={}, tenant={}",
+                    pt_key.len(),
+                    login_type,
+                    tenant
+                );
+
+                // 调用 JoyCode prepare API
+                let adapter = JoyCodeAnthropicAdapter::new();
+                let upstream_model = outbound_model
+                    .as_deref()
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or("Claude-Sonnet-4.6-hq");
+
+                match adapter
+                    .get_model_prepare(
+                        prepare_base_url,
+                        upstream_model,
+                        request_is_streaming,
+                        pt_key,
+                        login_type,
+                        tenant,
+                        "京东集团", // orgFullName
+                    )
+                    .await
+                {
+                    Ok(prepared) => {
+                        log::info!("[JoyCode] X-Model-Token obtained for {}", upstream_model);
+                        joycode_chat_id = Some(prepared.chat_id);
+                        joycode_model_token = Some(prepared.token);
+                    }
+                    Err(e) => {
+                        log::error!("[JoyCode] Failed to get model token: {}", e);
+                        return Err(e);
+                    }
+                }
+            } else {
+                log::warn!("[JoyCode] Missing ptKey for Anthropic prepare");
+            }
+        }
 
         // ============================================================
         // 构建有序 HeaderMap — 内联替换，保持客户端原始顺序
@@ -1657,6 +2068,24 @@ impl RequestForwarder {
                         ordered_headers.append(key.clone(), hv);
                     }
                 }
+                continue;
+            }
+
+            // Devin/Windsurf 本地入口的客户端头是 Connect-RPC/protobuf。
+            // 上游已经被转换成 JSON API，不能把原 content-type/content-encoding
+            // 或 connect/grpc 私有头继续带过去，否则 NewAPI 会按非 JSON 解析 body。
+            if rebuild_json_headers_for_devin && is_devin_connect_header_for_json_upstream(key_str)
+            {
+                continue;
+            }
+
+            // Match JoyCode's official VS Code extension for model calls.
+            // Extra Accept/User-Agent/tenant headers trigger the upgrade gate.
+            if is_joycode_upstream
+                && (key_str.eq_ignore_ascii_case("accept")
+                    || key_str.eq_ignore_ascii_case("user-agent")
+                    || key_str.eq_ignore_ascii_case("tenant"))
+            {
                 continue;
             }
 
@@ -1704,6 +2133,32 @@ impl RequestForwarder {
                     for (ah_name, ah_value) in &auth_headers {
                         ordered_headers.append(ah_name.clone(), ah_value.clone());
                     }
+
+                    // JoyCode Anthropic: 注入额外的认证头
+                    if let Some(ref token) = joycode_model_token {
+                        if let Ok(token_value) = http::HeaderValue::from_str(token) {
+                            ordered_headers.append(
+                                http::HeaderName::from_static("x-model-token"),
+                                token_value,
+                            );
+                        }
+
+                        // 注入 ptKey, loginType, tenant
+                        for (name, value) in &devin_extra_headers {
+                            if name.eq_ignore_ascii_case("ptKey")
+                                || name.eq_ignore_ascii_case("loginType")
+                                || name.eq_ignore_ascii_case("tenant")
+                            {
+                                if let Ok(hv) = http::HeaderValue::from_str(value) {
+                                    if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                                        ordered_headers.append(hn, hv);
+                                    }
+                                }
+                            }
+                        }
+
+                        log::debug!("[JoyCode] Injected X-Model-Token and auth headers");
+                    }
                 }
                 continue;
             }
@@ -1729,6 +2184,8 @@ impl RequestForwarder {
                 if !saw_user_agent {
                     saw_user_agent = true;
                     if let Some(ref ua) = custom_user_agent {
+                        ordered_headers.append(http::header::USER_AGENT, ua.clone());
+                    } else if let Some(ref ua) = devin_default_user_agent {
                         ordered_headers.append(http::header::USER_AGENT, ua.clone());
                     } else {
                         ordered_headers.append(key.clone(), value.clone());
@@ -1773,7 +2230,31 @@ impl RequestForwarder {
 
         // 如果原始请求中没有认证头，在末尾追加
         if !saw_auth && !auth_headers.is_empty() {
+            let app_type_str = match app_type {
+                AppType::Claude => "Claude",
+                AppType::ClaudeDesktop => "ClaudeDesktop",
+                AppType::Codex => "Codex",
+                AppType::Gemini => "Gemini",
+                AppType::OpenCode => "OpenCode",
+                AppType::OpenClaw => "OpenClaw",
+                AppType::Hermes => "Hermes",
+                AppType::Devin => "Devin",
+            };
+            log::debug!(
+                "[{}] Injecting {} auth headers",
+                app_type_str,
+                auth_headers.len()
+            );
             for (ah_name, ah_value) in &auth_headers {
+                log::debug!(
+                    "[{}] Auth header: {}: {}",
+                    app_type_str,
+                    ah_name,
+                    redact_header_value_for_log(
+                        ah_name.as_str(),
+                        ah_value.to_str().unwrap_or("<binary>")
+                    )
+                );
                 ordered_headers.append(ah_name.clone(), ah_value.clone());
             }
         }
@@ -1788,6 +2269,8 @@ impl RequestForwarder {
 
         if !saw_user_agent {
             if let Some(ref ua) = custom_user_agent {
+                ordered_headers.append(http::header::USER_AGENT, ua.clone());
+            } else if let Some(ref ua) = devin_default_user_agent {
                 ordered_headers.append(http::header::USER_AGENT, ua.clone());
             }
         }
@@ -1809,6 +2292,87 @@ impl RequestForwarder {
             );
         }
 
+        // JoyCode Anthropic: 注入 X-Model-Token 和认证头
+        if let Some(ref token) = joycode_model_token {
+            log::debug!("[JoyCode] Injecting headers, token length: {}", token.len());
+
+            // X-Model-Token
+            if let Ok(token_value) = http::HeaderValue::from_str(token) {
+                ordered_headers.insert(http::HeaderName::from_static("x-model-token"), token_value);
+                log::debug!("[JoyCode] Injected x-model-token");
+            }
+            if !ordered_headers.contains_key("x-ms-client-request-id") {
+                let request_id = uuid::Uuid::new_v4().to_string();
+                if let Ok(value) = http::HeaderValue::from_str(&request_id) {
+                    ordered_headers.insert(
+                        http::HeaderName::from_static("x-ms-client-request-id"),
+                        value,
+                    );
+                }
+            }
+
+            // 注入 ptKey, loginType, tenant（使用保存的认证参数）
+            let injected_count =
+                append_joycode_auth_headers(&mut ordered_headers, joycode_auth_params.as_ref());
+            if is_joycode_upstream {
+                ordered_headers.remove("tenant");
+            }
+
+            log::info!(
+                "[JoyCode] Injected {} auth headers (x-model-token + {} from auth_params)",
+                1 + injected_count,
+                injected_count
+            );
+        } else if is_joycode_upstream {
+            let injected_count =
+                append_joycode_auth_headers(&mut ordered_headers, joycode_auth_params.as_ref());
+            ordered_headers.remove("tenant");
+            if injected_count > 0 {
+                log::info!(
+                    "[JoyCode] Injected {} auth headers for OpenAI-compatible route",
+                    injected_count
+                );
+            }
+        }
+
+        if is_joycode_anthropic_route {
+            if let Some(chat_id) = joycode_chat_id.as_deref() {
+                if let Some(object) = filtered_body.as_object_mut() {
+                    object.insert(
+                        "chatId".to_string(),
+                        serde_json::Value::String(chat_id.to_string()),
+                    );
+                    object.insert(
+                        "tenant".to_string(),
+                        serde_json::Value::String(
+                            joycode_auth_params
+                                .as_ref()
+                                .map(|(_, _, tenant)| tenant.clone())
+                                .unwrap_or_else(|| "JD".to_string()),
+                        ),
+                    );
+                    object
+                        .entry("orgFullName".to_string())
+                        .or_insert_with(|| serde_json::Value::String("京东集团".to_string()));
+                    object
+                        .entry("userId".to_string())
+                        .or_insert_with(|| serde_json::Value::String(String::new()));
+                    object.insert(
+                        "client".to_string(),
+                        serde_json::Value::String(JOYCODE_VSCODE_CLIENT.to_string()),
+                    );
+                    object.insert(
+                        "clientVersion".to_string(),
+                        serde_json::Value::String(JOYCODE_VSCODE_CLIENT_VERSION.to_string()),
+                    );
+                    object
+                        .entry("language".to_string())
+                        .or_insert_with(|| serde_json::Value::String("UNKNOWN".to_string()));
+                    log::debug!("[JoyCode] Injected chatId into request body");
+                }
+            }
+        }
+
         // Codex OAuth 反代尽量对齐官方 Codex CLI 的会话路由信号。
         // 只发送客户端提供的 session_id；生成的 UUID 每次不同，反而会破坏前缀缓存。
         for (name, value) in codex_oauth_session_headers {
@@ -1825,12 +2389,41 @@ impl RequestForwarder {
             })?
         };
 
-        // 确保 content-type 存在
-        if !ordered_headers.contains_key(http::header::CONTENT_TYPE) {
+        if rebuild_json_headers_for_devin {
+            ordered_headers.insert(
+                http::header::CONTENT_TYPE,
+                if is_joycode_upstream {
+                    http::HeaderValue::from_static("application/json; charset=UTF-8")
+                } else {
+                    http::HeaderValue::from_static("application/json")
+                },
+            );
+            if !is_joycode_upstream {
+                ordered_headers.insert(
+                    http::header::ACCEPT,
+                    http::HeaderValue::from_static("text/event-stream"),
+                );
+            }
+        } else if !ordered_headers.contains_key(http::header::CONTENT_TYPE) {
             ordered_headers.insert(
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("application/json"),
             );
+        }
+
+        for (name, value) in &devin_extra_headers {
+            if is_joycode_anthropic_route || name.eq_ignore_ascii_case("anthropic-beta") {
+                continue;
+            }
+            let Ok(header_name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+                log::warn!("[Devin] Ignoring invalid route header name: {name}");
+                continue;
+            };
+            let Ok(header_value) = http::HeaderValue::from_str(value) else {
+                log::warn!("[Devin] Ignoring invalid route header value for: {name}");
+                continue;
+            };
+            ordered_headers.insert(header_name, header_value);
         }
 
         reject_proxy_placeholder_for_managed_account_upstream(&url, &ordered_headers)?;
@@ -1882,7 +2475,37 @@ impl RequestForwarder {
             log::debug!(
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
-            let client = super::http_client::get();
+
+            // 调试：打印最终要发送的所有头
+            if matches!(app_type, AppType::Devin) && log::log_enabled!(log::Level::Debug) {
+                log::debug!(
+                    "[Devin] Final headers to send ({} total):",
+                    ordered_headers.len()
+                );
+                for (key, value) in &ordered_headers {
+                    log::debug!(
+                        "[Devin]   {}: {}",
+                        key,
+                        redact_header_value_for_log(
+                            key.as_str(),
+                            value.to_str().unwrap_or("<binary>")
+                        )
+                    );
+                }
+            }
+
+            let use_direct_client =
+                should_use_direct_http_client_for_upstream(provider, devin_route.as_ref());
+            let client = if use_direct_client {
+                log::debug!(
+                    "[Forwarder] Using direct HTTP client for upstream request (bypass system proxy): provider={}, url={}",
+                    provider.name,
+                    url
+                );
+                super::http_client::get_direct()
+            } else {
+                super::http_client::get()
+            };
             let mut request = client.request(method.clone(), &url);
             if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor
@@ -1894,6 +2517,7 @@ impl RequestForwarder {
             for (key, value) in &ordered_headers {
                 request = request.header(key, value);
             }
+            let outbound_body_len = body_bytes.len();
             let send = request.body(body_bytes).send();
             let send_result = if request_is_streaming {
                 let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
@@ -1912,7 +2536,16 @@ impl RequestForwarder {
             } else {
                 send.await
             };
-            let reqwest_resp = send_result.map_err(map_reqwest_send_error)?;
+            let reqwest_resp = send_result.map_err(|error| {
+                log_reqwest_send_error(
+                    &error,
+                    app_type.as_str(),
+                    &provider.name,
+                    &url,
+                    outbound_body_len,
+                );
+                map_reqwest_send_error(error)
+            })?;
             ProxyResponse::Reqwest(reqwest_resp)
         } else {
             // HTTP 代理或直连：走 hyper raw write（保持 header 大小写）
@@ -1936,10 +2569,21 @@ impl RequestForwarder {
         let status = response.status();
 
         if status.is_success() {
-            let response = self
+            let mut response = self
                 .prepare_success_response_for_failover(response, request_is_streaming)
                 .await?;
-            Ok((response, resolved_claude_api_format, outbound_model))
+            if !sensitive_rewrite_map.is_empty() {
+                response =
+                    restore_sensitive_pseudonyms_in_response(response, sensitive_rewrite_map)
+                        .await?;
+            }
+            Ok((
+                response,
+                resolved_claude_api_format,
+                outbound_model,
+                codex_responses_to_chat,
+                codex_chat_to_responses,
+            ))
         } else {
             let status_code = status.as_u16();
             let body_text = String::from_utf8(response.bytes().await?.to_vec()).ok();
@@ -2281,6 +2925,1926 @@ fn extract_json_error_message(body: &Value) -> Option<String> {
         .find_map(|value| value.as_str().map(ToString::to_string))
 }
 
+#[derive(Debug, Clone)]
+struct ModelCatalogRoute {
+    requested_model: Option<String>,
+    upstream_model: Option<String>,
+    endpoint: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    auth_header: Option<String>,
+    api_format: Option<String>,
+}
+
+fn resolve_model_catalog_route(provider: &Provider, body: &Value) -> Option<ModelCatalogRoute> {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)?;
+    let requested_key = canonical_devin_model_key(&requested_model);
+    let models = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)?;
+    let model_entry = find_devin_model_entry(models, &requested_model, &requested_key)?;
+    let route = select_devin_route(model_entry);
+    let endpoint = route
+        .as_ref()
+        .and_then(|route| string_field(route, &["endpoint", "path"]))
+        .or_else(|| string_field(model_entry, &["endpoint", "path"]))
+        .or_else(|| {
+            route
+                .as_ref()
+                .and_then(|route| {
+                    string_field(route, &["apiFormat", "api_format", "wireApi", "wire_api"])
+                })
+                .or_else(|| {
+                    string_field(
+                        model_entry,
+                        &["apiFormat", "api_format", "wireApi", "wire_api"],
+                    )
+                })
+                .and_then(|format| endpoint_from_devin_format(&format))
+        })
+        .map(|endpoint| normalize_devin_endpoint(&endpoint));
+    let api_format = route
+        .as_ref()
+        .and_then(|route| string_field(route, &["apiFormat", "api_format", "wireApi", "wire_api"]))
+        .or_else(|| {
+            string_field(
+                model_entry,
+                &["apiFormat", "api_format", "wireApi", "wire_api"],
+            )
+        })
+        .or_else(|| {
+            endpoint
+                .as_deref()
+                .and_then(model_catalog_api_format_from_endpoint)
+        });
+    let base_url = route
+        .as_ref()
+        .and_then(|route| string_field(route, &["baseUrl", "base_url", "host", "url"]))
+        .or_else(|| string_field(model_entry, &["baseUrl", "base_url", "host", "url"]))
+        .map(|url| normalize_model_catalog_base_url(&url));
+    let api_key = route
+        .as_ref()
+        .and_then(|route| string_field(route, &["apiKey", "api_key", "key"]))
+        .or_else(|| string_field(model_entry, &["apiKey", "api_key", "key"]));
+    let upstream_model = string_field(model_entry, &["upstreamModel", "upstream_model"])
+        .or_else(|| string_field(model_entry, &["model"]));
+
+    if base_url.is_none() && api_key.is_none() && endpoint.is_none() && upstream_model.is_none() {
+        return None;
+    }
+
+    Some(ModelCatalogRoute {
+        requested_model: Some(requested_model),
+        upstream_model,
+        endpoint,
+        base_url,
+        api_key,
+        auth_header: route
+            .as_ref()
+            .and_then(|route| string_field(route, &["authHeader", "auth_header"]))
+            .or_else(|| string_field(model_entry, &["authHeader", "auth_header"])),
+        api_format,
+    })
+}
+
+fn model_catalog_api_format_from_endpoint(endpoint: &str) -> Option<String> {
+    if is_chat_completions_endpoint(endpoint) {
+        Some("openai_chat".to_string())
+    } else if is_responses_endpoint(endpoint) {
+        Some("openai_responses".to_string())
+    } else if is_messages_endpoint(endpoint) {
+        Some("anthropic".to_string())
+    } else {
+        None
+    }
+}
+
+fn normalize_model_catalog_base_url(url: &str) -> String {
+    url.trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string()
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DevinResolvedRoute {
+    pub(crate) requested_model: Option<String>,
+    pub(crate) upstream_model: Option<String>,
+    pub(crate) endpoint: String,
+    pub(crate) name: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) auth_header: Option<String>,
+    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) responses_codex_compat: bool,
+    pub(crate) responses_fast_mode: bool,
+    pub(crate) thinking_enabled: Option<bool>,
+}
+
+pub(crate) fn resolve_devin_model_route(
+    provider: &Provider,
+    body: &Value,
+) -> Option<DevinResolvedRoute> {
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| super::providers::codex_provider_upstream_model(provider));
+
+    let models = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(Value::as_array)?;
+
+    let requested_key = requested_model
+        .as_deref()
+        .map(canonical_devin_model_key)
+        .unwrap_or_default();
+
+    let exact_model_entry = requested_model
+        .as_ref()
+        .and_then(|model| find_devin_model_entry(models, model, &requested_key));
+    let model_entry = exact_model_entry
+        .or_else(|| {
+            requested_model
+                .as_deref()
+                .filter(|model| !is_devin_primary_model_alias(model))
+                .and_then(|_| find_devin_small_model_entry(models))
+        })
+        .or_else(|| find_devin_fallback_model_entry(models, provider))
+        .or_else(|| models.first())?;
+
+    let endpoint = resolve_devin_model_endpoint(model_entry, provider)?;
+    let upstream_model = devin_upstream_model(model_entry, provider);
+    let route = select_devin_route(model_entry);
+    let mut extra_headers =
+        header_fields(model_entry, &["headers", "extraHeaders", "extra_headers"]);
+    if let Some(route) = route.as_ref() {
+        merge_header_fields(
+            &mut extra_headers,
+            header_fields(route, &["headers", "extraHeaders", "extra_headers"]),
+        );
+    }
+    let responses_codex_compat =
+        resolve_devin_responses_codex_compat(model_entry, route.as_ref(), provider);
+    let responses_fast_mode =
+        resolve_devin_responses_fast_mode(model_entry, route.as_ref(), provider);
+    let thinking_enabled = resolve_devin_thinking_enabled(model_entry, route.as_ref(), provider);
+
+    let base_url_raw = route
+        .as_ref()
+        .and_then(|route| string_field(route, &["baseUrl", "base_url", "host", "url"]))
+        .or_else(|| string_field(model_entry, &["baseUrl", "base_url", "host", "url"]));
+
+    let base_url = base_url_raw.map(|url| {
+        let trimmed = url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
+        log::debug!("[Devin] baseUrl: raw='{}' → trimmed='{}'", url, trimmed);
+        trimmed
+    });
+
+    Some(DevinResolvedRoute {
+        requested_model,
+        upstream_model,
+        endpoint,
+        name: route
+            .as_ref()
+            .and_then(|route| string_field(route, &["name"]))
+            .or_else(|| string_field(model_entry, &["routeName", "route_name"])),
+        base_url,
+        api_key: route
+            .as_ref()
+            .and_then(|route| string_field(route, &["apiKey", "api_key", "key"]))
+            .or_else(|| string_field(model_entry, &["apiKey", "api_key", "key"])),
+        auth_header: route
+            .as_ref()
+            .and_then(|route| string_field(route, &["authHeader", "auth_header"]))
+            .or_else(|| string_field(model_entry, &["authHeader", "auth_header"])),
+        extra_headers,
+        responses_codex_compat,
+        responses_fast_mode,
+        thinking_enabled,
+    })
+}
+
+fn find_devin_model_entry<'a>(
+    models: &'a [Value],
+    requested_model: &str,
+    requested_key: &str,
+) -> Option<&'a Value> {
+    let requested_exact_key = normalize_devin_model_key(requested_model);
+    let exact = models.iter().find(|entry| {
+        entry
+            .get("model")
+            .and_then(Value::as_str)
+            .map(normalize_devin_model_key)
+            .is_some_and(|model| model == requested_exact_key)
+    });
+    if exact.is_some() {
+        return exact;
+    }
+
+    models.iter().find(|entry| {
+        [
+            "model",
+            "upstreamModel",
+            "upstream_model",
+            "displayName",
+            "display_name",
+            "name",
+        ]
+        .iter()
+        .any(|key| {
+            entry
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(canonical_devin_model_key)
+                .is_some_and(|key| key == requested_key)
+        })
+    })
+}
+
+fn find_devin_small_model_entry(models: &[Value]) -> Option<&Value> {
+    models.iter().find(|entry| {
+        entry
+            .get("routes")
+            .and_then(Value::as_array)
+            .is_some_and(|routes| {
+                routes.iter().any(|route| {
+                    string_field(route, &["name"]).as_deref() == Some("devin-small-model")
+                })
+            })
+    })
+}
+
+fn is_devin_primary_model_alias(model: &str) -> bool {
+    matches!(
+        normalize_devin_model_key(model).as_str(),
+        "swe_1_6_slow"
+            | "claude_sonnet_4_thinking_byok"
+            | "claude_sonnet_4_byok"
+            | "claude_opus_4_thinking_byok"
+            | "claude_opus_4_byok"
+            | "model_claude_4_sonnet_thinking_byok"
+            | "model_claude_4_sonnet_byok"
+            | "model_claude_4_opus_thinking_byok"
+            | "model_claude_4_opus_byok"
+    )
+}
+
+fn find_devin_fallback_model_entry<'a>(
+    models: &'a [Value],
+    provider: &Provider,
+) -> Option<&'a Value> {
+    if is_picpi_devin_catalog(models, provider) {
+        if let Some(entry) = models.iter().find(|entry| {
+            resolve_devin_model_endpoint(entry, provider)
+                .as_deref()
+                .is_some_and(is_responses_endpoint)
+                && devin_upstream_model(entry, provider).is_some()
+        }) {
+            return Some(entry);
+        }
+    }
+
+    models
+        .iter()
+        .find(|entry| devin_upstream_model(entry, provider).is_some())
+}
+
+fn is_picpi_devin_catalog(models: &[Value], provider: &Provider) -> bool {
+    string_field(
+        &provider.settings_config,
+        &["baseUrl", "base_url", "host", "url"],
+    )
+    .is_some_and(|url| is_picpi_devin_upstream(&url))
+        || models.iter().any(|entry| {
+            string_field(entry, &["baseUrl", "base_url", "host", "url"])
+                .is_some_and(|url| is_picpi_devin_upstream(&url))
+                || select_devin_route(entry).is_some_and(|route| {
+                    string_field(&route, &["baseUrl", "base_url", "host", "url"])
+                        .is_some_and(|url| is_picpi_devin_upstream(&url))
+                })
+        })
+}
+
+fn devin_upstream_model(model_entry: &Value, provider: &Provider) -> Option<String> {
+    let model = string_field(model_entry, &["model"]);
+    string_field(model_entry, &["upstreamModel", "upstream_model"])
+        .or_else(|| {
+            model
+                .as_deref()
+                .filter(|model| is_devin_windsurf_model_alias(model))
+                .and_then(|_| super::providers::codex_provider_upstream_model(provider))
+        })
+        .or(model)
+        .or_else(|| super::providers::codex_provider_upstream_model(provider))
+}
+
+fn resolve_devin_model_endpoint(model_entry: &Value, provider: &Provider) -> Option<String> {
+    string_field(model_entry, &["endpoint", "path"])
+        .or_else(|| {
+            string_field(
+                model_entry,
+                &["apiFormat", "api_format", "wireApi", "wire_api"],
+            )
+            .and_then(|format| endpoint_from_devin_format(&format))
+        })
+        .or_else(|| {
+            provider
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.api_format.as_deref())
+                .and_then(endpoint_from_devin_format)
+        })
+        .or_else(|| {
+            string_field(
+                &provider.settings_config,
+                &["apiFormat", "api_format", "wireApi", "wire_api"],
+            )
+            .and_then(|format| endpoint_from_devin_format(&format))
+        })
+        .map(|endpoint| normalize_devin_endpoint(&endpoint))
+}
+
+fn endpoint_from_devin_format(format: &str) -> Option<String> {
+    match normalize_devin_model_key(format).as_str() {
+        "anthropic" | "anthropic_messages" | "messages" | "claude" => {
+            Some("/v1/messages".to_string())
+        }
+        "openai_chat" | "chat" | "chat_completions" => Some("/v1/chat/completions".to_string()),
+        "openai_responses" | "responses" => Some("/v1/responses".to_string()),
+        _ => None,
+    }
+}
+
+fn normalize_devin_endpoint(endpoint: &str) -> String {
+    let raw = endpoint.trim();
+    let with_slash = if raw.starts_with('/') {
+        raw.to_string()
+    } else {
+        format!("/{raw}")
+    };
+
+    match with_slash.as_str() {
+        "/messages" => "/v1/messages".to_string(),
+        "/responses" => "/v1/responses".to_string(),
+        "/responses/compact" => "/v1/responses/compact".to_string(),
+        "/chat/completions" => "/v1/chat/completions".to_string(),
+        _ => with_slash,
+    }
+}
+
+fn select_devin_route(model_entry: &Value) -> Option<Value> {
+    let mut routes: Vec<Value> = model_entry
+        .get("routes")
+        .and_then(Value::as_array)
+        .map(|routes| {
+            routes
+                .iter()
+                .filter(|route| {
+                    route
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    routes.sort_by(|a, b| {
+        let priority_a = a.get("priority").and_then(Value::as_i64).unwrap_or(100);
+        let priority_b = b.get("priority").and_then(Value::as_i64).unwrap_or(100);
+        priority_a
+            .cmp(&priority_b)
+            .then_with(|| string_field(a, &["name"]).cmp(&string_field(b, &["name"])))
+    });
+
+    routes.into_iter().next()
+}
+
+fn resolve_devin_responses_codex_compat(
+    model_entry: &Value,
+    route: Option<&Value>,
+    provider: &Provider,
+) -> bool {
+    bool_field(
+        route.unwrap_or(&Value::Null),
+        &[
+            "responsesCodexCompat",
+            "responses_codex_compat",
+            "codexCompat",
+            "codex_compat",
+        ],
+    )
+    .or_else(|| {
+        bool_field(
+            model_entry,
+            &[
+                "responsesCodexCompat",
+                "responses_codex_compat",
+                "codexCompat",
+                "codex_compat",
+            ],
+        )
+    })
+    .or_else(|| {
+        bool_field(
+            &provider.settings_config,
+            &[
+                "responsesCodexCompat",
+                "responses_codex_compat",
+                "codexCompat",
+                "codex_compat",
+            ],
+        )
+    })
+    .unwrap_or_else(|| {
+        let explicit_mode = string_field(
+            route.unwrap_or(&Value::Null),
+            &["responsesMode", "responses_mode"],
+        )
+        .or_else(|| string_field(model_entry, &["responsesMode", "responses_mode"]))
+        .or_else(|| {
+            string_field(
+                &provider.settings_config,
+                &["responsesMode", "responses_mode"],
+            )
+        });
+
+        if explicit_mode.is_some_and(|mode| {
+            matches!(
+                normalize_devin_model_key(&mode).as_str(),
+                "codex" | "codex_compat" | "codex_compatible"
+            )
+        }) {
+            return true;
+        }
+
+        let base_url = route
+            .and_then(|route| string_field(route, &["baseUrl", "base_url", "host", "url"]))
+            .or_else(|| string_field(model_entry, &["baseUrl", "base_url", "host", "url"]))
+            .or_else(|| {
+                string_field(
+                    &provider.settings_config,
+                    &["baseUrl", "base_url", "host", "url"],
+                )
+            });
+
+        base_url.is_some_and(|url| is_picpi_devin_upstream(&url))
+    })
+}
+
+fn is_picpi_devin_upstream(url: &str) -> bool {
+    url.to_ascii_lowercase().contains("picpi.top")
+}
+
+fn should_use_direct_http_client_for_upstream(
+    provider: &Provider,
+    devin_route: Option<&DevinResolvedRoute>,
+) -> bool {
+    let route_base_url = devin_route.and_then(|route| route.base_url.as_deref());
+    let route_name = devin_route.and_then(|route| route.name.as_deref());
+
+    bool_field(
+        &provider.settings_config,
+        &[
+            "useDirectClient",
+            "use_direct_client",
+            "bypassSystemProxy",
+            "bypass_system_proxy",
+            "noProxy",
+            "no_proxy",
+        ],
+    )
+    .unwrap_or(false)
+        || route_base_url.is_some_and(|base| {
+            let lower = base.to_ascii_lowercase();
+            lower.contains("joycode-api") || lower.contains("picpi.top")
+        })
+        || route_name.is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.contains("joycode") || lower.contains("pipi") || lower.contains("picpi")
+        })
+        || {
+            let lower = provider.name.to_ascii_lowercase();
+            lower.contains("pipi") || lower.contains("picpi")
+        }
+}
+
+fn resolve_devin_responses_fast_mode(
+    model_entry: &Value,
+    route: Option<&Value>,
+    provider: &Provider,
+) -> bool {
+    bool_field(
+        route.unwrap_or(&Value::Null),
+        &[
+            "responsesFastMode",
+            "responses_fast_mode",
+            "codexFastMode",
+            "codex_fast_mode",
+        ],
+    )
+    .or_else(|| {
+        bool_field(
+            model_entry,
+            &[
+                "responsesFastMode",
+                "responses_fast_mode",
+                "codexFastMode",
+                "codex_fast_mode",
+            ],
+        )
+    })
+    .or_else(|| {
+        bool_field(
+            &provider.settings_config,
+            &[
+                "responsesFastMode",
+                "responses_fast_mode",
+                "codexFastMode",
+                "codex_fast_mode",
+            ],
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn resolve_devin_thinking_enabled(
+    model_entry: &Value,
+    route: Option<&Value>,
+    provider: &Provider,
+) -> Option<bool> {
+    bool_field(
+        route.unwrap_or(&Value::Null),
+        &[
+            "thinkingEnabled",
+            "thinking_enabled",
+            "enableThinking",
+            "enable_thinking",
+        ],
+    )
+    .or_else(|| {
+        bool_field(
+            model_entry,
+            &[
+                "thinkingEnabled",
+                "thinking_enabled",
+                "enableThinking",
+                "enable_thinking",
+            ],
+        )
+    })
+    .or_else(|| {
+        bool_field(
+            &provider.settings_config,
+            &[
+                "thinkingEnabled",
+                "thinking_enabled",
+                "enableThinking",
+                "enable_thinking",
+            ],
+        )
+    })
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| {
+            value.as_bool().or_else(|| {
+                value.as_str().map(str::trim).map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "true" | "1" | "yes" | "on"
+                    )
+                })
+            })
+        })
+    })
+}
+
+fn header_fields(value: &Value, keys: &[&str]) -> Vec<(String, String)> {
+    let Some(headers) = keys
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_object))
+    else {
+        return Vec::new();
+    };
+
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let value = value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_bool().map(|value| value.to_string()))
+                .or_else(|| value.as_i64().map(|value| value.to_string()))
+                .or_else(|| value.as_u64().map(|value| value.to_string()))
+                .or_else(|| value.as_f64().map(|value| value.to_string()))?;
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), value))
+        })
+        .collect()
+}
+
+fn merge_header_fields(base: &mut Vec<(String, String)>, patch: Vec<(String, String)>) {
+    for (name, value) in patch {
+        if let Some(existing) = base
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
+        {
+            existing.1 = value;
+        } else {
+            base.push((name, value));
+        }
+    }
+}
+
+fn normalize_devin_model_key(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_sep = false;
+
+    for ch in value.trim().chars().flat_map(char::to_lowercase) {
+        if ch == '-' || ch == '_' || ch == '.' || ch.is_whitespace() {
+            if !last_was_sep && !normalized.is_empty() {
+                normalized.push('_');
+                last_was_sep = true;
+            }
+        } else {
+            normalized.push(ch);
+            last_was_sep = false;
+        }
+    }
+
+    normalized.trim_matches('_').to_string()
+}
+
+fn canonical_devin_model_key(value: &str) -> String {
+    let key = normalize_devin_model_key(value);
+    match key.as_str() {
+        "model_claude_4_sonnet_byok" | "claude_sonnet_4_byok" => "claude_sonnet_4_byok".to_string(),
+        "model_claude_4_sonnet_thinking_byok"
+        | "claude_sonnet_4_thinking_byok"
+        | "claude_sonnet_4_thinking" => "claude_sonnet_4_thinking_byok".to_string(),
+        "model_claude_4_opus_byok" | "claude_opus_4_byok" => "claude_opus_4_byok".to_string(),
+        "model_claude_4_opus_thinking_byok" | "claude_opus_4_thinking_byok" => {
+            "claude_opus_4_thinking_byok".to_string()
+        }
+        "model_claude_haiku_4_5_byok" | "claude_haiku_4_5_byok" => {
+            "claude_haiku_4_5_byok".to_string()
+        }
+        "model_claude_haiku_4_5" | "claude_haiku_4_5" => "claude_haiku_4_5".to_string(),
+        "model_gpt_4o" | "gpt_4o" => "gpt_4o".to_string(),
+        "model_gpt_4o_mini" | "gpt_4o_mini" => "gpt_4o_mini".to_string(),
+        "model_gpt_5_nano" | "gpt_5_nano" => "gpt_5_nano".to_string(),
+        "model_google_gemini_2_5_flash" | "google_gemini_2_5_flash" | "gemini_2_5_flash" => {
+            "model_google_gemini_2_5_flash".to_string()
+        }
+        _ => key,
+    }
+}
+
+fn is_devin_windsurf_model_alias(value: &str) -> bool {
+    matches!(
+        canonical_devin_model_key(value).as_str(),
+        "claude_sonnet_4_byok"
+            | "claude_sonnet_4_thinking_byok"
+            | "claude_opus_4_byok"
+            | "claude_opus_4_thinking_byok"
+            | "claude_haiku_4_5"
+            | "claude_haiku_4_5_byok"
+            | "model_swe_1_5"
+            | "model_swe_1_5_slow"
+            | "model_chat_11121"
+            | "claude_sonnet_4_6_thinking"
+            | "claude_opus_4_6_thinking"
+            | "model_google_gemini_2_5_flash"
+            | "model_google_gemini_2_5_pro"
+            | "gpt_5_nano"
+            | "model_private_11"
+            | "gpt_4o"
+            | "gpt_4o_mini"
+            | "gpt_5_4_low"
+            | "gpt_5_4_high"
+            | "gpt_5_4_xhigh"
+            | "gpt_5_4_xhigh_priority"
+            | "swe_1_6_slow"
+            | "swe_1_6_fast"
+    )
+}
+
+fn devin_route_auth_headers(
+    route: &DevinResolvedRoute,
+) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, ProxyError> {
+    let api_key = route
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| ProxyError::AuthError("Devin route API key is empty".to_string()))?;
+
+    let auth_header = route
+        .auth_header
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if is_messages_endpoint(&route.endpoint) {
+                "x-api-key".to_string()
+            } else {
+                "bearer".to_string()
+            }
+        });
+
+    if matches!(
+        auth_header.as_str(),
+        "x-api-key" | "x_api_key" | "anthropic"
+    ) {
+        let value = http::HeaderValue::from_str(api_key)
+            .map_err(|e| ProxyError::AuthError(format!("Invalid Devin x-api-key: {e}")))?;
+        return Ok(vec![(http::HeaderName::from_static("x-api-key"), value)]);
+    }
+
+    let bearer = format!("Bearer {api_key}");
+    let value = http::HeaderValue::from_str(&bearer)
+        .map_err(|e| ProxyError::AuthError(format!("Invalid Devin bearer token: {e}")))?;
+    Ok(vec![(http::header::AUTHORIZATION, value)])
+}
+
+fn model_catalog_route_auth_headers(
+    route: &ModelCatalogRoute,
+) -> Result<Vec<(http::HeaderName, http::HeaderValue)>, ProxyError> {
+    let api_key = route
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| ProxyError::AuthError("Model catalog route API key is empty".to_string()))?;
+
+    let auth_header = route
+        .auth_header
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            if route.endpoint.as_deref().is_some_and(is_messages_endpoint) {
+                "x-api-key".to_string()
+            } else {
+                "bearer".to_string()
+            }
+        });
+
+    if matches!(
+        auth_header.as_str(),
+        "x-api-key" | "x_api_key" | "anthropic"
+    ) {
+        let value = http::HeaderValue::from_str(api_key)
+            .map_err(|e| ProxyError::AuthError(format!("Invalid route x-api-key: {e}")))?;
+        return Ok(vec![(http::HeaderName::from_static("x-api-key"), value)]);
+    }
+
+    let bearer = format!("Bearer {api_key}");
+    let value = http::HeaderValue::from_str(&bearer)
+        .map_err(|e| ProxyError::AuthError(format!("Invalid route bearer token: {e}")))?;
+    Ok(vec![(http::header::AUTHORIZATION, value)])
+}
+
+fn append_anthropic_beta_tokens(parts: &mut Vec<String>, value: &str) {
+    for token in value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if !parts.iter().any(|existing| existing == token) {
+            parts.push(token.to_string());
+        }
+    }
+}
+
+fn is_devin_connect_header_for_json_upstream(header_name: &str) -> bool {
+    if header_name.eq_ignore_ascii_case("content-type")
+        || header_name.eq_ignore_ascii_case("content-encoding")
+        || header_name.eq_ignore_ascii_case("accept")
+        || header_name.eq_ignore_ascii_case("te")
+    {
+        return true;
+    }
+
+    let lower = header_name.to_ascii_lowercase();
+    lower.starts_with("connect-") || lower.starts_with("grpc-")
+}
+
+fn is_joycode_provider(provider: &Provider, base_url: &str) -> bool {
+    let provider_type = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        .unwrap_or_default();
+    if !base_url.to_ascii_lowercase().contains("joycode-api.jd.com") {
+        return false;
+    }
+    let haystack = format!(
+        "{} {} {} {} {}",
+        provider.id, provider.name, base_url, provider_type, provider.settings_config
+    )
+    .to_ascii_lowercase();
+    haystack.contains("joycode") || haystack.contains("joycode-api.jd.com")
+}
+
+fn build_joycode_color_gateway_url(function_id: &str) -> String {
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    let params = vec![
+        ("appid", "joycode_ide".to_string()),
+        ("functionId", function_id.to_string()),
+        ("t", timestamp_ms.to_string()),
+    ];
+    let sign = joycode_color_gateway_sign(&params);
+    let mut url =
+        url::Url::parse("https://api-ai.jd.com/api").expect("JoyCode gateway URL is valid");
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in &params {
+            query.append_pair(key, value);
+        }
+        query.append_pair("sign", &sign);
+    }
+    url.to_string()
+}
+
+fn joycode_color_gateway_sign(params: &[(&str, String)]) -> String {
+    type HmacSha256 = Hmac<sha2::Sha256>;
+    const JOYCODE_COLOR_GATEWAY_SECRET: &[u8] = b"0691a3f0b37b4a85aeb63ad0fc7db3ed";
+
+    let mut pairs = params.iter().collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.cmp(right.0));
+    let sign_text = pairs
+        .into_iter()
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let mut mac = HmacSha256::new_from_slice(JOYCODE_COLOR_GATEWAY_SECRET)
+        .expect("JoyCode color gateway HMAC key is valid");
+    mac.update(sign_text.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn collect_joycode_provider_headers(provider: &Provider) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    collect_joycode_headers_from_json(&provider.settings_config, &mut headers);
+
+    if let Ok(cookie) = std::env::var("JOYCODE_COOKIE") {
+        headers.push(("cookie".to_string(), cookie));
+    }
+    if let Ok(cookie) = std::env::var("DEVIN_JOYCODE_COOKIE") {
+        headers.push(("cookie".to_string(), cookie));
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        for path in [
+            format!("{home}/.ccswitch/joycode.env"),
+            format!("{home}/.ccswitch/devin.toml"),
+        ] {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                collect_joycode_headers_from_toml(&content, &mut headers);
+                break;
+            }
+        }
+    }
+
+    promote_joycode_cookie_header_pairs(&mut headers);
+    headers
+}
+
+fn collect_joycode_headers_from_json(value: &Value, headers: &mut Vec<(String, String)>) {
+    for key in [
+        "cookie",
+        "joycode_cookie",
+        "joycodeCookie",
+        "pt_key",
+        "ptKey",
+        "ptkey",
+        "x-pt-key",
+        "loginType",
+        "tenant",
+    ] {
+        if let Some(value) = value.get(key).and_then(Value::as_str) {
+            headers.push((key.to_string(), value.to_string()));
+        }
+    }
+
+    for section in ["headers", "env", "joycode"] {
+        if let Some(object) = value.get(section).and_then(Value::as_object) {
+            for (key, value) in object {
+                if let Some(value) = value.as_str() {
+                    headers.push((key.clone(), value.to_string()));
+                }
+            }
+        }
+    }
+}
+
+fn collect_joycode_headers_from_toml(content: &str, headers: &mut Vec<(String, String)>) {
+    let Ok(doc) = content.parse::<toml::Value>() else {
+        return;
+    };
+    collect_joycode_headers_from_toml_value(&doc, headers);
+    for section in ["headers", "env", "joycode"] {
+        if let Some(value) = doc.get(section) {
+            collect_joycode_headers_from_toml_value(value, headers);
+            if section == "joycode" {
+                if let Some(value) = value.get("headers") {
+                    collect_joycode_headers_from_toml_value(value, headers);
+                }
+                if let Some(value) = value.get("env") {
+                    collect_joycode_headers_from_toml_value(value, headers);
+                }
+            }
+        }
+    }
+}
+
+fn collect_joycode_headers_from_toml_value(
+    value: &toml::Value,
+    headers: &mut Vec<(String, String)>,
+) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (key, value) in table {
+        let value = match value {
+            toml::Value::String(value) => Some(value.trim().to_string()),
+            toml::Value::Integer(value) => Some(value.to_string()),
+            toml::Value::Float(value) => Some(value.to_string()),
+            toml::Value::Boolean(value) => Some(value.to_string()),
+            _ => None,
+        };
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            headers.push((key.clone(), value));
+        }
+    }
+}
+
+fn promote_joycode_cookie_header_pairs(headers: &mut Vec<(String, String)>) {
+    let cookie = headers
+        .iter()
+        .rev()
+        .find(|(key, _)| {
+            key.eq_ignore_ascii_case("cookie")
+                || key.eq_ignore_ascii_case("joycode_cookie")
+                || key.eq_ignore_ascii_case("joycodeCookie")
+        })
+        .map(|(_, value)| value.clone());
+
+    if let Some(cookie) = cookie {
+        headers.push(("cookie".to_string(), cookie.clone()));
+        if let Some(pt_key) = extract_cookie_value(&cookie, "pt_key") {
+            headers.push(("pt_key".to_string(), pt_key.clone()));
+            headers.push(("x-pt-key".to_string(), pt_key));
+        }
+    }
+}
+
+fn extract_joycode_auth_params(headers: &[(String, String)]) -> Option<(String, String, String)> {
+    let pt_key = headers
+        .iter()
+        .find(|(key, _)| {
+            key.eq_ignore_ascii_case("ptKey")
+                || key.eq_ignore_ascii_case("ptkey")
+                || key.eq_ignore_ascii_case("pt_key")
+                || key.eq_ignore_ascii_case("x-pt-key")
+        })
+        .map(|(_, value)| value.clone())
+        .or_else(|| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("cookie"))
+                .and_then(|(_, value)| extract_cookie_value(value, "pt_key"))
+        })?;
+
+    let login_type = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("loginType"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "ERP".to_string());
+    let tenant = headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("tenant"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| "JD".to_string());
+
+    Some((pt_key, login_type, tenant))
+}
+
+fn append_joycode_auth_headers(
+    headers: &mut http::HeaderMap,
+    auth_params: Option<&(String, String, String)>,
+) -> usize {
+    let Some((pt_key, login_type, tenant)) = auth_params else {
+        return 0;
+    };
+
+    let mut injected_count = 0;
+    if let Ok(value) = http::HeaderValue::from_str(pt_key) {
+        headers.insert(http::HeaderName::from_static("ptkey"), value);
+        injected_count += 1;
+        log::debug!("[JoyCode] Injected ptkey");
+    }
+    if let Ok(value) = http::HeaderValue::from_str(login_type) {
+        headers.insert(http::HeaderName::from_static("logintype"), value);
+        injected_count += 1;
+        log::debug!("[JoyCode] Injected logintype={}", login_type);
+    }
+    if let Ok(value) = http::HeaderValue::from_str(tenant) {
+        headers.insert(http::HeaderName::from_static("tenant"), value);
+        injected_count += 1;
+        log::debug!("[JoyCode] Injected tenant={}", tenant);
+    }
+
+    injected_count
+}
+
+fn extract_cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+fn devin_request_to_anthropic_messages(body: Value) -> Result<Value, ProxyError> {
+    if value_is_anthropic_messages_request(&body) {
+        return Ok(body);
+    }
+
+    let chat_body = if value_is_openai_responses_request(&body) {
+        super::providers::transform_codex_chat::responses_to_chat_completions(body)?
+    } else {
+        body
+    };
+
+    super::providers::transform::openai_chat_request_to_anthropic(chat_body)
+}
+
+const DEVIN_CACHE_MAX_TEXT_CHARS: usize = 12_000;
+const DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS: usize = 2_000;
+const DEVIN_RECENT_MESSAGES_WITHOUT_COMPACTION: usize = 1;
+const DEVIN_STABLE_HISTORY_CACHE_POINTS: usize = 2;
+
+fn prepare_devin_anthropic_body(
+    body: Value,
+    provider: &Provider,
+    route: Option<&DevinResolvedRoute>,
+) -> (Value, Option<String>) {
+    let mut body = compact_devin_context(body);
+    inject_devin_anthropic_cache_control(&mut body);
+    let cache_key = build_devin_prompt_cache_key(&body, provider, route);
+    log_devin_cache_plan(&body, cache_key.as_deref());
+    (body, cache_key)
+}
+
+fn compact_devin_context(mut body: Value) -> Value {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        let before_chars = canonical_json_string(&Value::Array(messages.clone()))
+            .chars()
+            .count();
+        let compact_until = messages
+            .len()
+            .saturating_sub(DEVIN_RECENT_MESSAGES_WITHOUT_COMPACTION);
+        for (index, message) in messages.iter_mut().enumerate() {
+            if index >= compact_until {
+                continue;
+            }
+            compact_devin_message(message);
+        }
+        let after_chars = canonical_json_string(&Value::Array(messages.clone()))
+            .chars()
+            .count();
+        log_devin_compaction_stats("anthropic", messages, before_chars, after_chars);
+    }
+    body
+}
+
+fn compact_devin_openai_chat_context(mut body: Value) -> Value {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        let before_chars = canonical_json_string(&Value::Array(messages.clone()))
+            .chars()
+            .count();
+        let compact_until = messages
+            .len()
+            .saturating_sub(DEVIN_RECENT_MESSAGES_WITHOUT_COMPACTION);
+        for (index, message) in messages.iter_mut().enumerate() {
+            if index >= compact_until {
+                continue;
+            }
+            compact_devin_openai_chat_message(message);
+        }
+        let after_chars = canonical_json_string(&Value::Array(messages.clone()))
+            .chars()
+            .count();
+        log_devin_compaction_stats("openai_chat", messages, before_chars, after_chars);
+    }
+    body
+}
+
+fn compact_devin_openai_chat_message(message: &mut Value) {
+    let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+    if role == "tool" {
+        compact_devin_openai_chat_content(message.get_mut("content"));
+        return;
+    }
+
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+    let Some(parts) = content.as_array_mut() else {
+        return;
+    };
+
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) == Some("tool_result") {
+            compact_devin_tool_result(part);
+        }
+    }
+}
+
+fn compact_devin_openai_chat_content(content: Option<&mut Value>) {
+    let Some(content) = content else {
+        return;
+    };
+
+    match content {
+        Value::String(text) => {
+            *text = compact_long_devin_text(
+                text,
+                DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS * 2,
+                "tool_result",
+                Some(DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS),
+                true,
+            );
+        }
+        Value::Array(parts) => {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    part["text"] = Value::String(compact_long_devin_text(
+                        text,
+                        DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS * 2,
+                        "tool_result",
+                        Some(DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS),
+                        true,
+                    ));
+                }
+            }
+        }
+        other => {
+            let serialized = canonical_json_string(other);
+            *other = Value::String(compact_long_devin_text(
+                &serialized,
+                DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS * 2,
+                "tool_result",
+                Some(DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS),
+                true,
+            ));
+        }
+    }
+}
+
+fn compact_devin_message(message: &mut Value) {
+    let Some(content) = message.get_mut("content") else {
+        return;
+    };
+
+    if content.as_str().is_some() {
+        return;
+    }
+
+    let Some(blocks) = content.as_array_mut() else {
+        return;
+    };
+
+    let mut seen_tool_results = std::collections::BTreeSet::new();
+    blocks.retain_mut(|block| {
+        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+        match block_type {
+            "text" => true,
+            "tool_result" => {
+                let signature = canonical_json_string(&serde_json::json!({
+                    "tool_use_id": block.get("tool_use_id").and_then(Value::as_str).unwrap_or(""),
+                    "is_error": block.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                }));
+                if !seen_tool_results.insert(signature) {
+                    return false;
+                }
+                compact_devin_tool_result(block);
+                true
+            }
+            "tool_use" => {
+                compact_devin_tool_use(block);
+                true
+            }
+            "image" => {
+                compact_devin_image(block);
+                true
+            }
+            _ => true,
+        }
+    });
+}
+
+fn compact_devin_tool_result(block: &mut Value) {
+    let Some(content) = block.get("content").cloned() else {
+        return;
+    };
+
+    match content {
+        Value::String(text) => {
+            block["content"] = Value::String(compact_long_devin_text(
+                &text,
+                DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS * 2,
+                "tool_result",
+                Some(DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS),
+                true,
+            ));
+        }
+        Value::Array(mut parts) => {
+            for part in &mut parts {
+                if part.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        part["text"] = Value::String(compact_long_devin_text(
+                            text,
+                            DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS * 2,
+                            "tool_result",
+                            Some(DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS),
+                            true,
+                        ));
+                    }
+                } else if part.get("type").and_then(Value::as_str) == Some("image") {
+                    compact_devin_image(part);
+                }
+            }
+            block["content"] = Value::Array(parts);
+        }
+        other => {
+            let serialized = canonical_json_string(&other);
+            block["content"] = Value::String(compact_long_devin_text(
+                &serialized,
+                DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS * 2,
+                "tool_result",
+                Some(DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS),
+                true,
+            ));
+        }
+    }
+}
+
+fn compact_devin_tool_use(block: &mut Value) {
+    let Some(input) = block.get("input").cloned() else {
+        return;
+    };
+    let serialized = canonical_json_string(&input);
+    if serialized.chars().count() <= DEVIN_CACHE_MAX_TEXT_CHARS {
+        return;
+    }
+    block["input"] = serde_json::json!({
+        "_compressed": true,
+        "chars": serialized.chars().count(),
+        "sha256": short_sha256_hex(serialized.as_bytes()),
+        "preview": compact_long_devin_text(
+            &serialized,
+            DEVIN_CACHE_MAX_TEXT_CHARS,
+            "tool_use_input",
+            None,
+            false,
+        ),
+    });
+}
+
+fn compact_devin_image(block: &mut Value) {
+    let media_type = block
+        .get("media_type")
+        .or_else(|| block.get("mediaType"))
+        .or_else(|| block.pointer("/source/media_type"))
+        .or_else(|| block.pointer("/source/mediaType"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    if let Some(object) = block.as_object_mut() {
+        object.clear();
+        object.insert("type".to_string(), Value::String("image".to_string()));
+        if let Some(media_type) = media_type {
+            object.insert("media_type".to_string(), Value::String(media_type));
+        }
+    }
+}
+
+fn compact_long_devin_text(
+    value: &str,
+    max_chars: usize,
+    label: &str,
+    edge_chars: Option<usize>,
+    preserve_whitespace: bool,
+) -> String {
+    let normalized = normalize_devin_cache_text(value, preserve_whitespace);
+    let char_count = normalized.chars().count();
+    if char_count <= max_chars {
+        return normalized;
+    }
+
+    let head_chars = edge_chars.unwrap_or_else(|| std::cmp::max(200, max_chars * 6 / 10));
+    let tail_chars = edge_chars.unwrap_or_else(|| std::cmp::max(200, max_chars * 3 / 10));
+    let head = normalized.chars().take(head_chars).collect::<String>();
+    let tail = normalized
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!(
+        "[{label} elided: chars={char_count}, sha256={}]\n{head}\n[...elided...]\n{tail}",
+        short_sha256_hex(normalized.as_bytes())
+    )
+}
+
+fn normalize_devin_cache_text(value: &str, preserve_whitespace: bool) -> String {
+    let mut text = value.to_string();
+    for (regex, replacement) in [
+        (iso_timestamp_regex(), "[timestamp]"),
+        (request_id_regex(), "$1[id]"),
+        (uuid_regex(), "[uuid]"),
+        (call_id_regex(), "call_[id]"),
+        (toolu_id_regex(), "toolu_[id]"),
+        (msg_id_regex(), "msg_[id]"),
+        (resp_id_regex(), "resp_[id]"),
+        (tmp_path_regex(), "/tmp/[path]"),
+        (var_folders_regex(), "/var/folders/[path]"),
+    ] {
+        text = regex.replace_all(&text, replacement).into_owned();
+    }
+    if preserve_whitespace {
+        text.trim().to_string()
+    } else {
+        whitespace_regex()
+            .replace_all(text.trim(), " ")
+            .into_owned()
+    }
+}
+
+fn inject_devin_anthropic_cache_control(body: &mut Value) {
+    inject_anthropic_system_cache_control(body);
+    inject_anthropic_tools_cache_control(body);
+    inject_stable_history_cache_control(body);
+}
+
+fn inject_anthropic_system_cache_control(body: &mut Value) -> bool {
+    let Some(system) = body.get_mut("system") else {
+        return false;
+    };
+
+    if let Some(text) = system.as_str().map(ToString::to_string) {
+        if !text.trim().is_empty() {
+            *system = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": { "type": "ephemeral" }
+            }]);
+            return true;
+        }
+        return false;
+    }
+
+    if let Some(blocks) = system.as_array_mut() {
+        if let Some(block) = blocks.iter_mut().find(|block| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind == "text")
+                && block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+        }) {
+            block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            return true;
+        }
+    }
+
+    false
+}
+
+fn inject_anthropic_tools_cache_control(body: &mut Value) -> bool {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    let Some(tool) = tools.last_mut() else {
+        return false;
+    };
+
+    tool["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+    true
+}
+
+fn inject_stable_history_cache_control(body: &mut Value) -> bool {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    if messages.len() < 2 {
+        return false;
+    }
+
+    let mut injected = 0usize;
+    for message in messages.iter_mut().rev().skip(1) {
+        if message_has_devin_cache_control(message) {
+            injected += 1;
+        } else if inject_message_cache_control(message) {
+            injected += 1;
+        }
+        if injected >= DEVIN_STABLE_HISTORY_CACHE_POINTS {
+            return true;
+        }
+    }
+
+    injected > 0
+}
+
+fn inject_message_cache_control(message: &mut Value) -> bool {
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+
+    if let Some(text) = content.as_str().map(ToString::to_string) {
+        if text.trim().is_empty() {
+            return false;
+        }
+        *content = serde_json::json!([{
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" }
+        }]);
+        return true;
+    }
+
+    let Some(blocks) = content.as_array_mut() else {
+        return false;
+    };
+
+    for block in blocks.iter_mut().rev() {
+        if is_devin_cacheable_message_block(block) {
+            block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_devin_cacheable_message_block(block: &Value) -> bool {
+    matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("text" | "tool_result" | "tool_use")
+    )
+}
+
+fn log_devin_cache_plan(body: &Value, cache_key: Option<&str>) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let message_summaries = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            format!(
+                "{}:{}:{}:{}",
+                index,
+                message.get("role").and_then(Value::as_str).unwrap_or("?"),
+                if message_has_devin_cache_control(message) {
+                    "cache"
+                } else {
+                    "fresh"
+                },
+                if message_has_devin_compacted_content(message) {
+                    "compact"
+                } else {
+                    "raw"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    log::debug!(
+        "[DevinCache] cache_key={}, system={}, tools={}, messages={}, plan=[{}]",
+        cache_key
+            .map(|key| format!(
+                "present(len={},hash={})",
+                key.len(),
+                short_sha256_hex(key.as_bytes())
+            ))
+            .unwrap_or_else(|| "absent".to_string()),
+        short_value_hash(body.get("system")),
+        short_value_hash(body.get("tools")),
+        messages.len(),
+        message_summaries
+    );
+}
+
+fn log_devin_compaction_stats(
+    format: &str,
+    messages: &[Value],
+    before_chars: usize,
+    after_chars: usize,
+) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+
+    let compacted_messages = messages
+        .iter()
+        .filter(|message| message_has_devin_compacted_content(message))
+        .count();
+    let cache_messages = messages
+        .iter()
+        .filter(|message| message_has_devin_cache_control(message))
+        .count();
+    let saved_chars = before_chars.saturating_sub(after_chars);
+    let saved_percent = if before_chars > 0 {
+        saved_chars as f64 * 100.0 / before_chars as f64
+    } else {
+        0.0
+    };
+
+    log::debug!(
+        "[DevinCompact] format={}, messages={}, compacted={}, cache_marks={}, chars={} -> {} (-{}, {:.1}%)",
+        format,
+        messages.len(),
+        compacted_messages,
+        cache_messages,
+        before_chars,
+        after_chars,
+        saved_chars,
+        saved_percent
+    );
+}
+
+fn message_has_devin_cache_control(message: &Value) -> bool {
+    message
+        .get("content")
+        .is_some_and(value_has_devin_cache_control)
+}
+
+fn value_has_devin_cache_control(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("cache_control")
+                || object.values().any(value_has_devin_cache_control)
+        }
+        Value::Array(values) => values.iter().any(value_has_devin_cache_control),
+        _ => false,
+    }
+}
+
+fn message_has_devin_compacted_content(message: &Value) -> bool {
+    message
+        .get("content")
+        .is_some_and(value_has_devin_compacted_content)
+}
+
+fn value_has_devin_compacted_content(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains(" elided:") || text.contains("\"_compressed\":true"),
+        Value::Object(object) => {
+            object.get("_compressed").and_then(Value::as_bool) == Some(true)
+                || object.values().any(value_has_devin_compacted_content)
+        }
+        Value::Array(values) => values.iter().any(value_has_devin_compacted_content),
+        _ => false,
+    }
+}
+
+fn build_devin_prompt_cache_key(
+    body: &Value,
+    provider: &Provider,
+    route: Option<&DevinResolvedRoute>,
+) -> Option<String> {
+    let model = route
+        .and_then(|route| route.upstream_model.as_deref())
+        .or_else(|| body.get("model").and_then(Value::as_str))
+        .filter(|model| !model.trim().is_empty())?;
+    let system_hash = short_value_hash(body.get("system"));
+    let tools_hash = short_value_hash(body.get("tools"));
+    let conversation_scope = devin_prompt_cache_conversation_scope(body);
+    let raw_key = format!(
+        "workspace:cc-switch|agent:devin-v3|provider:{}|route:{}|model:{}|tools:{}|system:{}|scope:{}",
+        provider.id,
+        route
+            .and_then(|route| route.name.as_deref())
+            .unwrap_or("default"),
+        model,
+        tools_hash,
+        system_hash,
+        conversation_scope
+    );
+    Some(format!(
+        "ccsw-devin-{}",
+        short_sha256_hex(raw_key.as_bytes())
+    ))
+}
+
+fn devin_prompt_cache_conversation_scope(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return "no_messages".to_string();
+    };
+
+    let stable_prefix = messages.iter().take(4).cloned().collect::<Vec<_>>();
+    if stable_prefix.is_empty() {
+        return "empty_messages".to_string();
+    }
+
+    short_sha256_hex(canonical_json_string(&Value::Array(stable_prefix)).as_bytes())
+}
+
+fn inject_devin_responses_cache_key(
+    body: &mut Value,
+    provider: &Provider,
+    route: Option<&DevinResolvedRoute>,
+) {
+    if body.get("prompt_cache_key").is_some() {
+        return;
+    }
+    let cache_key = build_devin_prompt_cache_key(body, provider, route);
+    if let Some(cache_key) = cache_key {
+        body["prompt_cache_key"] = Value::String(cache_key);
+        body["prompt_cache_retention"] = Value::String("24h".to_string());
+    }
+}
+
+fn inject_devin_chat_cache_key(
+    body: &mut Value,
+    provider: &Provider,
+    route: Option<&DevinResolvedRoute>,
+) {
+    if body.get("prompt_cache_key").is_some() {
+        return;
+    }
+    let cache_key = build_devin_prompt_cache_key(body, provider, route);
+    if let Some(cache_key) = cache_key {
+        body["prompt_cache_key"] = Value::String(cache_key);
+        body["prompt_cache_retention"] = Value::String("24h".to_string());
+    }
+}
+
+fn iso_timestamp_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b").unwrap())
+}
+
+fn request_id_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b((?:request|req|trace|session|cursor|message|turn)[_-]?id\s*[:=]\s*)[A-Za-z0-9._:-]+").unwrap()
+    })
+}
+
+fn uuid_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b").unwrap()
+    })
+}
+
+fn call_id_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\bcall_[A-Za-z0-9_-]+\b").unwrap())
+}
+
+fn toolu_id_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\btoolu_[A-Za-z0-9_-]+\b").unwrap())
+}
+
+fn msg_id_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\bmsg_[A-Za-z0-9_-]+\b").unwrap())
+}
+
+fn resp_id_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\bresp_[A-Za-z0-9_-]+\b").unwrap())
+}
+
+fn tmp_path_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"/tmp/[^\s)]+").unwrap())
+}
+
+fn var_folders_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"/var/folders/[^\s)]+").unwrap())
+}
+
+fn whitespace_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"\s+").unwrap())
+}
+
+fn normalize_anthropic_temperature_for_thinking(mut body: Value) -> Value {
+    let thinking_enabled =
+        body.get("thinking")
+            .and_then(Value::as_object)
+            .is_some_and(|thinking| {
+                !matches!(
+                    thinking.get("type").and_then(Value::as_str),
+                    Some("disabled")
+                )
+            });
+
+    if !thinking_enabled {
+        return body;
+    }
+
+    let temperature_is_one = body
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .is_some_and(|temperature| (temperature - 1.0).abs() < f64::EPSILON);
+
+    if !temperature_is_one {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("temperature");
+        }
+    }
+
+    body
+}
+
+fn apply_devin_codex_responses_compat(mut body: Value, codex_fast_mode: bool) -> Value {
+    body["store"] = Value::Bool(false);
+    if codex_fast_mode {
+        body["service_tier"] = Value::String("priority".to_string());
+    }
+
+    const REASONING_MARKER: &str = "reasoning.encrypted_content";
+    let mut include = body
+        .get("include")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !include
+        .iter()
+        .any(|value| value.as_str() == Some(REASONING_MARKER))
+    {
+        include.push(Value::String(REASONING_MARKER.to_string()));
+    }
+    body["include"] = Value::Array(include);
+
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_output_tokens");
+        object.remove("temperature");
+        object.remove("top_p");
+        object
+            .entry("instructions".to_string())
+            .or_insert_with(|| Value::String(String::new()));
+        object
+            .entry("tools".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        object
+            .entry("parallel_tool_calls".to_string())
+            .or_insert_with(|| Value::Bool(false));
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+
+    body
+}
+
+fn value_is_openai_responses_request(body: &Value) -> bool {
+    body.get("input").is_some()
+        || body.get("instructions").is_some()
+        || body.get("previous_response_id").is_some()
+        || body.get("max_output_tokens").is_some()
+}
+
+fn value_is_openai_chat_request(body: &Value) -> bool {
+    body.get("messages").and_then(Value::as_array).is_some()
+        && !value_is_anthropic_messages_request(body)
+}
+
+fn value_is_anthropic_messages_request(body: &Value) -> bool {
+    if body.get("_cc_switch_canonical_api").and_then(Value::as_str) == Some("anthropic_messages") {
+        return true;
+    }
+
+    body.get("system").is_some()
+        || body.get("anthropic_version").is_some()
+        || body.get("stop_sequences").is_some()
+        || body
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| tools.iter().any(|tool| tool.get("input_schema").is_some()))
+        || body
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|content| {
+                            content.iter().any(|part| {
+                                matches!(
+                                    part.get("type").and_then(Value::as_str),
+                                    Some(
+                                        "tool_use"
+                                            | "tool_result"
+                                            | "thinking"
+                                            | "redacted_thinking"
+                                            | "server_tool_use"
+                                            | "web_search_tool_result"
+                                    )
+                                ) || part.get("source").is_some()
+                                    || part.get("input").is_some()
+                                    || part.get("tool_use_id").is_some()
+                            })
+                        })
+                })
+            })
+}
+
+fn replace_endpoint_path_preserve_query(original: &str, replacement_path: &str) -> String {
+    let (_, query) = split_endpoint_and_query(original);
+    match query {
+        Some(query) if !query.is_empty() => format!("{replacement_path}?{query}"),
+        _ => replacement_path.to_string(),
+    }
+}
+
+fn endpoint_path_matches(endpoint: &str, matches: &[&str]) -> bool {
+    let (path, _) = split_endpoint_and_query(endpoint);
+    matches.iter().any(|candidate| path == *candidate)
+}
+
+fn is_messages_endpoint(endpoint: &str) -> bool {
+    let (path, _) = split_endpoint_and_query(endpoint);
+    endpoint_path_matches(endpoint, &["/messages", "/v1/messages"]) || path.ends_with("/messages")
+}
+
+fn is_chat_completions_endpoint(endpoint: &str) -> bool {
+    let (path, _) = split_endpoint_and_query(endpoint);
+    endpoint_path_matches(endpoint, &["/chat/completions", "/v1/chat/completions"])
+        || path.ends_with("/chat/completions")
+}
+
+fn is_responses_endpoint(endpoint: &str) -> bool {
+    let (path, _) = split_endpoint_and_query(endpoint);
+    endpoint_path_matches(
+        endpoint,
+        &[
+            "/responses",
+            "/v1/responses",
+            "/responses/compact",
+            "/v1/responses/compact",
+        ],
+    ) || path.ends_with("/responses")
+        || path.ends_with("/responses/compact")
+}
+
 fn split_endpoint_and_query(endpoint: &str) -> (&str, Option<&str>) {
     endpoint
         .split_once('?')
@@ -2310,6 +4874,18 @@ fn rewrite_codex_responses_endpoint_to_chat(endpoint: &str) -> (String, Option<S
     let (_path, query) = split_endpoint_and_query(endpoint);
     let passthrough_query = query.map(ToString::to_string);
     let target_path = "/chat/completions";
+    let rewritten = match passthrough_query.as_deref() {
+        Some(query) if !query.is_empty() => format!("{target_path}?{query}"),
+        _ => target_path.to_string(),
+    };
+
+    (rewritten, passthrough_query)
+}
+
+fn rewrite_codex_chat_endpoint_to_responses(endpoint: &str) -> (String, Option<String>) {
+    let (_path, query) = split_endpoint_and_query(endpoint);
+    let passthrough_query = query.map(ToString::to_string);
+    let target_path = "/responses";
     let rewritten = match passthrough_query.as_deref() {
         Some(query) if !query.is_empty() => format!("{target_path}?{query}"),
         _ => target_path.to_string(),
@@ -2522,13 +5098,50 @@ fn should_force_identity_encoding(
 }
 
 fn map_reqwest_send_error(error: reqwest::Error) -> ProxyError {
+    let details = describe_reqwest_error(&error);
     if error.is_timeout() {
-        ProxyError::Timeout(format!("请求超时: {error}"))
+        ProxyError::Timeout(format!("请求超时: {details}"))
     } else if error.is_connect() {
-        ProxyError::ForwardFailed(format!("连接失败: {error}"))
+        ProxyError::ForwardFailed(format!("连接失败: {details}"))
     } else {
-        ProxyError::ForwardFailed(error.to_string())
+        ProxyError::ForwardFailed(details)
     }
+}
+
+fn describe_reqwest_error(error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(err) = source {
+        let text = err.to_string();
+        if !text.is_empty() && !parts.iter().any(|part| part == &text) {
+            parts.push(text);
+        }
+        source = err.source();
+    }
+    format!(
+        "{} (timeout={}, connect={}, request={})",
+        parts.join("; caused by: "),
+        error.is_timeout(),
+        error.is_connect(),
+        error.is_request()
+    )
+}
+
+fn log_reqwest_send_error(
+    error: &reqwest::Error,
+    app_type: &str,
+    provider_name: &str,
+    url: &str,
+    body_len: usize,
+) {
+    log::warn!(
+        "[Forwarder] reqwest send failed app_type={} provider={} url={} body_bytes={} error={}",
+        app_type,
+        provider_name,
+        url,
+        body_len,
+        describe_reqwest_error(error)
+    );
 }
 
 fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
@@ -2548,6 +5161,13 @@ fn prepare_upstream_request_body(request_body: Value) -> Value {
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
 }
 
+fn strip_devin_route_thinking(mut body: Value) -> Value {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("thinking");
+    }
+    super::copilot_optimizer::strip_thinking_blocks(body)
+}
+
 fn log_prompt_cache_trace(
     app_type: &AppType,
     provider: &Provider,
@@ -2563,7 +5183,13 @@ fn log_prompt_cache_trace(
     let prompt_cache_key = body
         .get("prompt_cache_key")
         .and_then(|value| value.as_str())
-        .map(|key| format!("present(len={})", key.len()))
+        .map(|key| {
+            format!(
+                "present(len={},hash={})",
+                key.len(),
+                short_sha256_hex(key.as_bytes())
+            )
+        })
         .unwrap_or_else(|| "absent".to_string());
     let store = body
         .get("store")
@@ -2592,6 +5218,116 @@ fn log_prompt_cache_trace(
     );
 }
 
+fn log_devin_chat_prefix_trace(provider: &Provider, endpoint: &str, body: &Value) {
+    if !log::log_enabled!(log::Level::Debug) {
+        return;
+    }
+
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return;
+    };
+
+    let mut checkpoints = vec![1usize, 2, 4, 8];
+    checkpoints.extend((16..=messages.len()).step_by(16));
+    for count in [
+        messages.len().saturating_sub(4),
+        messages.len().saturating_sub(2),
+        messages.len().saturating_sub(1),
+        messages.len(),
+    ] {
+        if count > 0 {
+            checkpoints.push(count);
+        }
+    }
+    checkpoints.sort_unstable();
+    checkpoints.dedup();
+
+    let prefix_hashes = checkpoints
+        .iter()
+        .copied()
+        .filter(|count| *count <= messages.len())
+        .map(|count| {
+            let prefix = messages.iter().take(count).cloned().collect::<Vec<_>>();
+            format!(
+                "{}:{}",
+                count,
+                short_sha256_hex(canonical_json_string(&Value::Array(prefix)).as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let chunk_hashes = messages
+        .chunks(16)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let start = chunk_index * 16;
+            let end = start + chunk.len();
+            format!(
+                "{}-{}:{}",
+                start,
+                end.saturating_sub(1),
+                short_sha256_hex(canonical_json_string(&Value::Array(chunk.to_vec())).as_bytes())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let role_runs = messages
+        .iter()
+        .map(
+            |message| match message.get("role").and_then(Value::as_str).unwrap_or("?") {
+                "system" => "s",
+                "user" => "u",
+                "assistant" => "a",
+                "tool" => "t",
+                _ => "?",
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("");
+
+    let tail = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|(index, message)| {
+            format!(
+                "{}:{}:{}",
+                index,
+                message.get("role").and_then(Value::as_str).unwrap_or("?"),
+                short_value_hash(Some(message))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    log::debug!(
+        "[DevinCacheTrace] provider={} endpoint={} model={} messages={} roles_hash={} roles_tail={} body_hash={} prefix=[{}] chunks=[{}] tail=[{}]",
+        provider.id,
+        endpoint,
+        body.get("model").and_then(Value::as_str).unwrap_or(""),
+        messages.len(),
+        short_sha256_hex(role_runs.as_bytes()),
+        role_runs
+            .chars()
+            .rev()
+            .take(32)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>(),
+        short_value_hash(Some(body)),
+        prefix_hashes,
+        chunk_hashes,
+        tail,
+    );
+}
+
 fn value_for_log(value: &Value) -> String {
     match value {
         Value::Bool(value) => value.to_string(),
@@ -2600,6 +5336,60 @@ fn value_for_log(value: &Value) -> String {
         Value::Null => "null".to_string(),
         Value::Array(values) => format!("array(len={})", values.len()),
         Value::Object(values) => format!("object(len={})", values.len()),
+    }
+}
+
+async fn restore_sensitive_pseudonyms_in_response(
+    response: ProxyResponse,
+    rewrite_map: super::sensitive_redaction::SensitiveRewriteMap,
+) -> Result<ProxyResponse, ProxyError> {
+    let status = response.status();
+    let headers = response.headers().clone();
+
+    if response.is_sse() {
+        let stream = response.bytes_stream().map(move |chunk| {
+            chunk.map(|bytes| restore_sensitive_pseudonyms_in_bytes(bytes, &rewrite_map))
+        });
+        Ok(ProxyResponse::streamed(status, headers, stream))
+    } else {
+        let bytes = response.bytes().await?;
+        Ok(ProxyResponse::buffered(
+            status,
+            headers,
+            restore_sensitive_pseudonyms_in_bytes(bytes, &rewrite_map),
+        ))
+    }
+}
+
+fn restore_sensitive_pseudonyms_in_bytes(
+    bytes: Bytes,
+    rewrite_map: &super::sensitive_redaction::SensitiveRewriteMap,
+) -> Bytes {
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return bytes;
+    };
+    let restored = rewrite_map.restore_text(text);
+    if restored.as_bytes() == bytes.as_ref() {
+        bytes
+    } else {
+        Bytes::from(restored)
+    }
+}
+
+fn redact_header_value_for_log(name: &str, value: &str) -> String {
+    if name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("api-key")
+        || name.eq_ignore_ascii_case("apikey")
+        || name.eq_ignore_ascii_case("x-model-token")
+        || name.eq_ignore_ascii_case("ptkey")
+        || name.eq_ignore_ascii_case("pt_key")
+        || name.eq_ignore_ascii_case("x-pt-key")
+    {
+        format!("<redacted,len={}>", value.len())
+    } else {
+        value.to_string()
     }
 }
 
@@ -2659,6 +5449,672 @@ mod tests {
             streaming_first_byte_timeout,
             max_attempts: 1,
         }
+    }
+
+    #[test]
+    fn devin_canonical_messages_marker_prevents_double_conversion_and_is_filtered() {
+        let body = json!({
+            "_cc_switch_canonical_api": "anthropic_messages",
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "user",
+                "content": "ping"
+            }],
+            "max_tokens": 1024,
+            "stream": true
+        });
+
+        let canonical = devin_request_to_anthropic_messages(body).unwrap();
+        assert_eq!(canonical["messages"][0]["content"], "ping");
+        assert_eq!(canonical["_cc_switch_canonical_api"], "anthropic_messages");
+
+        let upstream = prepare_upstream_request_body(canonical);
+        assert!(upstream.get("_cc_switch_canonical_api").is_none());
+        assert_eq!(upstream["messages"][0]["content"], "ping");
+    }
+
+    #[test]
+    fn devin_context_prepare_compacts_large_blocks_and_adds_cache_hints() {
+        let provider = test_provider_with_type(Some("codex"));
+        let older_tool_result = format!(
+            "request_id=req-001 2026-06-13T01:02:03Z {} /tmp/older/path/file.txt",
+            "o".repeat(9_000)
+        );
+        let long_tool_result = format!(
+            "request_id=req-123 2026-06-14T01:02:03Z {} /tmp/deep/path/file.txt",
+            "x".repeat(9_000)
+        );
+        let latest_tool_result = format!(
+            "request_id=req-999 2026-06-15T01:02:03Z {} /tmp/latest/path/file.txt",
+            "y".repeat(9_000)
+        );
+        let long_text = "z".repeat(20_000);
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "system": "workspace rules",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_old",
+                        "content": older_tool_result
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "text",
+                        "text": long_text
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_abc123",
+                        "content": long_tool_result
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "call_latest",
+                        "content": latest_tool_result
+                    }]
+                }
+            ],
+            "tools": [{
+                "name": "Read",
+                "description": "Read files",
+                "input_schema": {"type": "object"}
+            }]
+        });
+
+        let (prepared, cache_key) = prepare_devin_anthropic_body(body, &provider, None);
+
+        assert!(cache_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("ccsw-devin-") && key.len() <= 64));
+        assert_eq!(
+            prepared["system"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            prepared["tools"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        assert_eq!(
+            prepared["messages"][2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        let old_content = prepared["messages"][0]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(old_content.contains("[tool_result elided:"));
+        assert!(old_content.contains("request_id=[id]"));
+        assert!(old_content.contains("[timestamp]"));
+        assert!(old_content.contains("/tmp/[path]"));
+        let text = prepared["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert_eq!(text, long_text);
+        let stable_history_content = prepared["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert!(stable_history_content.contains("[tool_result elided:"));
+        assert!(stable_history_content.contains("request_id=[id]"));
+        assert!(stable_history_content.contains("[timestamp]"));
+        assert!(stable_history_content.contains("/tmp/[path]"));
+        let latest_content = prepared["messages"][3]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        assert_eq!(latest_content, latest_tool_result);
+        assert!(prepared["messages"][3]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(latest_content.contains("request_id=req-999"));
+        assert!(latest_content.contains("2026-06-15T01:02:03Z"));
+        assert!(latest_content.contains("/tmp/latest/path/file.txt"));
+    }
+
+    #[test]
+    fn devin_prompt_cache_key_uses_stable_conversation_prefix() {
+        let provider = test_provider_with_type(Some("codex"));
+        let base = json!({
+            "model": "gpt-5.5",
+            "system": "workspace rules",
+            "messages": [
+                {"role": "user", "content": "first prompt"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second prompt"},
+                {"role": "assistant", "content": "second answer"},
+                {"role": "user", "content": "third prompt"},
+                {"role": "assistant", "content": "third answer"}
+            ],
+            "tools": [{"name": "Read", "input_schema": {"type": "object"}}]
+        });
+        let mut with_tail = base.clone();
+        with_tail["messages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"role": "user", "content": "new tail"}));
+        let mut changed_prefix = base.clone();
+        changed_prefix["messages"][0]["content"] = json!("different prompt");
+
+        let base_key = build_devin_prompt_cache_key(&base, &provider, None).unwrap();
+        let tail_key = build_devin_prompt_cache_key(&with_tail, &provider, None).unwrap();
+        let changed_key = build_devin_prompt_cache_key(&changed_prefix, &provider, None).unwrap();
+
+        assert_eq!(base_key, tail_key);
+        assert_ne!(base_key, changed_key);
+    }
+
+    #[test]
+    fn devin_route_thinking_strip_is_explicit_opt_out_only() {
+        let body = json!({
+            "thinking": {"type": "enabled", "budget_tokens": 12000},
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "private"},
+                    {"type": "text", "text": "visible"}
+                ]}
+            ]
+        });
+
+        let stripped = strip_devin_route_thinking(body.clone());
+        assert!(stripped.get("thinking").is_none());
+        assert_eq!(
+            stripped["messages"][0]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(stripped["messages"][0]["content"][0]["type"], "text");
+
+        assert!(body.get("thinking").is_some());
+        assert_eq!(body["messages"][0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn anthropic_thinking_drops_incompatible_temperature() {
+        let body = json!({
+            "model": "Claude-Sonnet-4.6-hq",
+            "thinking": {"type": "enabled", "budget_tokens": 12000},
+            "temperature": 0,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1024
+        });
+
+        let normalized = normalize_anthropic_temperature_for_thinking(body);
+
+        assert!(normalized.get("thinking").is_some());
+        assert!(normalized.get("temperature").is_none());
+    }
+
+    #[test]
+    fn anthropic_temperature_is_preserved_without_thinking() {
+        let body = json!({
+            "model": "Claude-Sonnet-4.6-hq",
+            "temperature": 0,
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1024
+        });
+
+        let normalized = normalize_anthropic_temperature_for_thinking(body);
+
+        assert_eq!(normalized["temperature"], 0);
+    }
+
+    #[test]
+    fn joycode_auth_params_extract_cookie_and_inject_required_headers() {
+        let headers = vec![(
+            "cookie".to_string(),
+            "pt_pin=user; pt_key=BJ.secret; qid_uid=1".to_string(),
+        )];
+        let auth_params = extract_joycode_auth_params(&headers).unwrap();
+        let mut outgoing = http::HeaderMap::new();
+
+        let injected = append_joycode_auth_headers(&mut outgoing, Some(&auth_params));
+
+        assert_eq!(injected, 3);
+        assert_eq!(outgoing["ptkey"], "BJ.secret");
+        assert_eq!(outgoing["logintype"], "ERP");
+        assert_eq!(outgoing["tenant"], "JD");
+    }
+
+    #[test]
+    fn devin_responses_route_can_request_codex_compatible_shape() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "MODEL_PRIVATE_11",
+                    "upstreamModel": "gpt-5.5",
+                    "endpoint": "/v1/responses",
+                    "responsesMode": "codex"
+                }]
+            }
+        });
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "MODEL_PRIVATE_11" })).unwrap();
+        assert!(route.responses_codex_compat);
+
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "ping" }]
+            }],
+            "max_output_tokens": 1024,
+            "temperature": 0,
+            "stream": false
+        });
+        let compat = apply_devin_codex_responses_compat(body, false);
+        assert_eq!(compat["store"], false);
+        assert_eq!(compat["stream"], true);
+        assert_eq!(compat["tools"], json!([]));
+        assert_eq!(compat["parallel_tool_calls"], false);
+        assert!(compat["include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("reasoning.encrypted_content")));
+        assert!(compat.get("max_output_tokens").is_none());
+        assert!(compat.get("temperature").is_none());
+    }
+
+    #[test]
+    fn devin_picpi_responses_route_uses_codex_compatible_shape() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                    "upstreamModel": "gpt-5.5",
+                    "endpoint": "/v1/responses",
+                    "baseUrl": "https://cn.picpi.top"
+                }]
+            }
+        });
+
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "MODEL_CLAUDE_4_SONNET_BYOK" }))
+                .unwrap();
+
+        assert!(route.responses_codex_compat);
+    }
+
+    #[test]
+    fn devin_picpi_route_bypasses_system_proxy() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.name = "pipi".to_string();
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                    "upstreamModel": "gpt-5.5",
+                    "endpoint": "/v1/responses",
+                    "baseUrl": "https://cn.picpi.top"
+                }]
+            }
+        });
+
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "MODEL_CLAUDE_4_SONNET_BYOK" }))
+                .unwrap();
+
+        assert!(should_use_direct_http_client_for_upstream(
+            &provider,
+            Some(&route)
+        ));
+    }
+
+    #[test]
+    fn devin_provider_can_explicitly_bypass_system_proxy() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({ "bypassSystemProxy": true });
+
+        assert!(should_use_direct_http_client_for_upstream(&provider, None));
+    }
+
+    #[test]
+    fn devin_picpi_unknown_alias_falls_back_to_responses_route() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "swe-1-6-slow",
+                        "upstreamModel": "gpt-5.5",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://cn.picpi.top"
+                    },
+                    {
+                        "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                        "upstreamModel": "gpt-5.5",
+                        "endpoint": "/v1/responses",
+                        "baseUrl": "https://cn.picpi.top"
+                    }
+                ]
+            }
+        });
+
+        let route = resolve_devin_model_route(
+            &provider,
+            &json!({ "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH" }),
+        )
+        .unwrap();
+
+        assert_eq!(route.endpoint, "/v1/responses");
+        assert_eq!(route.upstream_model.as_deref(), Some("gpt-5.5"));
+        assert!(route.responses_codex_compat);
+    }
+
+    #[test]
+    fn devin_cheap_alias_routes_to_siliconflow_chat() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "swe-1-6-slow",
+                        "upstreamModel": "gpt-5.5",
+                        "endpoint": "/v1/responses",
+                        "baseUrl": "https://openai-plus.example"
+                    },
+                    {
+                        "model": "MODEL_GPT_5_NANO",
+                        "upstreamModel": "deepseek-ai/DeepSeek-V3.2",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://api.siliconflow.cn",
+                        "apiKey": "sk-test",
+                        "authHeader": "bearer",
+                        "thinkingEnabled": false
+                    },
+                    {
+                        "model": "MODEL_GOOGLE_GEMINI_2_5_FLASH",
+                        "upstreamModel": "deepseek-ai/DeepSeek-V3.2",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://api.siliconflow.cn",
+                        "apiKey": "sk-test",
+                        "authHeader": "bearer",
+                        "thinkingEnabled": false
+                    }
+                ]
+            }
+        });
+
+        for model in ["MODEL_GPT_5_NANO", "MODEL_GOOGLE_GEMINI_2_5_FLASH"] {
+            let route = resolve_devin_model_route(&provider, &json!({ "model": model })).unwrap();
+
+            assert_eq!(route.endpoint, "/v1/chat/completions");
+            assert_eq!(
+                route.upstream_model.as_deref(),
+                Some("deepseek-ai/DeepSeek-V3.2")
+            );
+            assert_eq!(
+                route.base_url.as_deref(),
+                Some("https://api.siliconflow.cn")
+            );
+            assert_eq!(route.thinking_enabled, Some(false));
+        }
+    }
+
+    #[test]
+    fn devin_unknown_non_primary_model_routes_to_small_model() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                        "upstreamModel": "gpt-5.5",
+                        "endpoint": "/v1/responses",
+                        "baseUrl": "https://cn.picpi.top",
+                        "routes": [{ "name": "primary" }]
+                    },
+                    {
+                        "model": "MODEL_GPT_5_NANO",
+                        "upstreamModel": "deepseek-ai/DeepSeek-V3.2",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://api.siliconflow.cn",
+                        "apiKey": "sk-test",
+                        "authHeader": "bearer",
+                        "routes": [{ "name": "devin-small-model" }]
+                    }
+                ]
+            }
+        });
+
+        let route = resolve_devin_model_route(
+            &provider,
+            &json!({ "model": "MODEL_CHAT_GPT_4_1_MINI_2025_04_14" }),
+        )
+        .unwrap();
+
+        assert_eq!(route.endpoint, "/v1/chat/completions");
+        assert_eq!(
+            route.upstream_model.as_deref(),
+            Some("deepseek-ai/DeepSeek-V3.2")
+        );
+        assert_eq!(
+            route.base_url.as_deref(),
+            Some("https://api.siliconflow.cn")
+        );
+    }
+
+    #[test]
+    fn devin_exact_model_id_beats_display_name_match() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [
+                    {
+                        "model": "Claude Sonnet 4 Thinking BYOK",
+                        "displayName": "Claude Sonnet 4 Thinking BYOK",
+                        "upstreamModel": "gpt-5.5",
+                        "endpoint": "/v1/responses",
+                        "baseUrl": "https://cn.picpi.top"
+                    },
+                    {
+                        "model": "MODEL_CLAUDE_4_SONNET_THINKING_BYOK",
+                        "displayName": "Small model",
+                        "upstreamModel": "deepseek-ai/DeepSeek-V3.2",
+                        "endpoint": "/v1/chat/completions",
+                        "baseUrl": "https://api.siliconflow.cn"
+                    }
+                ]
+            }
+        });
+
+        let route = resolve_devin_model_route(
+            &provider,
+            &json!({ "model": "MODEL_CLAUDE_4_SONNET_THINKING_BYOK" }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            route.upstream_model.as_deref(),
+            Some("deepseek-ai/DeepSeek-V3.2")
+        );
+        assert_eq!(route.endpoint, "/v1/chat/completions");
+        assert_eq!(
+            route.base_url.as_deref(),
+            Some("https://api.siliconflow.cn")
+        );
+    }
+
+    #[test]
+    fn devin_windsurf_messages_body_converts_for_responses_route() {
+        let body = json!({
+            "model": "GPT 5.3-codex",
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": "ping" }]
+            }],
+            "max_tokens": 1024,
+            "stream": true
+        });
+
+        assert!(!value_is_openai_responses_request(&body));
+        let responses = crate::proxy::providers::transform_responses::anthropic_to_responses(
+            devin_request_to_anthropic_messages(body).unwrap(),
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert!(responses.get("messages").is_none());
+        assert!(responses.get("max_tokens").is_none());
+        assert_eq!(responses["model"], "GPT 5.3-codex");
+        assert_eq!(responses["input"][0]["role"], "user");
+        assert_eq!(responses["stream"], true);
+    }
+
+    #[test]
+    fn devin_endpoint_detection_accepts_provider_prefixed_paths() {
+        assert!(is_messages_endpoint("/api/saas/anthropic/v1/messages"));
+        assert!(is_responses_endpoint("/api/saas/openai/v1/responses"));
+        assert!(is_chat_completions_endpoint(
+            "/api/saas/openai/v2/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn sensitive_header_values_are_redacted_for_logs() {
+        assert_eq!(
+            redact_header_value_for_log("pt_key", "BJ.secret"),
+            "<redacted,len=9>"
+        );
+        assert_eq!(
+            redact_header_value_for_log("x-model-token", "mt_secret"),
+            "<redacted,len=9>"
+        );
+        assert_eq!(
+            redact_header_value_for_log("user-agent", "codex_cli_rs/0.80.0"),
+            "codex_cli_rs/0.80.0"
+        );
+    }
+
+    #[test]
+    fn devin_route_matches_windsurf_byok_enum_to_display_name() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "config": r#"model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+base_url = "https://muyuan.do/v1"
+wire_api = "responses""#,
+            "modelCatalog": {
+                "models": [{
+                    "model": "gpt-5.5",
+                    "displayName": "Claude Sonnet 4 BYOK",
+                    "upstreamModel": "gpt-5.5",
+                    "endpoint": "/v1/chat/completions",
+                    "baseUrl": "https://muyuan.do"
+                }]
+            }
+        });
+
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "MODEL_CLAUDE_4_SONNET_BYOK" }))
+                .unwrap();
+
+        assert_eq!(route.upstream_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(route.endpoint, "/v1/chat/completions");
+    }
+
+    #[test]
+    fn devin_route_uses_provider_default_for_unmapped_windsurf_alias() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "config": r#"model_provider = "custom"
+model = "glm-5.1"
+
+[model_providers.custom]
+base_url = "https://llmhub.qzz.io/v1"
+wire_api = "responses""#,
+            "modelCatalog": {
+                "models": [{
+                    "model": "MODEL_CLAUDE_4_OPUS_BYOK",
+                    "displayName": "Claude Opus 4 BYOK",
+                    "endpoint": "/v1/chat/completions",
+                    "baseUrl": "https://llmhub.qzz.io"
+                }]
+            }
+        });
+
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "MODEL_CLAUDE_4_OPUS_BYOK" }))
+                .unwrap();
+
+        assert_eq!(route.upstream_model.as_deref(), Some("glm-5.1"));
+        assert_eq!(route.endpoint, "/v1/chat/completions");
+    }
+
+    #[test]
+    fn devin_route_merges_model_and_route_headers() {
+        let mut provider = test_provider_with_type(Some("openai"));
+        provider.settings_config = json!({
+            "modelCatalog": {
+                "models": [{
+                    "model": "MODEL_CLAUDE_4_SONNET_BYOK",
+                    "upstreamModel": "claude-sonnet-4-5-20250929",
+                    "endpoint": "/v1/messages",
+                    "headers": {
+                        "anthropic-beta": "context-1m-2025-08-07",
+                        "x-model-header": "model"
+                    },
+                    "routes": [{
+                        "name": "primary",
+                        "baseUrl": "https://anyrouter.top",
+                        "apiKey": "sk-test",
+                        "headers": {
+                            "x-model-header": "route"
+                        }
+                    }]
+                }]
+            }
+        });
+
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "MODEL_CLAUDE_4_SONNET_BYOK" }))
+                .unwrap();
+
+        assert_eq!(
+            route.extra_headers,
+            vec![
+                (
+                    "anthropic-beta".to_string(),
+                    "context-1m-2025-08-07".to_string()
+                ),
+                ("x-model-header".to_string(), "route".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn devin_json_upstream_drops_connect_rpc_headers() {
+        for header in [
+            "content-type",
+            "Content-Encoding",
+            "accept",
+            "te",
+            "connect-content-encoding",
+            "connect-timeout-ms",
+            "grpc-timeout",
+        ] {
+            assert!(
+                is_devin_connect_header_for_json_upstream(header),
+                "{header} should be rebuilt for Devin JSON upstream"
+            );
+        }
+
+        assert!(!is_devin_connect_header_for_json_upstream("user-agent"));
+        assert!(!is_devin_connect_header_for_json_upstream("anthropic-beta"));
+        assert!(!is_devin_connect_header_for_json_upstream("x-custom"));
     }
 
     #[test]
@@ -3057,6 +6513,15 @@ mod tests {
             rewrite_codex_responses_endpoint_to_chat("/v1/responses/compact?foo=bar");
 
         assert_eq!(endpoint, "/chat/completions?foo=bar");
+        assert_eq!(passthrough_query.as_deref(), Some("foo=bar"));
+    }
+
+    #[test]
+    fn rewrite_codex_chat_endpoint_to_responses_preserves_query() {
+        let (endpoint, passthrough_query) =
+            rewrite_codex_chat_endpoint_to_responses("/v1/chat/completions?foo=bar");
+
+        assert_eq!(endpoint, "/responses?foo=bar");
         assert_eq!(passthrough_query.as_deref(), Some("foo=bar"));
     }
 

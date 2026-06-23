@@ -169,13 +169,19 @@ export interface UsageRangeSelection {
  * `opencode` / `openclaw` / `hermes` have no proxy handler at all — they
  * appear only as managed apps elsewhere.
  */
-export type AppType = "claude" | "codex" | "gemini" | "opencode";
+export type AppType =
+  | "claude"
+  | "codex"
+  | "devin"
+  | "gemini"
+  | "opencode";
 
 export type AppTypeFilter = "all" | AppType;
 
 export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
   "claude",
   "codex",
+  "devin",
   "gemini",
   "opencode",
 ];
@@ -194,6 +200,7 @@ export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
  */
 export const CACHE_INCLUSIVE_APP_TYPES: ReadonlySet<string> = new Set([
   "codex",
+  "devin",
   "gemini",
 ]);
 
@@ -202,6 +209,7 @@ export interface CacheNormalizableLog {
   appType: string;
   inputTokens: number;
   cacheReadTokens: number;
+  cacheCreationTokens: number;
 }
 
 /**
@@ -217,6 +225,12 @@ export function getFreshInputTokens(log: CacheNormalizableLog): number {
     return log.inputTokens - log.cacheReadTokens;
   }
   return log.inputTokens;
+}
+
+export function getEffectiveInputTokens(log: CacheNormalizableLog): number {
+  return (
+    getFreshInputTokens(log) + log.cacheReadTokens + log.cacheCreationTokens
+  );
 }
 
 export const NON_NEGATIVE_DECIMAL_REGEX = /^\d+(?:\.\d+)?$/;

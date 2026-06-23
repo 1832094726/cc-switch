@@ -19,6 +19,7 @@ export const APP_IDS: AppId[] = [
   "claude",
   "claude-desktop",
   "codex",
+  "devin",
   "gemini",
   "opencode",
   "openclaw",
@@ -61,6 +62,14 @@ export const APP_ICON_MAP: Record<AppId, AppConfig> = {
       "bg-green-500/10 ring-1 ring-green-500/20 hover:bg-green-500/20 text-green-600 dark:text-green-400",
     badgeClass:
       "bg-green-500/10 text-green-700 dark:text-green-300 hover:bg-green-500/20 border-0 gap-1.5",
+  },
+  devin: {
+    label: "Devin",
+    icon: <ProviderIcon icon="openai" name="Devin" size={14} />,
+    activeClass:
+      "bg-cyan-500/10 ring-1 ring-cyan-500/20 hover:bg-cyan-500/20 text-cyan-600 dark:text-cyan-400",
+    badgeClass:
+      "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-500/20 border-0 gap-1.5",
   },
   gemini: {
     label: "Gemini",

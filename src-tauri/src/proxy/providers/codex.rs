@@ -26,6 +26,10 @@ pub struct CodexAdapter;
 /// OpenAI Chat Completions, even if the local Codex client is talking to CC
 /// Switch through the Responses API.
 pub fn codex_provider_uses_chat_completions(provider: &Provider) -> bool {
+    if is_joycode_local_chat_proxy_provider(provider) {
+        return true;
+    }
+
     if let Some(api_format) = provider
         .meta
         .as_ref()
@@ -73,6 +77,78 @@ pub fn codex_provider_uses_chat_completions(provider: &Provider) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether this Codex-like provider explicitly declares OpenAI Responses as
+/// its upstream wire API. This is intentionally stricter than
+/// `!codex_provider_uses_chat_completions`: a plain OpenAI-compatible base URL
+/// may support both APIs, so only provider metadata/config should force a
+/// Chat -> Responses request rewrite.
+pub fn codex_provider_uses_responses_api(provider: &Provider) -> bool {
+    if codex_provider_uses_chat_completions(provider) {
+        return false;
+    }
+
+    if let Some(api_format) = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_format.as_deref())
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("api_format")
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("apiFormat")
+                .and_then(|v| v.as_str())
+        })
+    {
+        return is_responses_wire_api(api_format);
+    }
+
+    if let Some(wire_api) = provider
+        .settings_config
+        .get("config")
+        .and_then(|v| v.as_str())
+        .and_then(extract_codex_wire_api_from_toml)
+    {
+        return is_responses_wire_api(&wire_api);
+    }
+
+    false
+}
+
+fn is_joycode_local_chat_proxy_provider(provider: &Provider) -> bool {
+    let haystack = codex_provider_identity_haystack(provider);
+    (haystack.contains("joycode-proxy") || haystack.contains("joycode proxy"))
+        && (haystack.contains("127.0.0.1:8081") || haystack.contains("localhost:8081"))
+}
+
+fn codex_provider_identity_haystack(provider: &Provider) -> String {
+    let mut parts = vec![provider.name.as_str()];
+
+    for key in ["base_url", "baseURL"] {
+        if let Some(value) = provider.settings_config.get(key).and_then(|v| v.as_str()) {
+            parts.push(value);
+        }
+    }
+
+    if let Some(value) = provider.settings_config.get("config") {
+        if let Some(config_text) = value.as_str() {
+            parts.push(config_text);
+        } else if let Some(base_url) = value.get("base_url").and_then(|v| v.as_str()) {
+            parts.push(base_url);
+        }
+    }
+
+    if let Some(value) = provider.website_url.as_deref() {
+        parts.push(value);
+    }
+
+    parts.join(" ").to_ascii_lowercase()
+}
+
 pub fn should_convert_codex_responses_to_chat(provider: &Provider, endpoint: &str) -> bool {
     let path = endpoint
         .split_once('?')
@@ -82,6 +158,15 @@ pub fn should_convert_codex_responses_to_chat(provider: &Provider, endpoint: &st
         path,
         "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
     ) && codex_provider_uses_chat_completions(provider)
+}
+
+pub fn should_convert_codex_chat_to_responses(provider: &Provider, endpoint: &str) -> bool {
+    let path = endpoint
+        .split_once('?')
+        .map_or(endpoint, |(path, _query)| path);
+
+    matches!(path, "/chat/completions" | "/v1/chat/completions")
+        && codex_provider_uses_responses_api(provider)
 }
 
 /// Extract the real upstream model configured for a Codex provider.
@@ -156,10 +241,15 @@ pub fn resolve_codex_chat_reasoning_config(
         .as_ref()
         .and_then(|meta| meta.codex_chat_reasoning.clone())
     {
-        return Some(normalize_codex_chat_reasoning_config(config));
+        return Some(apply_catalog_reasoning_default(
+            normalize_codex_chat_reasoning_config(config),
+            provider,
+            body,
+        ));
     }
 
     infer_codex_chat_reasoning_config(provider, body)
+        .map(|config| apply_catalog_reasoning_default(config, provider, body))
 }
 
 fn normalize_codex_chat_reasoning_config(
@@ -169,6 +259,55 @@ fn normalize_codex_chat_reasoning_config(
         config.supports_thinking = Some(true);
     }
     config
+}
+
+fn apply_catalog_reasoning_default(
+    mut config: CodexChatReasoningConfig,
+    provider: &Provider,
+    body: &JsonValue,
+) -> CodexChatReasoningConfig {
+    if config.default_enabled.is_none() {
+        config.default_enabled = catalog_model_thinking_enabled(provider, body);
+    }
+    config
+}
+
+fn catalog_model_thinking_enabled(provider: &Provider, body: &JsonValue) -> Option<bool> {
+    let request_model = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let upstream_model = codex_provider_upstream_model(provider);
+    let models = provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(|models| models.as_array())?;
+
+    request_model
+        .and_then(|request_model| catalog_model_thinking_enabled_by_name(models, request_model))
+        .or_else(|| {
+            upstream_model.as_deref().and_then(|upstream_model| {
+                catalog_model_thinking_enabled_by_name(models, upstream_model)
+            })
+        })
+}
+
+fn catalog_model_thinking_enabled_by_name(models: &[JsonValue], name: &str) -> Option<bool> {
+    for model in models {
+        let model_id = model.get("model").and_then(|value| value.as_str());
+        let model_upstream = model.get("upstreamModel").and_then(|value| value.as_str());
+        if model_id == Some(name) || model_upstream == Some(name) {
+            return Some(
+                model
+                    .get("thinkingEnabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+            );
+        }
+    }
+    None
 }
 
 fn infer_codex_chat_reasoning_config(
@@ -214,6 +353,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("reasoning_effort".to_string()),
             effort_value_mode: Some("deepseek".to_string()),
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         });
     }
@@ -228,6 +368,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("none".to_string()),
             effort_param: Some("reasoning_effort".to_string()),
             effort_value_mode: Some("low_high".to_string()),
+            default_enabled: None,
             output_format: Some("reasoning".to_string()),
         });
     }
@@ -239,6 +380,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         });
     }
@@ -250,6 +392,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         });
     }
@@ -261,6 +404,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("enable_thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         });
     }
@@ -272,6 +416,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("reasoning_split".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_details".to_string()),
         });
     }
@@ -283,6 +428,7 @@ fn infer_codex_chat_reasoning_config(
             thinking_param: Some("thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         });
     }
@@ -312,6 +458,7 @@ fn infer_aggregator_platform_config(
             thinking_param: Some("none".to_string()),
             effort_param: Some("reasoning.effort".to_string()),
             effort_value_mode: Some("openrouter".to_string()),
+            default_enabled: None,
             output_format: Some("auto".to_string()),
         });
     }
@@ -326,6 +473,7 @@ fn infer_aggregator_platform_config(
             thinking_param: Some("enable_thinking".to_string()),
             effort_param: Some("none".to_string()),
             effort_value_mode: None,
+            default_enabled: None,
             output_format: Some("reasoning_content".to_string()),
         });
     }
@@ -342,6 +490,13 @@ fn is_chat_wire_api(value: &str) -> bool {
             | "openai_chat"
             | "openai-chat"
             | "openai_chat_completions"
+    )
+}
+
+fn is_responses_wire_api(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "responses" | "response" | "openai_responses" | "openai-responses"
     )
 }
 
@@ -544,14 +699,22 @@ impl ProviderAdapter for CodexAdapter {
         let already_has_v1 = base_trimmed.ends_with("/v1");
         let origin_only = is_origin_only_url(base_trimmed);
 
+        // 检查 endpoint 是否是标准 OpenAI 格式 (v1/xxx, chat/completions, responses 等)
+        // 如果是自定义完整路径（如 /api/saas/...），则不应添加 /v1
+        let is_standard_openai_endpoint = endpoint_trimmed.starts_with("v1/")
+            || endpoint_trimmed.starts_with("chat/")
+            || endpoint_trimmed.starts_with("completions")
+            || endpoint_trimmed.starts_with("responses")
+            || endpoint_trimmed.starts_with("messages");
+
         let mut url = if already_has_v1 {
             // 已经有 /v1，直接拼接
             format!("{base_trimmed}/{endpoint_trimmed}")
-        } else if origin_only {
-            // 纯 origin，添加 /v1
+        } else if origin_only && is_standard_openai_endpoint {
+            // 纯 origin + 标准 endpoint，添加 /v1
             format!("{base_trimmed}/v1/{endpoint_trimmed}")
         } else {
-            // 自定义前缀，不添加 /v1，直接拼接
+            // 自定义前缀或非标准 endpoint，不添加 /v1，直接拼接
             format!("{base_trimmed}/{endpoint_trimmed}")
         };
 
@@ -788,6 +951,92 @@ wire_api = "chat"
     }
 
     #[test]
+    fn test_joycode_proxy_uses_responses_api_on_official_domain() {
+        let mut provider = create_provider(json!({
+            "auth": { "OPENAI_API_KEY": "sk-joycode-proxy" },
+            "config": r#"
+model_provider = "custom"
+model = "joycode-gpt"
+
+[model_providers.custom]
+name = "joycode-proxy"
+base_url = "https://joycode-api.jd.com/api/saas/openai/v2"
+wire_api = "responses"
+"#
+        }));
+        provider.name = "JoyCode".to_string();
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+
+        assert!(!codex_provider_uses_chat_completions(&provider));
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
+            "/responses"
+        ));
+        assert!(codex_provider_uses_responses_api(&provider));
+    }
+
+    #[test]
+    fn test_anyrouter_responses_provider_does_not_convert_to_chat() {
+        let mut provider = create_provider(json!({
+            "config": r#"
+model_provider = "custom"
+model = "gpt-5.5"
+
+[model_providers.custom]
+name = "Any Router"
+base_url = "https://a-ocnfniawgw.cn-shanghai.fcapp.run/v1"
+wire_api = "responses"
+"#
+        }));
+        provider.name = "Any Router".to_string();
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+
+        assert!(!codex_provider_uses_chat_completions(&provider));
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
+            "/responses"
+        ));
+        assert!(codex_provider_uses_responses_api(&provider));
+        assert!(should_convert_codex_chat_to_responses(
+            &provider,
+            "/v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn test_joycode_proxy_converts_chat_to_responses_on_official_domain() {
+        let mut provider = create_provider(json!({
+            "config": r#"
+model_provider = "custom"
+model = "joycode-gpt"
+
+[model_providers.custom]
+name = "joycode-proxy"
+base_url = "https://joycode-api.jd.com/api/saas/openai/v2"
+wire_api = "responses"
+"#
+        }));
+        provider.name = "JoyCode".to_string();
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+
+        assert!(!codex_provider_uses_chat_completions(&provider));
+        assert!(codex_provider_uses_responses_api(&provider));
+        assert!(should_convert_codex_chat_to_responses(
+            &provider,
+            "/chat/completions"
+        ));
+    }
+
+    #[test]
     fn test_apply_codex_chat_upstream_model_uses_provider_config_model() {
         let mut provider = create_provider(json!({
             "config": r#"
@@ -895,6 +1144,7 @@ wire_api = "chat"
                 thinking_param: Some("none".to_string()),
                 effort_param: Some("none".to_string()),
                 effort_value_mode: None,
+                default_enabled: None,
                 output_format: Some("auto".to_string()),
             }),
             ..Default::default()
@@ -907,6 +1157,37 @@ wire_api = "chat"
         assert_eq!(config.supports_thinking, Some(false));
         assert_eq!(config.supports_effort, Some(false));
         assert_eq!(config.thinking_param.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn test_resolve_codex_chat_reasoning_reads_catalog_default_thinking() {
+        let provider = create_provider(json!({
+            "config": r#"
+model_provider = "deepseek"
+model = "deepseek-v4-pro"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "https://api.deepseek.com"
+wire_api = "chat"
+"#,
+            "modelCatalog": {
+                "models": [
+                    { "model": "deepseek-v4-pro" },
+                    { "model": "deepseek-v4-lite", "thinkingEnabled": false }
+                ]
+            }
+        }));
+
+        let enabled =
+            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "deepseek-v4-pro" }))
+                .unwrap();
+        let disabled =
+            resolve_codex_chat_reasoning_config(&provider, &json!({ "model": "deepseek-v4-lite" }))
+                .unwrap();
+
+        assert_eq!(enabled.default_enabled, Some(true));
+        assert_eq!(disabled.default_enabled, Some(false));
     }
 
     #[test]

@@ -30,6 +30,21 @@ pub async fn stream_check_provider(
 
     // Copilot 端点是动态的（随 OAuth token 解析），需预先取出 host 再探测；
     // 其余供应商传 None，由服务层从 settings_config 提取 base_url。无需鉴权。
+    if app_type == AppType::Devin {
+        let mut provider = provider.clone();
+        let snippet = state.db.get_config_snippet("devin")?;
+        crate::devin_variables::apply_devin_common_variables(&mut provider, snippet.as_deref());
+        let results = StreamCheckService::check_devin_catalog(&provider, &config).await;
+        for result in &results {
+            let _ = state.db.save_stream_check_log(
+                &provider_id,
+                &provider.name,
+                app_type.as_str(),
+                result,
+            );
+        }
+        return Ok(StreamCheckService::summarize_results(&results));
+    }
     let base_url_override = resolve_copilot_base_url_override(provider, &copilot_state).await?;
     let result =
         StreamCheckService::check_with_retry(&app_type, provider, &config, base_url_override)
@@ -78,6 +93,20 @@ pub async fn stream_check_all_providers(
             }
         }
 
+        if app_type == AppType::Devin {
+            let mut provider = provider;
+            let snippet = state.db.get_config_snippet("devin")?;
+            crate::devin_variables::apply_devin_common_variables(&mut provider, snippet.as_deref());
+            let model_results = StreamCheckService::check_devin_catalog(&provider, &config).await;
+            for result in &model_results {
+                let _ =
+                    state
+                        .db
+                        .save_stream_check_log(&id, &provider.name, app_type.as_str(), result);
+            }
+            results.push((id, StreamCheckService::summarize_results(&model_results)));
+            continue;
+        }
         let base_url_override =
             resolve_copilot_base_url_override(&provider, &copilot_state).await?;
         let result =

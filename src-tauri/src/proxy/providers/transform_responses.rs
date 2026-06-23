@@ -142,6 +142,7 @@ pub fn anthropic_to_responses(
     // Inject prompt_cache_key for improved cache routing on OpenAI-compatible endpoints
     if let Some(key) = cache_key {
         result["prompt_cache_key"] = json!(key);
+        result["prompt_cache_retention"] = json!("24h");
     }
 
     // Codex OAuth (ChatGPT Plus/Pro 反代) 特殊协议约束：
@@ -381,7 +382,7 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
 /// - user/assistant 的 text 内容 → 对应 role 的 message item
 /// - tool_use 从 assistant message 中"提升"为独立的 function_call item
 /// - tool_result 从 user message 中"提升"为独立的 function_call_output item
-/// - thinking blocks → 丢弃
+/// - thinking blocks → 降级为带 cc-switch 标记的文本，避免目标协议丢上下文
 fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyError> {
     let mut input = Vec::new();
 
@@ -477,11 +478,7 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                                 .get("tool_use_id")
                                 .and_then(|i| i.as_str())
                                 .unwrap_or("");
-                            let output = match block.get("content") {
-                                Some(Value::String(s)) => s.clone(),
-                                Some(v) => canonical_json_string(v),
-                                None => String::new(),
-                            };
+                            let output = super::transform::degraded_tool_result_content(block);
 
                             input.push(json!({
                                 "type": "function_call_output",
@@ -490,8 +487,15 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
                             }));
                         }
 
-                        "thinking" => {
-                            // 丢弃 thinking blocks（与 openai_chat 一致）
+                        "thinking" | "redacted_thinking" => {
+                            if let Some(text) = super::transform::degraded_thinking_text(block) {
+                                let content_type = if role == "assistant" {
+                                    "output_text"
+                                } else {
+                                    "input_text"
+                                };
+                                message_content.push(json!({ "type": content_type, "text": text }));
+                            }
                         }
 
                         _ => {}
@@ -856,14 +860,41 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_to_responses_thinking_discarded() {
+    fn test_anthropic_to_responses_degrades_tool_result_error_flag() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "call_123", "content": "file missing", "is_error": true}
+                ]
+            }]
+        });
+
+        let result = anthropic_to_responses(input, None, false, false).unwrap();
+        let input_arr = result["input"].as_array().unwrap();
+        assert_eq!(input_arr[0]["type"], "function_call_output");
+        assert_eq!(input_arr[0]["call_id"], "call_123");
+        assert!(input_arr[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains(r#"<cc-switch:tool_result is_error="true">"#));
+        assert!(input_arr[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("file missing"));
+    }
+
+    #[test]
+    fn test_anthropic_to_responses_degrades_thinking() {
         let input = json!({
             "model": "gpt-4o",
             "max_tokens": 1024,
             "messages": [{
                 "role": "assistant",
                 "content": [
-                    {"type": "thinking", "thinking": "Let me think..."},
+                    {"type": "thinking", "thinking": "Let me think...", "signature": "sig_123"},
                     {"type": "text", "text": "The answer is 42"}
                 ]
             }]
@@ -872,10 +903,18 @@ mod tests {
         let result = anthropic_to_responses(input, None, false, false).unwrap();
         let input_arr = result["input"].as_array().unwrap();
 
-        // thinking should be discarded, only text remains
         assert_eq!(input_arr.len(), 1);
         assert_eq!(input_arr[0]["content"][0]["type"], "output_text");
-        assert_eq!(input_arr[0]["content"][0]["text"], "The answer is 42");
+        assert!(input_arr[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<cc-switch:thinking>"));
+        assert!(input_arr[0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<cc-switch:signature>sig_123</cc-switch:signature>"));
+        assert_eq!(input_arr[0]["content"][1]["type"], "output_text");
+        assert_eq!(input_arr[0]["content"][1]["text"], "The answer is 42");
     }
 
     #[test]
@@ -1114,6 +1153,7 @@ mod tests {
 
         let result = anthropic_to_responses(input, Some("my-provider-id"), false, false).unwrap();
         assert_eq!(result["prompt_cache_key"], "my-provider-id");
+        assert_eq!(result["prompt_cache_retention"], "24h");
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod commands;
 mod config;
 mod database;
 mod deeplink;
+mod devin_variables;
 mod error;
 mod gemini_config;
 mod gemini_mcp;
@@ -558,6 +559,14 @@ pub fn run() {
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("✗ Failed to seed official providers: {e}"),
+            }
+
+            match app_state.db.repair_devin_builtin_provider_catalogs() {
+                Ok(count) if count > 0 => {
+                    log::info!("✓ Repaired {count} Devin built-in provider catalog(s)");
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("✗ Failed to repair Devin provider catalogs: {e}"),
             }
 
             {
@@ -1688,7 +1697,7 @@ pub(crate) fn remove_tray_icon_before_exit(app_handle: &tauri::AppHandle) {
 async fn restore_proxy_state_on_startup(state: &store::AppState) {
     // 收集需要恢复接管的应用列表（从 proxy_config.enabled 读取）
     let mut apps_to_restore = Vec::new();
-    for app_type in ["claude", "codex", "gemini"] {
+    for app_type in ["claude", "codex", "gemini", "devin"] {
         if let Ok(config) = state.db.get_proxy_config_for_app(app_type).await {
             if config.enabled {
                 apps_to_restore.push(app_type);

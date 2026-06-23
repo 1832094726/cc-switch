@@ -28,6 +28,10 @@ import {
   type CodexProviderPreset,
 } from "@/config/codexProviderPresets";
 import {
+  devinProviderPresets,
+  type DevinProviderPreset,
+} from "@/config/devinProviderPresets";
+import {
   geminiProviderPresets,
   type GeminiProviderPreset,
 } from "@/config/geminiProviderPresets";
@@ -58,6 +62,7 @@ import {
   extractCodexWireApi,
   setCodexWireApi,
   setCodexModelName as setCodexModelNameInConfig,
+  updateCodexExperimentalBearerToken,
 } from "@/utils/providerConfigUtils";
 import { isNonNegativeDecimalString } from "@/types/usage";
 import { getCodexCustomTemplate } from "@/config/codexTemplates";
@@ -120,6 +125,7 @@ type PresetEntry = {
   preset:
     | ProviderPreset
     | CodexProviderPreset
+    | DevinProviderPreset
     | GeminiProviderPreset
     | OpenCodeProviderPreset
     | OpenClawProviderPreset
@@ -164,11 +170,102 @@ export const normalizeCodexCatalogModelsForSave = (
     const contextWindow = rawContextWindow
       ? Number.parseInt(rawContextWindow, 10)
       : undefined;
+    const upstreamModel = item.upstreamModel?.trim();
+    const endpoint = item.endpoint;
+    const provider =
+      item.provider ??
+      (endpoint === "/v1/messages"
+        ? "anthropic"
+        : endpoint === "/v1/responses" || endpoint === "/v1/chat/completions"
+          ? "openai"
+          : undefined);
+    const baseUrl = item.baseUrl?.trim();
+    const apiKey = item.apiKey?.trim();
+    const routeName = item.routeName?.trim();
+    const authHeader =
+      item.authHeader ??
+      (endpoint === "/v1/messages"
+        ? "x-api-key"
+        : endpoint === "/v1/responses" || endpoint === "/v1/chat/completions"
+          ? "bearer"
+          : undefined);
+    const headers =
+      item.headers && Object.keys(item.headers).length > 0
+        ? item.headers
+        : undefined;
+    const thinkingFields =
+      item.thinkingEnabled !== undefined
+        ? { thinkingEnabled: item.thinkingEnabled }
+        : {};
+    const responsesFields =
+      endpoint === "/v1/responses"
+        ? {
+            ...(item.responsesMode
+              ? { responsesMode: item.responsesMode }
+              : {}),
+            ...(item.responsesCodexCompat !== undefined
+              ? { responsesCodexCompat: item.responsesCodexCompat }
+              : {}),
+            ...(item.responsesFastMode !== undefined
+              ? { responsesFastMode: item.responsesFastMode }
+              : {}),
+          }
+        : {};
+    const routes =
+      baseUrl || apiKey
+        ? [
+            {
+              name: routeName || "primary",
+              baseUrl: baseUrl || "",
+              apiKey: apiKey || "",
+              enabled: true,
+              priority: 10,
+              ...(authHeader ? { authHeader } : {}),
+              ...(headers ? { headers } : {}),
+              ...responsesFields,
+              ...thinkingFields,
+            },
+          ]
+        : item.routes?.map((route, index) => ({
+            name: route.name?.trim() || `route_${index + 1}`,
+            baseUrl: route.baseUrl?.trim() || "",
+            apiKey: route.apiKey?.trim() || "",
+            enabled: route.enabled !== false,
+            priority:
+              typeof route.priority === "number" ? route.priority : 100 + index,
+            ...(route.authHeader ? { authHeader: route.authHeader } : {}),
+            ...(route.headers && Object.keys(route.headers).length > 0
+              ? { headers: route.headers }
+              : {}),
+            ...(route.responsesMode
+              ? { responsesMode: route.responsesMode }
+              : {}),
+            ...(route.responsesCodexCompat !== undefined
+              ? { responsesCodexCompat: route.responsesCodexCompat }
+              : {}),
+            ...(route.responsesFastMode !== undefined
+              ? { responsesFastMode: route.responsesFastMode }
+              : {}),
+            ...(route.thinkingEnabled !== undefined
+              ? { thinkingEnabled: route.thinkingEnabled }
+              : {}),
+          }));
 
     normalized.push({
       model,
       ...(displayName ? { displayName } : {}),
       ...(contextWindow && contextWindow > 0 ? { contextWindow } : {}),
+      ...(upstreamModel ? { upstreamModel } : {}),
+      ...(provider ? { provider } : {}),
+      ...(endpoint ? { endpoint } : {}),
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      ...(routeName ? { routeName } : {}),
+      ...(authHeader ? { authHeader } : {}),
+      ...(headers ? { headers } : {}),
+      ...responsesFields,
+      ...thinkingFields,
+      ...(routes && routes.length > 0 ? { routes } : {}),
     });
   }
 
@@ -262,6 +359,7 @@ function ProviderFormFull({
   const isEditMode = Boolean(initialData);
   const queryClient = useQueryClient();
   const { data: settingsData } = useSettingsQuery();
+  const isCodexLikeApp = appId === "codex" || appId === "devin";
   const showCommonConfigNotice =
     settingsData != null && settingsData.commonConfigConfirmed !== true;
 
@@ -300,7 +398,7 @@ function ProviderFormFull({
   const [endpointAutoSelect, setEndpointAutoSelect] = useState<boolean>(
     () => initialData?.meta?.endpointAutoSelect ?? true,
   );
-  const supportsFullUrl = appId === "claude" || appId === "codex";
+  const supportsFullUrl = appId === "claude" || isCodexLikeApp;
   const [localIsFullUrl, setLocalIsFullUrl] = useState<boolean>(() => {
     if (!supportsFullUrl) return false;
     return initialData?.meta?.isFullUrl ?? false;
@@ -365,7 +463,7 @@ function ProviderFormFull({
       notes: initialData?.notes ?? "",
       settingsConfig: initialData?.settingsConfig
         ? JSON.stringify(initialData.settingsConfig, null, 2)
-        : appId === "codex"
+        : isCodexLikeApp
           ? CODEX_DEFAULT_CONFIG
           : appId === "gemini"
             ? GEMINI_DEFAULT_CONFIG
@@ -576,12 +674,12 @@ function ProviderFormFull({
   );
 
   useEffect(() => {
-    if (appId === "codex" && !initialData && selectedPresetId === "custom") {
+    if (isCodexLikeApp && !initialData && selectedPresetId === "custom") {
       const template = getCodexCustomTemplate();
       resetCodexConfig(template.auth, template.config);
       setCodexChatReasoning({});
     }
-  }, [appId, initialData, selectedPresetId, resetCodexConfig]);
+  }, [isCodexLikeApp, initialData, selectedPresetId, resetCodexConfig]);
 
   useEffect(() => {
     form.reset(defaultValues);
@@ -610,6 +708,11 @@ function ProviderFormFull({
     if (appId === "codex") {
       return codexProviderPresets.map<PresetEntry>((preset, index) => ({
         id: `codex-${index}`,
+        preset,
+      }));
+    } else if (appId === "devin") {
+      return devinProviderPresets.map<PresetEntry>((preset, index) => ({
+        id: `devin-${index}`,
         preset,
       }));
     } else if (appId === "gemini") {
@@ -684,9 +787,11 @@ function ProviderFormFull({
   } = useCodexCommonConfig({
     codexConfig,
     onConfigChange: handleCodexConfigChange,
-    initialData: appId === "codex" ? initialData : undefined,
-    initialEnabled:
-      appId === "codex" ? initialData?.meta?.commonConfigEnabled : undefined,
+    appType: isCodexLikeApp ? appId : "codex",
+    initialData: isCodexLikeApp ? initialData : undefined,
+    initialEnabled: isCodexLikeApp
+      ? initialData?.meta?.commonConfigEnabled
+      : undefined,
     selectedPresetId: selectedPresetId ?? undefined,
   });
 
@@ -1130,7 +1235,7 @@ function ProviderFormFull({
             }),
           );
         }
-      } else if (appId === "codex") {
+      } else if (isCodexLikeApp) {
         if (!codexBaseUrl.trim()) {
           issues.push(
             t("providerForm.endpointRequired", {
@@ -1185,7 +1290,7 @@ function ProviderFormFull({
 
     let settingsConfig: string;
 
-    if (appId === "codex") {
+    if (isCodexLikeApp) {
       try {
         const authJson = JSON.parse(codexAuth);
         let normalizedCodexConfig =
@@ -1193,7 +1298,8 @@ function ProviderFormFull({
             ? setCodexWireApi(codexConfig ?? "", "responses")
             : (codexConfig ?? "");
         const normalizedCatalogModels =
-          category !== "official" && localCodexApiFormat === "openai_chat"
+          category !== "official" &&
+          (localCodexApiFormat === "openai_chat" || appId === "devin")
             ? normalizeCodexCatalogModelsForSave(codexCatalogModels)
             : [];
         // Sync first catalog row's model into config.toml so Codex uses it as default
@@ -1203,6 +1309,14 @@ function ProviderFormFull({
             normalizedCatalogModels[0].model,
           );
         }
+        const authApiKey =
+          typeof authJson?.OPENAI_API_KEY === "string"
+            ? authJson.OPENAI_API_KEY.trim()
+            : "";
+        normalizedCodexConfig = updateCodexExperimentalBearerToken(
+          normalizedCodexConfig,
+          authApiKey,
+        );
         const configObj = {
           auth: authJson,
           config: normalizedCodexConfig,
@@ -1358,7 +1472,7 @@ function ProviderFormFull({
       commonConfigEnabled:
         appId === "claude"
           ? useCommonConfig
-          : appId === "codex"
+          : isCodexLikeApp
             ? useCodexCommonConfigFlag
             : appId === "gemini"
               ? useGeminiCommonConfigFlag
@@ -1387,13 +1501,13 @@ function ProviderFormFull({
           : undefined,
       codexFastMode: isCodexOauthProvider ? codexFastMode : undefined,
       codexChatReasoning:
-        appId === "codex" &&
+        isCodexLikeApp &&
         category !== "official" &&
-        localCodexApiFormat === "openai_chat"
+        (appId === "devin" || localCodexApiFormat === "openai_chat")
           ? normalizeCodexChatReasoningForSave(codexChatReasoning)
           : undefined,
       customUserAgent:
-        (appId === "claude" || appId === "codex") && category !== "official"
+        (appId === "claude" || isCodexLikeApp) && category !== "official"
           ? customUserAgent.trim() || undefined
           : undefined,
       testConfig: testConfig.enabled ? testConfig : undefined,
@@ -1407,7 +1521,7 @@ function ProviderFormFull({
       apiFormat:
         appId === "claude" && category !== "official"
           ? localApiFormat
-          : appId === "codex" && category !== "official"
+          : isCodexLikeApp && category !== "official"
             ? localCodexApiFormat
             : undefined,
       apiKeyField:
@@ -1453,7 +1567,7 @@ function ProviderFormFull({
     isPartner: isCodexPartner,
     partnerPromotionKey: codexPartnerPromotionKey,
   } = useApiKeyLink({
-    appId: "codex",
+    appId: isCodexLikeApp ? appId : "codex",
     category,
     selectedPresetId,
     presetEntries,
@@ -1530,7 +1644,7 @@ function ProviderFormFull({
       setActivePreset(null);
       form.reset(defaultValues);
 
-      if (appId === "codex") {
+      if (isCodexLikeApp) {
         const template = getCodexCustomTemplate();
         resetCodexConfig(template.auth, template.config);
         setCodexChatReasoning({});
@@ -1568,8 +1682,8 @@ function ProviderFormFull({
       partnerPromotionKey: entry.preset.partnerPromotionKey,
     });
 
-    if (appId === "codex") {
-      const preset = entry.preset as CodexProviderPreset;
+    if (isCodexLikeApp) {
+      const preset = entry.preset as CodexProviderPreset | DevinProviderPreset;
       const auth = preset.auth ?? {};
       const config = preset.config ?? "";
 
@@ -2026,8 +2140,9 @@ function ProviderFormFull({
             />
           )}
 
-          {appId === "codex" && (
+          {isCodexLikeApp && (
             <CodexFormFields
+              appId={appId}
               providerId={providerId}
               codexApiKey={codexApiKey}
               onApiKeyChange={handleCodexApiKeyChange}
@@ -2176,7 +2291,7 @@ function ProviderFormFull({
           )}
 
           {/* 配置编辑器：Codex、Claude、Gemini 分别使用不同的编辑器 */}
-          {appId === "codex" ? (
+          {isCodexLikeApp ? (
             <>
               <CodexConfigEditor
                 authValue={codexAuth}

@@ -104,6 +104,21 @@ opt-level = "s"
 panic = "unwind"
 strip = "symbols"
 
+# ── dev 构建优化：加速增量编译 ──────────────────────────────
+# codegen-units 越大，并行度越高，编译越快（代价是运行时性能略降，dev 环境可接受）
+[profile.dev]
+codegen-units = 16
+debug = 0
+
+# 依赖 crate 用更高优化级别反而能加快编译（减少 LLVM IR 体积）
+[profile.dev.package."*"]
+opt-level = 0
+
+# 测试 profile 也加速
+[profile.test]
+codegen-units = 16
+debug = 0
+
 [dev-dependencies]
 serial_test = "3"
 tempfile = "3"

@@ -35,7 +35,7 @@ pub fn check_env_conflicts(app: &str) -> Result<Vec<EnvConflict>, String> {
 fn get_keywords_for_app(app: &str) -> Vec<&str> {
     match app.to_lowercase().as_str() {
         "claude" => vec!["ANTHROPIC"],
-        "codex" => vec!["OPENAI"],
+        "codex" | "devin" => vec!["OPENAI"],
         "gemini" => vec!["GEMINI", "GOOGLE_GEMINI"],
         _ => vec![],
     }

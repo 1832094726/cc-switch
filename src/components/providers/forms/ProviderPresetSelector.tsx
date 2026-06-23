@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import type { ProviderPreset } from "@/config/claudeProviderPresets";
 import type { CodexProviderPreset } from "@/config/codexProviderPresets";
+import type { DevinProviderPreset } from "@/config/devinProviderPresets";
 import type { GeminiProviderPreset } from "@/config/geminiProviderPresets";
 import type { ClaudeDesktopProviderPreset } from "@/config/claudeDesktopProviderPresets";
 import type { OpenCodeProviderPreset } from "@/config/opencodeProviderPresets";
@@ -40,6 +41,7 @@ export type PresetSortMode =
 export type AnyPreset =
   | ProviderPreset
   | CodexProviderPreset
+  | DevinProviderPreset
   | GeminiProviderPreset
   | ClaudeDesktopProviderPreset
   | OpenCodeProviderPreset

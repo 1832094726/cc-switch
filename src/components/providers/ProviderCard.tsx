@@ -76,7 +76,7 @@ function isOfficialProvider(provider: Provider, appId: AppId): boolean {
     const baseUrl = config?.env?.ANTHROPIC_BASE_URL;
     return !baseUrl || (typeof baseUrl === "string" && baseUrl.trim() === "");
   }
-  if (appId === "codex") {
+  if (appId === "codex" || appId === "devin") {
     // 无 OPENAI_API_KEY → 使用 Codex CLI 内置 OAuth（官方）
     const apiKey = config?.auth?.OPENAI_API_KEY;
     const bearerToken =
@@ -219,7 +219,16 @@ export function ProviderCard({
   const isCodexOauth =
     provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH;
   const codexNeedsRouting = useMemo(() => {
-    if (appId !== "codex" || provider.category === "official") return false;
+    if (appId === "devin") {
+      return provider.category !== "official";
+    }
+
+    if (
+      appId !== "codex" ||
+      provider.category === "official"
+    ) {
+      return false;
+    }
     if (provider.meta?.apiFormat === "openai_chat") return true;
     const config = (provider.settingsConfig as Record<string, any>)?.config;
     return (
@@ -399,13 +408,14 @@ export function ProviderCard({
                 </span>
               )}
 
-              {appId === "codex" && provider.category === "official" && (
+              {(appId === "codex" || appId === "devin") &&
+                provider.category === "official" && (
                 <span className="inline-flex items-center rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-700/60 dark:text-slate-200">
                   {t("codex.noRoutingSupport", {
                     defaultValue: "不支持路由",
                   })}
                 </span>
-              )}
+                )}
 
               {isProxyRunning && isInFailoverQueue && health && (
                 <ProviderHealthBadge

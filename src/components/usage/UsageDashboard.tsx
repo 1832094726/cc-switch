@@ -53,6 +53,7 @@ const REFRESH_INTERVAL_OPTIONS_MS = [0, 5000, 10000, 30000, 60000] as const;
 const APP_FILTER_ICON: Record<AppType, string> = {
   claude: "claude",
   codex: "openai",
+  devin: "devin",
   gemini: "gemini",
   opencode: "opencode",
 };

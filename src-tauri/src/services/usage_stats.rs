@@ -2070,6 +2070,9 @@ fn model_pricing_candidates(model_id: &str) -> Vec<String> {
         if let Some(stripped) = strip_reasoning_effort_suffix(&candidate) {
             queue.push(stripped);
         }
+        if let Some(stripped) = strip_joycode_quality_suffix(&candidate) {
+            queue.push(stripped);
+        }
         if candidate.starts_with("claude-") && candidate.contains('.') {
             queue.push(candidate.replace('.', "-"));
         }
@@ -2087,6 +2090,7 @@ fn clean_model_id_for_pricing(model_id: &str) -> String {
         .unwrap_or(model_id)
         .trim()
         .replace('@', "-")
+        .replace(' ', "-")
         .to_ascii_lowercase();
 
     normalized
@@ -2203,6 +2207,17 @@ fn strip_model_date_suffix(model_id: &str) -> Option<String> {
 
 fn strip_reasoning_effort_suffix(model_id: &str) -> Option<String> {
     for suffix in ["-minimal", "-low", "-medium", "-high", "-xhigh"] {
+        if let Some(stripped) = model_id.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                return Some(stripped.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn strip_joycode_quality_suffix(model_id: &str) -> Option<String> {
+    for suffix in ["-hq"] {
         if let Some(stripped) = model_id.strip_suffix(suffix) {
             if !stripped.is_empty() {
                 return Some(stripped.to_string());
@@ -3988,6 +4003,18 @@ mod tests {
         assert!(
             result.is_some(),
             "缺少专门 effort 价格时应回退到 gpt-5.4 基础模型定价"
+        );
+
+        // JoyCode 上游显示名：空格/点号/-hq 需要归一化到内置公开模型价格。
+        let result = find_model_pricing_row(&conn, "GPT 5.3-codex")?;
+        assert!(
+            result.is_some(),
+            "JoyCode GPT 5.3-codex 显示名应能匹配到 gpt-5.3-codex 定价"
+        );
+        let result = find_model_pricing_row(&conn, "Claude-Sonnet-4.6-hq")?;
+        assert!(
+            result.is_some(),
+            "JoyCode Claude-Sonnet-4.6-hq 应能匹配到 claude-sonnet-4-6 定价"
         );
 
         // Kimi Code 是订阅/额度模型，不应伪装成公开按 token 计费模型

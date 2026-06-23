@@ -167,6 +167,7 @@ export interface CodexChatReasoning {
   thinkingParam?: CodexChatThinkingParam;
   effortParam?: CodexChatEffortParam;
   effortValueMode?: CodexChatEffortValueMode;
+  defaultEnabled?: boolean;
   // 声明性字段：标注上游 reasoning 回传位置。当前提取靠穷举字段，未读取此值（think_tags 尚未接线）。
   outputFormat?: CodexChatReasoningOutputFormat;
 }
@@ -251,6 +252,31 @@ export interface CodexCatalogModel {
   model: string;
   displayName?: string;
   contextWindow?: string | number;
+  upstreamModel?: string;
+  provider?: "openai" | "anthropic";
+  endpoint?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  routeName?: string;
+  authHeader?: "bearer" | "x-api-key";
+  headers?: Record<string, string>;
+  responsesMode?: "standard" | "codex";
+  responsesCodexCompat?: boolean;
+  responsesFastMode?: boolean;
+  thinkingEnabled?: boolean;
+  routes?: Array<{
+    name?: string;
+    baseUrl?: string;
+    apiKey?: string;
+    enabled?: boolean;
+    priority?: number;
+    authHeader?: "bearer" | "x-api-key";
+    headers?: Record<string, string>;
+    responsesMode?: "standard" | "codex";
+    responsesCodexCompat?: boolean;
+    responsesFastMode?: boolean;
+    thinkingEnabled?: boolean;
+  }>;
 }
 
 // Claude 认证字段类型
@@ -261,6 +287,7 @@ export interface VisibleApps {
   claude: boolean;
   "claude-desktop": boolean;
   codex: boolean;
+  devin: boolean;
   gemini: boolean;
   opencode: boolean;
   openclaw: boolean;
@@ -389,6 +416,8 @@ export interface Settings {
   currentProviderClaudeDesktop?: string;
   // 当前 Codex 供应商 ID（优先于数据库 is_current）
   currentProviderCodex?: string;
+  // 当前 Devin 供应商 ID（优先于数据库 is_current）
+  currentProviderDevin?: string;
   // 当前 Gemini 供应商 ID（优先于数据库 is_current）
   currentProviderGemini?: string;
 
@@ -468,6 +497,7 @@ export interface McpApps {
   claude: boolean;
   "claude-desktop"?: boolean;
   codex: boolean;
+  devin?: boolean;
   gemini: boolean;
   opencode: boolean;
   openclaw: boolean;

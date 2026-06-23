@@ -147,7 +147,7 @@ impl Provider {
         let (base_url, api_key) = match app_type {
             // Codex keeps its key in `auth.OPENAI_API_KEY` and its base URL
             // inside a TOML `config` string, not in an `env` map.
-            AppType::Codex => {
+            AppType::Codex | AppType::Devin => {
                 let auth = settings.get("auth");
                 let config_text = settings.get("config").and_then(|v| v.as_str());
                 let api_key = crate::codex_config::extract_codex_api_key(auth, config_text)
@@ -313,6 +313,12 @@ pub struct ProviderTestConfig {
     /// 最大重试次数
     #[serde(rename = "maxRetries", skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// 测试用 prompt（仅 devin 流式检查使用）
+    #[serde(rename = "testPrompt", skip_serializing_if = "Option::is_none")]
+    pub test_prompt: Option<String>,
+    /// 测试模型（仅 devin 流式检查使用）
+    #[serde(rename = "testModel", skip_serializing_if = "Option::is_none")]
+    pub test_model: Option<String>,
 }
 
 /// 认证绑定来源
@@ -375,6 +381,8 @@ pub struct CodexChatReasoningConfig {
     pub effort_param: Option<String>,
     #[serde(rename = "effortValueMode", skip_serializing_if = "Option::is_none")]
     pub effort_value_mode: Option<String>,
+    #[serde(rename = "defaultEnabled", skip_serializing_if = "Option::is_none")]
+    pub default_enabled: Option<bool>,
     /// 声明性字段：标注上游 reasoning 的回传位置（reasoning_content / reasoning /
     /// reasoning_details / think_tags）。当前响应侧 `extract_reasoning_field_text`
     /// 靠穷举字段提取、并不读取本字段；保留作文档说明与未来按格式分发（如 think_tags）的预留。

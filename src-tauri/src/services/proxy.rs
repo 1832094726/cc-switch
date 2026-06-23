@@ -598,6 +598,12 @@ impl ProxyService {
             .await
             .map(|c| c.enabled)
             .unwrap_or(false);
+        let devin_enabled = self
+            .db
+            .get_proxy_config_for_app("devin")
+            .await
+            .map(|c| c.enabled)
+            .unwrap_or(false);
         // OpenCode and OpenClaw don't support proxy features, always return false
         let opencode_enabled = false;
         let openclaw_enabled = false;
@@ -606,6 +612,7 @@ impl ProxyService {
             claude: claude_enabled,
             codex: codex_enabled,
             gemini: gemini_enabled,
+            devin: devin_enabled,
             opencode: opencode_enabled,
             openclaw: openclaw_enabled,
         })
@@ -619,6 +626,10 @@ impl ProxyService {
         let app = AppType::from_str(app_type).map_err(|e| format!("无效的应用类型: {e}"))?;
         let app_type_str = app.as_str();
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
+
+        if matches!(app, AppType::Devin) {
+            return self.set_devin_takeover(enabled).await;
+        }
 
         if enabled {
             // 1) 代理服务未运行则自动启动
@@ -787,6 +798,62 @@ impl ProxyService {
 
             if self.is_running().await {
                 // 此时没有任何 app 处于接管状态，停止服务即可
+                let _ = self.stop().await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn set_devin_takeover(&self, enabled: bool) -> Result<(), String> {
+        let app_type_str = AppType::Devin.as_str();
+
+        if enabled {
+            if !self.is_running().await {
+                self.start().await?;
+            }
+
+            let mut config = self
+                .db
+                .get_proxy_config_for_app(app_type_str)
+                .await
+                .map_err(|e| format!("获取 devin 配置失败: {e}"))?;
+            config.enabled = true;
+            self.db
+                .update_proxy_config_for_app(config)
+                .await
+                .map_err(|e| format!("设置 devin enabled 状态失败: {e}"))?;
+            let _ = self.db.set_live_takeover_active(true).await;
+            return Ok(());
+        }
+
+        let mut config = self
+            .db
+            .get_proxy_config_for_app(app_type_str)
+            .await
+            .map_err(|e| format!("获取 devin 配置失败: {e}"))?;
+        if !config.enabled {
+            return Ok(());
+        }
+
+        config.enabled = false;
+        self.db
+            .update_proxy_config_for_app(config)
+            .await
+            .map_err(|e| format!("清除 devin enabled 状态失败: {e}"))?;
+        self.db
+            .clear_provider_health_for_app(app_type_str)
+            .await
+            .map_err(|e| format!("清除 devin 健康状态失败: {e}"))?;
+
+        let any_enabled = self
+            .db
+            .is_live_takeover_active()
+            .await
+            .map_err(|e| format!("检查接管状态失败: {e}"))?;
+        if !any_enabled {
+            let _ = self.db.set_live_takeover_active(false).await;
+            if self.is_running().await {
                 let _ = self.stop().await;
             }
         }
@@ -1091,7 +1158,7 @@ impl ProxyService {
             .map_err(|e| format!("清除接管状态失败: {e}"))?;
 
         // 4. 清除所有应用的 enabled 状态（用户手动关闭，不需要下次自动恢复）
-        for app_type in ["claude", "codex", "gemini"] {
+        for app_type in ["claude", "codex", "gemini", "devin"] {
             if let Ok(mut config) = self.db.get_proxy_config_for_app(app_type).await {
                 if config.enabled {
                     config.enabled = false;
@@ -1869,7 +1936,7 @@ impl ProxyService {
     /// 检查是否处于 Live 接管模式
     pub async fn is_takeover_active(&self) -> Result<bool, String> {
         let status = self.get_takeover_status().await?;
-        Ok(status.claude || status.codex || status.gemini)
+        Ok(status.claude || status.codex || status.devin || status.gemini)
     }
 
     /// 从异常退出中恢复（启动时调用）

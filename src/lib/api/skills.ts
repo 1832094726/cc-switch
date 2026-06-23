@@ -6,6 +6,7 @@ export type AppType =
   | "claude"
   | "claude-desktop"
   | "codex"
+  | "devin"
   | "gemini"
   | "opencode"
   | "openclaw"
@@ -16,6 +17,7 @@ export interface SkillApps {
   claude: boolean;
   "claude-desktop"?: boolean;
   codex: boolean;
+  devin?: boolean;
   gemini: boolean;
   opencode: boolean;
   openclaw: boolean;

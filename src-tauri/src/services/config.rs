@@ -136,6 +136,9 @@ impl ConfigService {
             AppType::Hermes => {
                 // Hermes uses additive mode, no live sync needed
             }
+            AppType::Devin => {
+                // Devin is a local routing namespace only; no client live config is written.
+            }
         }
 
         Ok(())

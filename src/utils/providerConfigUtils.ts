@@ -178,7 +178,7 @@ export const getApiKeyFromConfig = (
     }
 
     // Codex API Key
-    if (appType === "codex") {
+    if (appType === "codex" || appType === "devin") {
       const codexKey = env.CODEX_API_KEY;
       return typeof codexKey === "string" ? codexKey : "";
     }
@@ -262,7 +262,7 @@ export const hasApiKeyField = (
       return Object.prototype.hasOwnProperty.call(env, "GEMINI_API_KEY");
     }
 
-    if (appType === "codex") {
+    if (appType === "codex" || appType === "devin") {
       return Object.prototype.hasOwnProperty.call(env, "CODEX_API_KEY");
     }
 
@@ -314,7 +314,7 @@ export const setApiKeyInConfig = (
     }
 
     // Codex API Key
-    if (appType === "codex") {
+    if (appType === "codex" || appType === "devin") {
       if ("CODEX_API_KEY" in env) {
         env.CODEX_API_KEY = apiKey;
       } else if (createIfMissing) {

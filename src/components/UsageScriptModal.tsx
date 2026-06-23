@@ -228,8 +228,8 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
               env.GOOGLE_API_KEY,
             baseUrl: env.ANTHROPIC_BASE_URL,
           };
-        } else if (appId === "codex") {
-          // Codex: { auth: { OPENAI_API_KEY }, config: TOML string with base_url }
+        } else if (appId === "codex" || appId === "devin") {
+          // Codex-like: { auth: { OPENAI_API_KEY }, config: TOML string with base_url }
           const auth = (config as any).auth || {};
           const configToml = (config as any).config || "";
           const apiKey =

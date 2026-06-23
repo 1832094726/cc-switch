@@ -208,13 +208,42 @@ pub async fn handle_streaming(
         status.as_u16(),
         format_headers(response.headers())
     );
-    // 检查流式响应是否被压缩（SSE 通常不压缩，如果压缩则 SSE 解析会失败）
+    // 检查流式响应是否被压缩。部分 JoyCode gateway 会无视
+    // Accept-Encoding: identity 返回 gzip SSE；先整包解压再返回，避免下游 UI
+    // 看到压缩字节。
     if let Some(encoding) = get_content_encoding(response.headers()) {
         log::warn!(
-            "[{}] 流式响应含 content-encoding={encoding}，SSE 解析可能失败。\
-             上游在 accept-encoding 透传后压缩了 SSE 流。",
+            "[{}] 流式响应含 content-encoding={encoding}，将整包读取并解压后返回。",
             ctx.tag
         );
+        let body_timeout = if ctx.app_config.streaming_idle_timeout > 0 {
+            Duration::from_secs(ctx.app_config.streaming_idle_timeout as u64)
+        } else {
+            Duration::ZERO
+        };
+        return match read_decoded_body(response, ctx.tag, body_timeout).await {
+            Ok((mut response_headers, status, body_bytes)) => {
+                strip_hop_by_hop_response_headers(&mut response_headers);
+                let mut builder = axum::response::Response::builder().status(status);
+                for (key, value) in response_headers.iter() {
+                    builder = builder.header(key, value);
+                }
+                match builder.body(axum::body::Body::from(body_bytes)) {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        log::error!("[{}] 构建解压流式响应失败: {e}", ctx.tag);
+                        ProxyError::Internal(format!(
+                            "Failed to build decoded streaming response: {e}"
+                        ))
+                        .into_response()
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[{}] 解压流式响应失败: {e}", ctx.tag);
+                e.into_response()
+            }
+        };
     }
 
     let mut response_headers = response.headers().clone();
@@ -502,12 +531,33 @@ impl Drop for SseUsageFinishGuard {
     }
 }
 
+fn sse_json_payloads(data: &str) -> Vec<&str> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() || trimmed == "[DONE]" {
+        return Vec::new();
+    }
+
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return vec![trimmed];
+    }
+
+    data.lines()
+        .filter_map(|line| strip_sse_field(line.trim_start(), "data"))
+        .map(str::trim)
+        .filter(|payload| {
+            !payload.is_empty()
+                && *payload != "[DONE]"
+                && (payload.starts_with('{') || payload.starts_with('['))
+        })
+        .collect()
+}
+
 // ============================================================================
 // 内部辅助函数
 // ============================================================================
 
 /// 创建使用量收集器
-fn create_usage_collector(
+pub(crate) fn create_usage_collector(
     ctx: &RequestContext,
     state: &ProxyState,
     status_code: u16,
@@ -573,31 +623,6 @@ fn create_usage_collector(
                     .await;
                 });
             } else {
-                let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
-                let state = state.clone();
-                let provider_id = provider_id.clone();
-                let session_id = session_id.clone();
-                let request_model = request_model.clone();
-                let outbound_model = fallback_model.clone();
-
-                tokio::spawn(async move {
-                    log_usage_internal(
-                        &state,
-                        &provider_id,
-                        app_type_str,
-                        &model,
-                        &request_model,
-                        &outbound_model,
-                        TokenUsage::default(),
-                        latency_ms,
-                        first_token_ms,
-                        true, // is_streaming
-                        status_code,
-                        Some(session_id),
-                    )
-                    .await;
-                });
                 log::debug!("[{tag}] 流式响应缺少 usage 统计，跳过消费记录");
             }
         },
@@ -788,6 +813,9 @@ pub fn create_logged_passthrough_stream(
                             "[{tag}] 已接收上游流式首包: bytes={}",
                             bytes.len()
                         );
+                        // 打印首包内容预览（前 200 字节）
+                        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
+                        log::debug!("[{tag}] 首包内容预览: {}", preview);
                     }
                     is_first_chunk = false;
                     if inspect_sse_events {
@@ -801,14 +829,24 @@ pub fn create_logged_passthrough_stream(
                                     if let Some(data) = strip_sse_field(line, "data") {
                                         if data.trim() != "[DONE]" {
                                             let collected = match &collector {
-                                                Some(c) if c.should_collect(data) => {
-                                                    match serde_json::from_str::<Value>(data) {
-                                                        Ok(json_value) => {
-                                                            c.push(json_value).await;
-                                                            true
+                                                Some(c) => {
+                                                    let mut pushed = false;
+                                                    for payload in sse_json_payloads(data) {
+                                                        if c.should_collect(payload) {
+                                                            match serde_json::from_str::<Value>(payload) {
+                                                                Ok(json_value) => {
+                                                                    c.push(json_value).await;
+                                                                    pushed = true;
+                                                                }
+                                                                Err(e) => {
+                                                                    log::debug!(
+                                                                        "[{tag}] SSE usage JSON 解析失败: {e}; payload={payload}"
+                                                                    );
+                                                                }
+                                                            }
                                                         }
-                                                        Err(_) => false,
                                                     }
+                                                    pushed
                                                 }
                                                 _ => false,
                                             };
@@ -931,6 +969,47 @@ mod tests {
             Some("message_start")
         );
         assert_eq!(super::strip_sse_field("id:1", "data"), None);
+    }
+
+    #[test]
+    fn sse_json_payloads_accepts_plain_json_data() {
+        assert_eq!(
+            sse_json_payloads(r#"{"type":"message_delta","usage":{"output_tokens":50}}"#),
+            vec![r#"{"type":"message_delta","usage":{"output_tokens":50}}"#]
+        );
+        assert!(sse_json_payloads("[DONE]").is_empty());
+    }
+
+    #[test]
+    fn sse_json_payloads_unwraps_nested_joycode_data_line() {
+        let data = concat!(
+            "data: {\"type\":\"message_delta\",",
+            "\"usage\":{\"input_tokens\":64809,",
+            "\"cache_creation_input_tokens\":0,",
+            "\"cache_read_input_tokens\":0,",
+            "\"output_tokens\":208}}"
+        );
+
+        assert_eq!(
+            sse_json_payloads(data),
+            vec![
+                "{\"type\":\"message_delta\",\"usage\":{\"input_tokens\":64809,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":208}}"
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_json_payloads_unwraps_nested_joycode_event_block() {
+        let data = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",",
+            "\"usage\":{\"output_tokens\":208}}\n"
+        );
+
+        assert_eq!(
+            sse_json_payloads(data),
+            vec![r#"{"type":"message_delta","usage":{"output_tokens":208}}"#]
+        );
     }
 
     #[test]
