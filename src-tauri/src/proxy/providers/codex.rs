@@ -710,10 +710,14 @@ impl ProviderAdapter for CodexAdapter {
         let mut url = if already_has_v1 {
             // 已经有 /v1，直接拼接
             format!("{base_trimmed}/{endpoint_trimmed}")
-        } else if origin_only && is_standard_openai_endpoint {
-            // 纯 origin + 标准 endpoint，添加 /v1
-            format!("{base_trimmed}/v1/{endpoint_trimmed}")
-        } else {
+       } else if origin_only && is_standard_openai_endpoint {
+           // 纯 origin + 标准 endpoint，添加 /v1
+           format!("{base_trimmed}/v1/{endpoint_trimmed}")
+      } else if !origin_only && endpoint_trimmed.starts_with("v1/") {
+          // base_url 有自定义路径前缀（如 /api/coding/paas/v4），
+          // endpoint 不应再叠加 /v1 前缀，否则会产生 /v4/v1/chat/completions
+          format!("{}/{}", base_trimmed, &endpoint_trimmed[3..])
+       } else {
             // 自定义前缀或非标准 endpoint，不添加 /v1，直接拼接
             format!("{base_trimmed}/{endpoint_trimmed}")
         };
