@@ -879,35 +879,28 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_to_responses_degrades_thinking() {
-        let input = json!({
-            "model": "gpt-4o",
-            "max_tokens": 1024,
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": "Let me think...", "signature": "sig_123"},
-                    {"type": "text", "text": "The answer is 42"}
-                ]
-            }]
-        });
+   fn test_anthropic_to_responses_degrades_thinking() {
+       let input = json!({
+           "model": "gpt-4o",
+           "max_tokens": 1024,
+           "messages": [{
+               "role": "assistant",
+               "content": [
+                   {"type": "thinking", "thinking": "Let me think...", "signature": "sig_123"},
+                   {"type": "text", "text": "The answer is 42"}
+               ]
+           }]
+       });
 
-        let result = anthropic_to_responses(input, None, false, false).unwrap();
-        let input_arr = result["input"].as_array().unwrap();
+       let result = anthropic_to_responses(input, None, false, false).unwrap();
+       let input_arr = result["input"].as_array().unwrap();
 
-        assert_eq!(input_arr.len(), 1);
+       assert_eq!(input_arr.len(), 1);
+        // Thinking blocks are now dropped — only visible text should remain.
+        assert_eq!(input_arr[0]["content"].as_array().unwrap().len(), 1);
         assert_eq!(input_arr[0]["content"][0]["type"], "output_text");
-        assert!(input_arr[0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("<cc-switch:thinking>"));
-        assert!(input_arr[0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("<cc-switch:signature>sig_123</cc-switch:signature>"));
-        assert_eq!(input_arr[0]["content"][1]["type"], "output_text");
-        assert_eq!(input_arr[0]["content"][1]["text"], "The answer is 42");
-    }
+        assert_eq!(input_arr[0]["content"][0]["text"], "The answer is 42");
+   }
 
     #[test]
     fn test_anthropic_to_responses_image() {
