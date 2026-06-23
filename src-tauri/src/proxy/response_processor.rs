@@ -8,7 +8,7 @@ use super::{
     handler_context::{RequestContext, StreamingTimeoutConfig},
     hyper_client::ProxyResponse,
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{append_utf8_safe, strip_sse_field, take_sse_block},
     usage::parser::TokenUsage,
     ProxyError,
 };
@@ -547,9 +547,61 @@ fn sse_json_payloads(data: &str) -> Vec<&str> {
         .filter(|payload| {
             !payload.is_empty()
                 && *payload != "[DONE]"
-                && (payload.starts_with('{') || payload.starts_with('['))
+        && (payload.starts_with('{') || payload.starts_with('['))
         })
         .collect()
+}
+
+/// 从 SSE data 行中剥离 `reasoning_content` 字段。
+///
+/// 上游 (如 glm-5.2) 会把完整 reasoning 冗余地塞进每个 function_call item，
+/// 膨胀响应体数倍、拖慢流式传输，并增加 function_call_arguments 被截断的风险。
+fn strip_reasoning_content_from_sse_data(data: &str) -> Option<String> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('{') {
+        return None;
+    }
+    let mut json: Value = serde_json::from_str(trimmed).ok()?;
+    let obj = json.as_object_mut()?;
+    let mut changed = false;
+    if obj.remove("reasoning_content").is_some() {
+        changed = true;
+    }
+    if let Some(item) = obj.get_mut("item").and_then(|v| v.as_object_mut()) {
+        if item.remove("reasoning_content").is_some() {
+            changed = true;
+        }
+    }
+    if changed {
+        Some(serde_json::to_string(&json).unwrap_or_else(|_| trimmed.to_string()))
+    } else {
+        None
+    }
+}
+
+/// 重建 SSE 事件块：从 data 行中剥离 reasoning_content 后，
+/// 保留原有 event/id 行结构。
+fn rebuild_sse_block(block: &str) -> Option<String> {
+    let mut has_data = false;
+    let mut out_lines = Vec::new();
+    for line in block.lines() {
+        if let Some(data) = strip_sse_field(line.trim_start(), "data") {
+            has_data = true;
+            if data.trim() == "[DONE]" {
+                out_lines.push(format!("data: {data}"));
+            } else if let Some(cleaned) = strip_reasoning_content_from_sse_data(data) {
+                out_lines.push(format!("data: {cleaned}"));
+            } else {
+                out_lines.push(line.to_string());
+            }
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    if !has_data {
+        return None;
+    }
+    Some(out_lines.join("\n") + "\n\n")
 }
 
 // ============================================================================
@@ -765,7 +817,7 @@ pub fn create_logged_passthrough_stream(
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
             collector.is_some() || log::log_enabled!(log::Level::Debug);
-        let mut is_first_chunk = true;
+       let mut is_first_chunk = true;
 
         // 超时配置
         let first_byte_timeout = if timeout_config.first_byte_timeout > 0 {
@@ -817,9 +869,12 @@ pub fn create_logged_passthrough_stream(
                         let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
                         log::debug!("[{tag}] 首包内容预览: {}", preview);
                     }
-                    is_first_chunk = false;
-                    if inspect_sse_events {
-                        crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                   is_first_chunk = false;
+                   if inspect_sse_events {
+                        append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+
+                        // 收集过滤后的完整 SSE 块
+                        let mut pending_output = String::new();
 
                         // 尝试解析并记录完整的 SSE 事件
                         while let Some(event_text) = take_sse_block(&mut buffer) {
@@ -861,10 +916,22 @@ pub fn create_logged_passthrough_stream(
                                     }
                                 }
                             }
+                            // 重建 SSE 块（剥离冗余 reasoning_content），加入待输出
+                            if let Some(cleaned) = rebuild_sse_block(&event_text) {
+                                pending_output.push_str(&cleaned);
+                            } else {
+                                pending_output.push_str(&event_text);
+                                pending_output.push_str("\n\n");
+                            }
                         }
-                    }
 
-                    yield Ok(bytes);
+                        // 输出过滤后的完整块；不完整数据留在 buffer 等下一轮
+                        if !pending_output.is_empty() {
+                            yield Ok(Bytes::from(pending_output.into_bytes()));
+                        }
+                    } else {
+                        yield Ok(bytes);
+                    }
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
@@ -872,7 +939,10 @@ pub fn create_logged_passthrough_stream(
                     break;
                 }
                 None => {
-                    // 流正常结束
+                    // 流正常结束，flush 缓冲区中残余数据
+                    if !buffer.is_empty() {
+                        yield Ok(Bytes::from(buffer.into_bytes()));
+                    }
                     break;
                 }
             }
@@ -902,6 +972,46 @@ fn format_headers(headers: &HeaderMap) -> String {
 mod tests {
     use super::*;
     use crate::database::Database;
+
+    #[test]
+    fn strip_reasoning_content_from_function_call_item() {
+        let data = r#"{"type":"response.output_item.done","output_index":2,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","reasoning_content":"long reasoning that bloats response"}}"#;
+        let cleaned = strip_reasoning_content_from_sse_data(data).unwrap();
+        let json: Value = serde_json::from_str(&cleaned).unwrap();
+        assert!(json["item"]["reasoning_content"].is_null());
+        assert_eq!(json["item"]["name"], "exec_command");
+    }
+
+    #[test]
+    fn strip_reasoning_content_from_top_level() {
+        let data = r#"{"type":"response.completed","reasoning_content":"should be removed","response":{"id":"resp_1"}}"#;
+        let cleaned = strip_reasoning_content_from_sse_data(data).unwrap();
+        let json: Value = serde_json::from_str(&cleaned).unwrap();
+        assert!(json.get("reasoning_content").is_none());
+        assert_eq!(json["response"]["id"], "resp_1");
+    }
+
+    #[test]
+    fn strip_reasoning_content_noop_without_field() {
+        let data = r#"{"type":"response.output_text.delta","delta":"hello"}"#;
+        assert!(strip_reasoning_content_from_sse_data(data).is_none());
+    }
+
+    #[test]
+    fn rebuild_sse_block_strips_reasoning() {
+        let block = "event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\",\"reasoning_content\":\"bloated\"}}";
+        let rebuilt = rebuild_sse_block(block).unwrap();
+        assert!(!rebuilt.contains("reasoning_content"));
+        assert!(rebuilt.contains("event:"));
+    }
+
+    #[test]
+    fn rebuild_sse_block_preserves_non_json() {
+        let block = "data: [DONE]";
+        let rebuilt = rebuild_sse_block(block).unwrap();
+        assert_eq!(rebuilt.trim(), "data: [DONE]");
+    }
+
     use crate::error::AppError;
     use crate::provider::ProviderMeta;
     use crate::proxy::failover_switch::FailoverSwitchManager;
