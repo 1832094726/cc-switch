@@ -130,11 +130,9 @@ cleanup_stale_artifacts() {
   fi
 
   log "target ${current_mb}MB > ${threshold_mb}MB, cleaning orphaned artifacts..."
-  # cargo-sweep 需要传入包含 Cargo.toml 的项目目录，而非 target 目录本身。
-  # 用 || true 防止 sweep 失败时（set -e）中断整个启动流程。
-  "$sweep_bin" sweep --maxsize "${max_size}GB" "$ROOT_DIR/src-tauri" 2>&1 | while IFS= read -r line; do
+  "$sweep_bin" sweep --maxsize "${max_size}GB" "$CARGO_TARGET_DIR" 2>&1 | while IFS= read -r line; do
     log "$line"
-  done || true
+  done
   local after_bytes
   after_bytes="$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1)"
   local freed_mb=$(( (before_bytes - after_bytes) / 1024 ))

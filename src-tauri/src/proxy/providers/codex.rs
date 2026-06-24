@@ -205,6 +205,44 @@ fn codex_provider_catalog_model_ids(provider: &Provider) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Look up the `upstreamModel` for a catalog entry by model name.
+fn codex_catalog_upstream_model_for(provider: &Provider, model: &str) -> Option<String> {
+    provider
+        .settings_config
+        .get("modelCatalog")
+        .and_then(|catalog| catalog.get("models"))
+        .and_then(|models| models.as_array())?
+        .iter()
+        .find(|entry| {
+            entry
+                .get("model")
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .is_some_and(|m| m == model)
+        })
+        .and_then(|entry| {
+            entry
+                .get("upstreamModel")
+                .or_else(|| entry.get("upstream_model"))
+                .and_then(JsonValue::as_str)
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(ToString::to_string)
+        })
+}
+
+/// Detect small model aliases that should not be overridden to the upstream
+/// primary model (e.g. glm-5.2), to avoid routing cheap background tasks to
+/// expensive upstream providers.
+fn is_codex_small_model_alias(model: &str) -> bool {
+    matches!(
+        model.trim(),
+        "MODEL_GPT_5_NANO"
+            | "MODEL_GOOGLE_GEMINI_2_5_FLASH"
+            | "MODEL_CHAT_GPT_4_1_MINI_2025_04_14"
+    )
+}
+
 /// For Codex Chat providers, ensure the request uses the configured upstream
 /// model before converting the request to Chat Completions.
 pub fn apply_codex_chat_upstream_model(
@@ -223,7 +261,26 @@ pub fn apply_codex_chat_upstream_model(
         .filter(|model| !model.is_empty())
     {
         if catalog_model_ids.contains(request_model) {
+            // Catalog entry found — check for an upstreamModel override
+            // so that alias names (e.g. gpt-5.4) are translated to the
+            // real upstream model (e.g. glm-5.2) before forwarding.
+            if let Some(upstream) = codex_catalog_upstream_model_for(provider, request_model) {
+                if upstream != request_model {
+                    log::info!(
+                        "[Codex] Catalog model '{request_model}' mapped to upstream model '{upstream}'"
+                    );
+                    body["model"] = JsonValue::String(upstream.clone());
+                    return Some(upstream);
+                }
+            }
             return Some(request_model.to_string());
+        }
+
+        if is_codex_small_model_alias(request_model) {
+            log::info!(
+                "[Codex] Small model '{request_model}' requested, skipping upstream model override"
+            );
+            return None;
         }
     }
 
