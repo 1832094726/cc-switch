@@ -17,6 +17,50 @@ log() {
   printf '[cc-switch-dev] %s\n' "$*"
 }
 
+# ── 环境自检 ──────────────────────────────────────────
+# 确保 Node.js 可用且版本 >= 18
+ensure_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    log "ERROR: node not found in PATH"
+    log "install Node.js 18+ (e.g. via nvm or https://nodejs.org)"
+    exit 1
+  fi
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  if (( major < 18 )); then
+    log "ERROR: node v$(node -v) is too old, need v18+"
+    exit 1
+  fi
+  log "node: $(node -v)"
+}
+
+# 解析 pnpm 命令——优先用全局 pnpm，其次 corepack，最后 npx 兜底
+resolve_pnpm() {
+  if command -v pnpm >/dev/null 2>&1; then
+    PNPM_CMD="pnpm"
+  elif corepack --version >/dev/null 2>&1; then
+    PNPM_CMD="corepack pnpm"
+  else
+    PNPM_CMD="npx pnpm@9"
+  fi
+  log "pnpm: $PNPM_CMD"
+}
+
+# 检查 node_modules 完整性——tauri CLI native binding 必须存在
+ensure_deps() {
+  if [[ ! -x "./node_modules/.bin/tauri" ]]; then
+    log "node_modules missing or incomplete, installing..."
+    $PNPM_CMD install
+    return
+  fi
+  # 验证 native binding 可加载
+  if ! ./node_modules/.bin/tauri --version >/dev/null 2>&1; then
+    log "tauri CLI native binding broken, reinstalling..."
+    rm -rf node_modules
+    $PNPM_CMD install
+  fi
+}
+
 pid_is_running() {
   local pid="$1"
   kill -0 "$pid" 2>/dev/null
@@ -130,9 +174,11 @@ cleanup_stale_artifacts() {
   fi
 
   log "target ${current_mb}MB > ${threshold_mb}MB, cleaning orphaned artifacts..."
-  "$sweep_bin" sweep --maxsize "${max_size}GB" "$CARGO_TARGET_DIR" 2>&1 | while IFS= read -r line; do
+  # cargo-sweep 需要传入包含 Cargo.toml 的项目目录，而非 target 目录本身。
+  # 用 || true 防止 sweep 失败时（set -e）中断整个启动流程。
+  "$sweep_bin" sweep --maxsize "${max_size}GB" "$ROOT_DIR/src-tauri" 2>&1 | while IFS= read -r line; do
     log "$line"
-  done
+  done || true
   local after_bytes
   after_bytes="$(du -sk "$CARGO_TARGET_DIR" 2>/dev/null | cut -f1)"
   local freed_mb=$(( (before_bytes - after_bytes) / 1024 ))
@@ -143,6 +189,10 @@ cleanup_old_cc_switch_processes
 cleanup_proxy_port
 cleanup_renderer_port
 cleanup_stale_artifacts
+
+ensure_node
+resolve_pnpm
+ensure_deps
 
 # 手动重载模式：--no-watch 禁用 Tauri 的 Rust 文件监听。
 # 改完 Rust 代码后 Ctrl+C 停掉脚本、再重新运行即可。
