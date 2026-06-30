@@ -147,6 +147,11 @@ const codexApiFormatFromWireApi = (
     case "openai_chat":
     case "openai-chat":
       return "openai_chat";
+    case "messages":
+    case "anthropic":
+    case "anthropic_messages":
+    case "anthropic-messages":
+      return "anthropic_messages";
     case "responses":
     case "openai_responses":
     case "openai-responses":
@@ -155,6 +160,14 @@ const codexApiFormatFromWireApi = (
       return undefined;
   }
 };
+
+const isClaudeApiFormat = (
+  value: ProviderMeta["apiFormat"] | undefined,
+): value is ClaudeApiFormat =>
+  value === "anthropic" ||
+  value === "openai_chat" ||
+  value === "openai_responses" ||
+  value === "gemini_native";
 
 export const normalizeCodexCatalogModelsForSave = (
   models: CodexCatalogModel[],
@@ -595,7 +608,9 @@ function ProviderFormFull({
 
   const [localApiFormat, setLocalApiFormat] = useState<ClaudeApiFormat>(() => {
     if (appId !== "claude") return "anthropic";
-    return initialData?.meta?.apiFormat ?? "anthropic";
+    return isClaudeApiFormat(initialData?.meta?.apiFormat)
+      ? initialData.meta.apiFormat
+      : "anthropic";
   });
 
   const handleApiFormatChange = useCallback((format: ClaudeApiFormat) => {
@@ -683,6 +698,8 @@ function ProviderFormFull({
   const initialCodexApiFormat: CodexApiFormat =
     initialData?.meta?.apiFormat === "openai_chat"
       ? "openai_chat"
+      : initialData?.meta?.apiFormat === "anthropic_messages"
+        ? "anthropic_messages"
       : initialData?.meta?.apiFormat === "openai_responses"
         ? "openai_responses"
         : (codexApiFormatFromWireApi(

@@ -269,15 +269,15 @@ export function CodexFormFields({
   const supportsEffort = codexChatReasoning.supportsEffort === true;
 
   // 高级区在有任何可见配置时自动展开（仅折叠→展开，不会自动折叠）：自定义 UA /
-  // 请求覆盖 / 已填模型映射 / 原生 Responses（需维护 catalog）/ 已配置思考能力。
+  // 请求覆盖 / 已填模型映射 / 已配置思考能力。
   const hasRequestOverrides = Boolean(
     localProxyHeadersOverride.trim() || localProxyBodyOverride.trim(),
   );
   const hasAnyAdvancedValue =
     !!customUserAgent ||
     hasRequestOverrides ||
+    apiFormat !== "openai_responses" ||
     catalogModels.length > 0 ||
-    apiFormat === "openai_responses" ||
     supportsThinking ||
     supportsEffort;
   const [advancedExpanded, setAdvancedExpanded] = useState(hasAnyAdvancedValue);
@@ -446,8 +446,15 @@ export function CodexFormFields({
       .finally(() => setIsFetchingModels(false));
   }, [codexBaseUrl, codexApiKey, isFullUrl, customUserAgent, t]);
 
+  const resolveEndpointForApiFormat = useCallback(() => {
+    if (apiFormat === "anthropic_messages") return "/v1/messages";
+    if (apiFormat === "openai_chat") return "/v1/chat/completions";
+    return "/v1/responses";
+  }, [apiFormat]);
+
   const handleAddCatalogRow = useCallback(() => {
     if (!onCatalogModelsChange) return;
+    const endpoint = resolveEndpointForApiFormat();
     setCatalogRows((current) => [
       ...current,
       createCatalogRow(
@@ -455,18 +462,26 @@ export function CodexFormFields({
           ? {
               baseUrl: codexBaseUrl,
               apiKey: codexApiKey,
-              endpoint:
-                apiFormat === "openai_chat"
-                  ? "/v1/chat/completions"
-                  : "/v1/responses",
-              provider: "openai",
-              authHeader: "bearer",
-              responsesMode: apiFormat === "openai_chat" ? undefined : "codex",
+              endpoint,
+              provider: endpoint === "/v1/messages" ? "anthropic" : "openai",
+              authHeader: endpoint === "/v1/messages" ? "x-api-key" : "bearer",
+              responsesMode: endpoint === "/v1/responses" ? "codex" : undefined,
             }
-          : undefined,
+          : {
+              endpoint,
+              provider: endpoint === "/v1/messages" ? "anthropic" : "openai",
+              authHeader: endpoint === "/v1/messages" ? "x-api-key" : "bearer",
+              responsesMode: endpoint === "/v1/responses" ? "codex" : undefined,
+            },
       ),
     ]);
-  }, [apiFormat, codexApiKey, codexBaseUrl, isDevin, onCatalogModelsChange]);
+  }, [
+    codexApiKey,
+    codexBaseUrl,
+    isDevin,
+    onCatalogModelsChange,
+    resolveEndpointForApiFormat,
+  ]);
 
   const handleUpdateCatalogRow = useCallback(
     (index: number, patch: Partial<CodexCatalogModel>) => {
@@ -495,9 +510,7 @@ export function CodexFormFields({
       joycodeDefaults?.endpoint ??
       (isClaudeRoute
         ? "/v1/messages"
-        : apiFormat === "openai_chat"
-          ? "/v1/chat/completions"
-          : "/v1/responses");
+        : resolveEndpointForApiFormat());
 
     return {
       model,
@@ -510,7 +523,7 @@ export function CodexFormFields({
       authHeader:
         joycodeDefaults?.authHeader ??
         row?.authHeader ??
-        DEVIN_DEFAULT_AUTH_HEADER,
+        (endpoint === "/v1/messages" ? "x-api-key" : DEVIN_DEFAULT_AUTH_HEADER),
       responsesMode: endpoint === "/v1/responses" ? "codex" : undefined,
       thinkingEnabled: joycodeDefaults?.thinkingEnabled ?? row?.thinkingEnabled,
       baseUrl: row?.baseUrl || codexBaseUrl,
@@ -648,6 +661,11 @@ export function CodexFormFields({
                           defaultValue: "Chat Completions（需开启路由）",
                         })}
                       </SelectItem>
+                      <SelectItem value="anthropic_messages">
+                        {t("codexConfig.upstreamFormatMessages", {
+                          defaultValue: "Anthropic Messages（需开启路由）",
+                        })}
+                      </SelectItem>
                       <SelectItem value="openai_responses">
                         {t("codexConfig.upstreamFormatResponses", {
                           defaultValue: "Responses（原生）",
@@ -658,7 +676,7 @@ export function CodexFormFields({
                   <p className="text-xs leading-relaxed text-muted-foreground">
                     {t("codexConfig.upstreamFormatHint", {
                       defaultValue:
-                        "供应商原生是 Responses API 就选 Responses（直连，不转换格式）；使用 Chat Completions 协议就选 Chat（需开启路由接管才能转换为 Chat Completions）。",
+                        "供应商原生是 Responses API 就选 Responses；使用 OpenAI Chat 或 Anthropic Messages 协议时选择对应结构，并通过模型映射生成本地路由。",
                     })}
                   </p>
                 </div>
@@ -780,7 +798,7 @@ export function CodexFormFields({
                         "hidden gap-2 px-1 text-xs font-medium text-muted-foreground md:grid",
                         isDevin
                           ? "grid-cols-[minmax(220px,1fr)_minmax(260px,1.4fr)_120px_36px]"
-                          : "grid-cols-[1fr_1fr_140px_36px]",
+                          : "grid-cols-[1fr_1fr_140px_150px_36px]",
                       )}
                     >
                       {isDevin ? (
@@ -813,6 +831,11 @@ export function CodexFormFields({
                           <span>
                             {t("codexConfig.catalogColumnContext", {
                               defaultValue: "上下文窗口",
+                            })}
+                          </span>
+                          <span>
+                            {t("codexConfig.catalogColumnEndpoint", {
+                              defaultValue: "上游端点",
                             })}
                           </span>
                           <span />
@@ -984,7 +1007,7 @@ export function CodexFormFields({
                       return (
                         <div
                           key={row.rowId}
-                          className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_36px]"
+                          className="grid grid-cols-1 gap-2 md:grid-cols-[1fr_1fr_140px_150px_36px]"
                         >
                           <Input
                             value={row.displayName ?? ""}
@@ -1059,6 +1082,59 @@ export function CodexFormFields({
                               defaultValue: "上下文窗口",
                             })}
                           />
+                          <Select
+                            value={row.endpoint ?? "default"}
+                            onValueChange={(value) => {
+                              if (value === "default") {
+                                handleUpdateCatalogRow(index, {
+                                  endpoint: undefined,
+                                  provider: undefined,
+                                  authHeader: undefined,
+                                });
+                                return;
+                              }
+                              const endpoint =
+                                value as CodexCatalogModel["endpoint"];
+                              handleUpdateCatalogRow(index, {
+                                endpoint,
+                                provider:
+                                  endpoint === "/v1/messages"
+                                    ? "anthropic"
+                                    : "openai",
+                                authHeader:
+                                  endpoint === "/v1/messages"
+                                    ? "x-api-key"
+                                    : "bearer",
+                              });
+                            }}
+                          >
+                            <SelectTrigger
+                              aria-label={t(
+                                "codexConfig.catalogColumnEndpoint",
+                                {
+                                  defaultValue: "上游端点",
+                                },
+                              )}
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="default">
+                                {t("common.default", {
+                                  defaultValue: "默认",
+                                })}
+                              </SelectItem>
+                              <SelectItem value="/v1/responses">
+                                /v1/responses
+                              </SelectItem>
+                              <SelectItem value="/v1/chat/completions">
+                                /v1/chat/completions
+                              </SelectItem>
+                              <SelectItem value="/v1/messages">
+                                /v1/messages
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
                           <Button
                             type="button"
                             variant="ghost"

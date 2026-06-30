@@ -54,6 +54,28 @@ describe("ProviderForm Codex catalog helpers", () => {
     ]);
   });
 
+  it("preserves Codex Anthropic Messages routing fields", () => {
+    expect(
+      normalizeCodexCatalogModelsForSave([
+        {
+          model: " claude-sonnet-4-6 ",
+          displayName: " Claude Sonnet ",
+          endpoint: "/v1/messages",
+          provider: "anthropic",
+          authHeader: "x-api-key",
+        },
+      ]),
+    ).toEqual([
+      {
+        model: "claude-sonnet-4-6",
+        displayName: "Claude Sonnet",
+        provider: "anthropic",
+        endpoint: "/v1/messages",
+        authHeader: "x-api-key",
+      },
+    ]);
+  });
+
   it("preserves native-profile overrides (parallel tool calls + input modalities + base instructions)", () => {
     expect(
       normalizeCodexCatalogModelsForSave([

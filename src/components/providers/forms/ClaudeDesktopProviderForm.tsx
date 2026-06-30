@@ -104,6 +104,12 @@ export interface ClaudeDesktopProviderFormProps {
   showButtons?: boolean;
 }
 
+const isClaudeApiFormat = (value: unknown): value is ClaudeApiFormat =>
+  value === "anthropic" ||
+  value === "openai_chat" ||
+  value === "openai_responses" ||
+  value === "gemini_native";
+
 type RouteRow = {
   rowId: string;
   route: string;
@@ -260,7 +266,9 @@ export function ClaudeDesktopProviderForm({
   const [mode, setMode] = useState<"direct" | "proxy">(initialMode);
   const needsModelMapping = mode === "proxy";
   const [apiFormat, setApiFormat] = useState<ClaudeApiFormat>(
-    initialData?.meta?.apiFormat ?? "anthropic",
+    isClaudeApiFormat(initialData?.meta?.apiFormat)
+      ? initialData.meta.apiFormat
+      : "anthropic",
   );
   const [baseUrl, setBaseUrl] = useState(
     envString(initialData?.settingsConfig, "ANTHROPIC_BASE_URL"),

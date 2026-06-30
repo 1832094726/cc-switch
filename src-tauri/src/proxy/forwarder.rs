@@ -1561,10 +1561,15 @@ impl RequestForwarder {
             && devin_route.is_some()
             && devin_upstream_is_responses
             && !value_is_openai_responses_request(&mapped_body);
+        let codex_model_catalog_to_messages = model_catalog_route
+            .as_ref()
+            .is_some_and(|route| route.endpoint.as_deref().is_some_and(is_messages_endpoint));
         let codex_responses_to_chat = if matches!(app_type, AppType::Devin) && devin_route.is_some()
         {
             is_responses_endpoint(endpoint)
                 && (devin_upstream_is_chat || devin_upstream_is_messages)
+        } else if codex_model_catalog_to_messages {
+            is_responses_endpoint(endpoint) || is_chat_completions_endpoint(endpoint)
         } else if model_catalog_route.as_ref().is_some_and(|route| {
             route
                 .endpoint
@@ -1724,6 +1729,8 @@ impl RequestForwarder {
                 apply_devin_codex_responses_compat(mapped_body, devin_responses_fast_mode);
             inject_devin_responses_cache_key(&mut body, provider, devin_route.as_ref());
             body
+        } else if codex_model_catalog_to_messages {
+            codex_request_to_anthropic_messages(mapped_body)?
         } else if codex_responses_to_chat {
             let mut mapped_body = mapped_body;
             let restored = self
@@ -4202,6 +4209,21 @@ fn devin_request_to_anthropic_messages(body: Value) -> Result<Value, ProxyError>
     super::providers::transform::openai_chat_request_to_anthropic(chat_body)
 }
 
+fn codex_request_to_anthropic_messages(body: Value) -> Result<Value, ProxyError> {
+    if value_is_anthropic_messages_request(&body) {
+        return Ok(body);
+    }
+
+    let chat_body = if value_is_openai_responses_request(&body) {
+        super::providers::transform_codex_chat::responses_to_chat_completions(body)?
+    } else {
+        body
+    };
+
+    super::providers::transform::openai_chat_request_to_anthropic(chat_body)
+        .map(normalize_anthropic_temperature_for_thinking)
+}
+
 const DEVIN_CACHE_MAX_TEXT_CHARS: usize = 12_000;
 const DEVIN_CACHE_TOOL_RESULT_EDGE_CHARS: usize = 2_000;
 const DEVIN_RECENT_MESSAGES_WITHOUT_COMPACTION: usize = 1;
@@ -6348,6 +6370,28 @@ mod tests {
         assert_eq!(responses["model"], "GPT 5.3-codex");
         assert_eq!(responses["input"][0]["role"], "user");
         assert_eq!(responses["stream"], true);
+    }
+
+    #[test]
+    fn codex_responses_body_converts_for_messages_catalog_route() {
+        let body = json!({
+            "model": "claude-sonnet-4-6",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "ping" }]
+            }],
+            "max_output_tokens": 1024,
+            "stream": true
+        });
+
+        let messages = codex_request_to_anthropic_messages(body).unwrap();
+
+        assert!(messages.get("input").is_none());
+        assert!(messages.get("max_output_tokens").is_none());
+        assert_eq!(messages["model"], "claude-sonnet-4-6");
+        assert_eq!(messages["messages"][0]["role"], "user");
+        assert_eq!(messages["max_tokens"], 1024);
+        assert_eq!(messages["stream"], true);
     }
 
     #[test]

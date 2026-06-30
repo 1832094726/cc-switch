@@ -229,7 +229,12 @@ export function ProviderCard({
     ) {
       return false;
     }
-    if (provider.meta?.apiFormat === "openai_chat") return true;
+    if (
+      provider.meta?.apiFormat === "openai_chat" ||
+      provider.meta?.apiFormat === "anthropic_messages"
+    ) {
+      return true;
+    }
     const config = (provider.settingsConfig as Record<string, any>)?.config;
     return (
       typeof config === "string" &&

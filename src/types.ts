@@ -205,11 +205,13 @@ export interface ProviderMeta {
   // - "anthropic": 原生 Anthropic Messages API 格式，直接透传
   // - "openai_chat": OpenAI Chat Completions 格式，需要格式转换
   // - "openai_responses": OpenAI Responses API 格式，需要格式转换
+  // - "anthropic_messages": Codex 上游 Anthropic Messages API 格式，需要本地路由转换
   // - "gemini_native": Gemini Native generateContent API 格式，需要格式转换
   apiFormat?:
     | "anthropic"
     | "openai_chat"
     | "openai_responses"
+    | "anthropic_messages"
     | "gemini_native";
   // 通用认证绑定
   authBinding?: AuthBinding;
@@ -253,7 +255,11 @@ export type ClaudeApiFormat =
 // Codex API 格式类型
 // - "openai_responses": OpenAI Responses API 格式，直接透传
 // - "openai_chat": OpenAI Chat Completions 格式，需要本地路由转换
-export type CodexApiFormat = "openai_responses" | "openai_chat";
+// - "anthropic_messages": Anthropic Messages API 格式，需要本地路由转换
+export type CodexApiFormat =
+  | "openai_responses"
+  | "openai_chat"
+  | "anthropic_messages";
 
 export interface CodexCatalogModel {
   model: string;

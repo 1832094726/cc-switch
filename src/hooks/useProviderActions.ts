@@ -158,6 +158,7 @@ export function useProviderActions(
       const isCodexChatFormat =
         (activeApp === "codex" || activeApp === "devin") &&
         (provider.meta?.apiFormat === "openai_chat" ||
+          provider.meta?.apiFormat === "anthropic_messages" ||
           (typeof (provider.settingsConfig as Record<string, any>)?.config ===
             "string" &&
             isCodexChatWireApi(
