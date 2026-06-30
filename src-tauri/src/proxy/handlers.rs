@@ -8,6 +8,7 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::{resolve_devin_model_route, ActiveConnectionGuard},
     handler_config::{
@@ -1220,6 +1221,49 @@ fn devin_prompt_to_chat_request(body: &Value, prompt: &str) -> Value {
     result
 }
 
+/// Codex 客户端（尤其 Desktop 登录态）可能对请求体启用 zstd 压缩，使得后续
+/// `serde_json::from_slice` 直接解析失败。这里在解析前解压，并剥掉已失真的实体头
+/// （content-encoding / content-length / transfer-encoding）——转发层会基于解压后的
+/// 明文 JSON 重新生成正确的头。
+fn decode_codex_request_body(
+    headers: &mut axum::http::HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Bytes, ProxyError> {
+    let Some(encoding) = get_content_encoding(headers) else {
+        return Ok(body_bytes);
+    };
+
+    if !is_supported_content_encoding(&encoding) {
+        return Err(ProxyError::InvalidRequest(format!(
+            "Unsupported request content-encoding: {encoding}"
+        )));
+    }
+
+    log::debug!("[Codex] 解压请求体: content-encoding={encoding}");
+    let decompressed = match decompress_body(&encoding, &body_bytes) {
+        Ok(Some(decompressed)) => decompressed,
+        // is_supported_content_encoding 已确保编码受支持，正常不会返回 None；
+        // 防御性兜底：宁可报错，也不能把压缩字节当 JSON 透传下去。
+        Ok(None) => {
+            return Err(ProxyError::InvalidRequest(format!(
+                "Unsupported request content-encoding: {encoding}"
+            )));
+        }
+        Err(e) => {
+            log::warn!("[Codex] 请求体解压失败 ({encoding}): {e}");
+            return Err(ProxyError::InvalidRequest(format!(
+                "Failed to decompress request body ({encoding}): {e}"
+            )));
+        }
+    };
+
+    headers.remove(axum::http::header::CONTENT_ENCODING);
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.remove(axum::http::header::TRANSFER_ENCODING);
+
+    Ok(Bytes::from(decompressed))
+}
+
 // ============================================================================
 // Codex API 处理器
 // ============================================================================
@@ -1249,13 +1293,14 @@ async fn handle_chat_completions_for_app(
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
     if matches!(app_type, AppType::Devin) {
@@ -1356,13 +1401,14 @@ async fn handle_responses_for_app(
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
     if matches!(app_type, AppType::Devin) {
@@ -1454,13 +1500,14 @@ async fn handle_responses_compact_for_app(
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 

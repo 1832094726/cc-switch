@@ -35,6 +35,7 @@ import {
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { DEVIN_WINDSURF_MODEL_OPTIONS } from "@/config/devinProviderPresets";
+import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
 import { cn } from "@/lib/utils";
 import type {
   CodexApiFormat,
@@ -88,6 +89,10 @@ interface CodexFormFieldsProps {
   // Local proxy User-Agent override
   customUserAgent: string;
   onCustomUserAgentChange: (value: string) => void;
+  localProxyHeadersOverride: string;
+  onLocalProxyHeadersOverrideChange: (value: string) => void;
+  localProxyBodyOverride: string;
+  onLocalProxyBodyOverrideChange: (value: string) => void;
 }
 
 type CodexCatalogRow = CodexCatalogModel & { rowId: string };
@@ -144,32 +149,24 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
       seed?.responsesCodexCompat ?? firstRoute?.responsesCodexCompat,
     responsesFastMode: seed?.responsesFastMode ?? firstRoute?.responsesFastMode,
     thinkingEnabled: seed?.thinkingEnabled ?? firstRoute?.thinkingEnabled,
+    // Carry native-profile overrides verbatim (not user-editable in the row UI,
+    // but must survive load->save so the official catalog fidelity is kept).
+    ...(seed?.supportsParallelToolCalls !== undefined
+      ? { supportsParallelToolCalls: seed.supportsParallelToolCalls }
+      : {}),
+    ...(seed?.inputModalities ? { inputModalities: seed.inputModalities } : {}),
+    ...(seed?.baseInstructions
+      ? { baseInstructions: seed.baseInstructions }
+      : {}),
   };
 }
 
 // Compares rows (with rowId) to incoming models (without) by data fields only,
-// so both sync effects can use the same equality definition.
+// so both sync effects can use the same equality definition. Hidden native-profile
+// fields are included so switching between providers with identical visible fields
+// but different base_instructions / tools / modalities still rebuilds the rows.
 function catalogRowsMatchModels(
-  rows: Array<
-    Pick<
-      CodexCatalogRow,
-      | "model"
-      | "displayName"
-      | "contextWindow"
-      | "upstreamModel"
-      | "provider"
-      | "endpoint"
-      | "baseUrl"
-      | "apiKey"
-      | "routeName"
-      | "authHeader"
-      | "headers"
-      | "responsesMode"
-      | "responsesCodexCompat"
-      | "responsesFastMode"
-      | "thinkingEnabled"
-    >
-  >,
+  rows: CodexCatalogModel[],
   models: CodexCatalogModel[],
 ): boolean {
   if (rows.length !== models.length) return false;
@@ -208,7 +205,12 @@ function catalogRowsMatchModels(
       (row.thinkingEnabled ?? undefined) ===
         (incoming.thinkingEnabled ??
           incoming.routes?.[0]?.thinkingEnabled ??
-          undefined)
+          undefined) &&
+      (row.supportsParallelToolCalls ?? null) ===
+        (incoming.supportsParallelToolCalls ?? null) &&
+      (row.baseInstructions ?? "") === (incoming.baseInstructions ?? "") &&
+      JSON.stringify(row.inputModalities ?? []) ===
+        JSON.stringify(incoming.inputModalities ?? [])
     );
   });
 }
@@ -242,6 +244,10 @@ export function CodexFormFields({
   speedTestEndpoints,
   customUserAgent,
   onCustomUserAgentChange,
+  localProxyHeadersOverride,
+  onLocalProxyHeadersOverrideChange,
+  localProxyBodyOverride,
+  onLocalProxyBodyOverrideChange,
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
 
@@ -252,7 +258,9 @@ export function CodexFormFields({
     isDevin &&
     ((providerId ?? "").toLowerCase().includes("joycode") ||
       /(?:127\.0\.0\.1|localhost):8081/.test(codexBaseUrl));
-  const needsLocalRouting = isDevin || apiFormat === "openai_chat";
+  // 思考能力随 Chat 格式显示（仅 Chat Completions 转换路径用得上）；模型映射常驻
+  //（填了才生成 catalog）。两者都已与「路由接管」概念解耦。
+  const isChatFormat = apiFormat === "openai_chat";
   const canEditCatalog = Boolean(onCatalogModelsChange);
   const canEditReasoning = Boolean(onCodexChatReasoningChange);
   const supportsThinking =
@@ -260,8 +268,18 @@ export function CodexFormFields({
     codexChatReasoning.supportsEffort === true;
   const supportsEffort = codexChatReasoning.supportsEffort === true;
 
-  // needsLocalRouting 非默认值说明预设/用户动过路由配置，需要让模型映射保持可见
-  const hasAnyAdvancedValue = !!customUserAgent || needsLocalRouting;
+  // 高级区在有任何可见配置时自动展开（仅折叠→展开，不会自动折叠）：自定义 UA /
+  // 请求覆盖 / 已填模型映射 / 原生 Responses（需维护 catalog）/ 已配置思考能力。
+  const hasRequestOverrides = Boolean(
+    localProxyHeadersOverride.trim() || localProxyBodyOverride.trim(),
+  );
+  const hasAnyAdvancedValue =
+    !!customUserAgent ||
+    hasRequestOverrides ||
+    catalogModels.length > 0 ||
+    apiFormat === "openai_responses" ||
+    supportsThinking ||
+    supportsEffort;
   const [advancedExpanded, setAdvancedExpanded] = useState(hasAnyAdvancedValue);
 
   // 预设/编辑加载填充高级值后自动展开（仅从折叠→展开，不会自动折叠）
@@ -367,13 +385,6 @@ export function CodexFormFields({
     lastSentModelsRef.current = next;
     onCatalogModelsChange(next);
   }, [catalogRows, codexApiKey, codexBaseUrl, isDevin, onCatalogModelsChange]);
-
-  const handleLocalRoutingChange = useCallback(
-    (checked: boolean) => {
-      onApiFormatChange(checked ? "openai_chat" : "openai_responses");
-    },
-    [onApiFormatChange],
-  );
 
   const handleReasoningThinkingChange = useCallback(
     (checked: boolean) => {
@@ -576,7 +587,7 @@ export function CodexFormFields({
         />
       )}
 
-      {/* 高级选项 —— 本地路由映射/模型映射/思考能力/自定义 UA；预设供应商通常无需展开 */}
+      {/* 高级选项 —— 上游格式/模型映射/思考能力/自定义 UA；预设供应商通常无需展开 */}
       {category !== "official" && (
         <Collapsible
           open={advancedExpanded}
@@ -604,43 +615,57 @@ export function CodexFormFields({
             <p className="mt-1 ml-1 text-xs text-muted-foreground">
               {t("codexConfig.advancedSectionHint", {
                 defaultValue:
-                  "包含本地路由映射、模型映射、思考能力与自定义 User-Agent。供应商使用 Chat Completions 协议或非 GPT 模型时，需在此开启本地路由映射。",
+                  "包含上游格式、模型映射、思考能力与自定义 User-Agent。使用 Chat Completions 协议的供应商需开启路由接管才能使用。",
               })}
             </p>
           )}
           <CollapsibleContent className="space-y-3 pt-3">
-            {/* 本地路由映射开关 —— 沿用 shouldShowSpeedTest 门控，cloud_provider 保持不可切换 */}
-            {shouldShowSpeedTest && !isDevin && (
-              <div className="flex items-center justify-between gap-4">
-                <div className="space-y-1">
-                  <FormLabel>
-                    {t("codexConfig.localRoutingToggle", {
-                      defaultValue: "需要本地路由映射",
+            {/* 上游格式 —— Chat 需开启路由接管（走代理转换），Responses 原生直连。
+                沿用 shouldShowSpeedTest 门控，cloud_provider 保持不可切换。 */}
+            {shouldShowSpeedTest && (
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <FormLabel htmlFor="codex-upstream-format">
+                    {t("codexConfig.upstreamFormatLabel", {
+                      defaultValue: "上游格式",
                     })}
                   </FormLabel>
-                  <p className="text-xs leading-relaxed text-muted-foreground">
-                    {needsLocalRouting
-                      ? t("codexConfig.localRoutingOnHint", {
-                          defaultValue:
-                            "Codex 目前仅原生支持 OpenAI Responses API 与 GPT 系列模型；如果您的供应商使用 Chat Completions 协议或非 GPT 模型（如 DeepSeek、Kimi），则需要打开本开关，并在使用过程中保持本地路由开启。",
-                        })
-                      : t("codexConfig.localRoutingOffHint", {
-                          defaultValue:
-                            "如果您的供应商不是原生 OpenAI Responses API，或者模型名不是 Codex 默认的 GPT 系列，请打开此开关。",
+                  <Select
+                    value={apiFormat}
+                    onValueChange={(value) =>
+                      onApiFormatChange(value as CodexApiFormat)
+                    }
+                  >
+                    <SelectTrigger
+                      id="codex-upstream-format"
+                      className="w-full"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="openai_chat">
+                        {t("codexConfig.upstreamFormatChat", {
+                          defaultValue: "Chat Completions（需开启路由）",
                         })}
+                      </SelectItem>
+                      <SelectItem value="openai_responses">
+                        {t("codexConfig.upstreamFormatResponses", {
+                          defaultValue: "Responses（原生）",
+                        })}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    {t("codexConfig.upstreamFormatHint", {
+                      defaultValue:
+                        "供应商原生是 Responses API 就选 Responses（直连，不转换格式）；使用 Chat Completions 协议就选 Chat（需开启路由接管才能转换为 Chat Completions）。",
+                    })}
                   </p>
                 </div>
-                <Switch
-                  checked={needsLocalRouting}
-                  onCheckedChange={handleLocalRoutingChange}
-                  aria-label={t("codexConfig.localRoutingToggle", {
-                    defaultValue: "需要本地路由映射",
-                  })}
-                />
               </div>
             )}
 
-            {needsLocalRouting && canEditReasoning && !isDevin && (
+            {isChatFormat && canEditReasoning && (
               <div
                 className={cn(
                   "space-y-3",
@@ -709,23 +734,17 @@ export function CodexFormFields({
               </div>
             )}
 
-            <div
-              className={cn(
-                (shouldShowSpeedTest ||
-                  (needsLocalRouting && canEditReasoning)) &&
-                  "border-t border-border-default pt-3",
-              )}
-            >
-              <CustomUserAgentField
-                id="codex-custom-user-agent"
-                value={customUserAgent}
-                onChange={onCustomUserAgentChange}
-              />
-            </div>
-
-            {/* 模型映射 —— 仅在本地路由 + 可编辑时显示；上方恒有 UA 字段，分隔线无需条件 */}
-            {needsLocalRouting && canEditCatalog && (
-              <div className="space-y-4 border-t border-border-default pt-3">
+            {/* 模型映射 / 模型目录 —— 与「路由接管」解耦，常驻显示（可编辑即渲染）。
+                填了才生成 catalog：Chat 模式生成兼容路由、原生 Responses 生成
+                model-catalogs.json；留空则不生成。排在自定义 UA 之前。 */}
+            {canEditCatalog && (
+              <div
+                className={cn(
+                  "space-y-4",
+                  (shouldShowSpeedTest || (isChatFormat && canEditReasoning)) &&
+                    "border-t border-border-default pt-3",
+                )}
+              >
                 <div className="space-y-1">
                   <div className="flex items-center justify-between gap-3">
                     <FormLabel>
@@ -1059,6 +1078,30 @@ export function CodexFormFields({
                 )}
               </div>
             )}
+
+            <div
+              className={cn(
+                "space-y-3",
+                (shouldShowSpeedTest ||
+                  (isChatFormat && canEditReasoning) ||
+                  canEditCatalog) &&
+                  "border-t border-border-default pt-3",
+              )}
+            >
+              <CustomUserAgentField
+                id="codex-custom-user-agent"
+                value={customUserAgent}
+                onChange={onCustomUserAgentChange}
+              />
+              <div className="border-t border-border-default pt-3">
+                <LocalProxyRequestOverridesField
+                  headersJson={localProxyHeadersOverride}
+                  bodyJson={localProxyBodyOverride}
+                  onHeadersJsonChange={onLocalProxyHeadersOverrideChange}
+                  onBodyJsonChange={onLocalProxyBodyOverrideChange}
+                />
+              </div>
+            </div>
           </CollapsibleContent>
         </Collapsible>
       )}

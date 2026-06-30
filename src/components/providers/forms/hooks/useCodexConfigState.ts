@@ -66,39 +66,45 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
         : [];
       setCodexCatalogModels(
         rawCatalogModels
-          .map((item: any) => ({
-            model: typeof item?.model === "string" ? item.model : "",
-            displayName:
-              typeof item?.displayName === "string"
-                ? item.displayName
-                : typeof item?.display_name === "string"
-                  ? item.display_name
-                  : "",
-            contextWindow:
-              typeof item?.contextWindow === "string" ||
-              typeof item?.contextWindow === "number"
-                ? item.contextWindow
-                : typeof item?.context_window === "string" ||
-                    typeof item?.context_window === "number"
-                  ? item.context_window
-                  : "",
-            upstreamModel:
+          .map((item: any) => {
+            // 隐藏字段（原生 Responses profile 用）不在行 UI 暴露，但必须 load→save
+            // 原样保留，否则编辑保存 MiMo/MiniMax 等会丢官方 base_instructions、
+            // 并行工具、图像模态。DB SSOT 为 camelCase、live 反解兜底可能为 snake_case，
+            // 双格式兼容（与 displayName/contextWindow 一致）。
+            const supportsParallelToolCalls =
+              typeof item?.supportsParallelToolCalls === "boolean"
+                ? item.supportsParallelToolCalls
+                : typeof item?.supports_parallel_tool_calls === "boolean"
+                  ? item.supports_parallel_tool_calls
+                  : undefined;
+            const inputModalities = Array.isArray(item?.inputModalities)
+              ? item.inputModalities
+              : Array.isArray(item?.input_modalities)
+                ? item.input_modalities
+                : undefined;
+            const baseInstructions =
+              typeof item?.baseInstructions === "string"
+                ? item.baseInstructions
+                : typeof item?.base_instructions === "string"
+                  ? item.base_instructions
+                  : undefined;
+            const upstreamModel =
               typeof item?.upstreamModel === "string"
                 ? item.upstreamModel
                 : typeof item?.upstream_model === "string"
                   ? item.upstream_model
-                  : "",
-            provider:
+                  : "";
+            const provider =
               item?.provider === "anthropic" || item?.provider === "openai"
                 ? item.provider
-                : undefined,
-            endpoint:
+                : undefined;
+            const endpoint =
               item?.endpoint === "/v1/responses" ||
               item?.endpoint === "/v1/chat/completions" ||
               item?.endpoint === "/v1/messages"
                 ? item.endpoint
-                : undefined,
-            baseUrl:
+                : undefined;
+            const baseUrl =
               typeof item?.baseUrl === "string"
                 ? item.baseUrl
                 : typeof item?.base_url === "string"
@@ -106,8 +112,8 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
                   : Array.isArray(item?.routes) &&
                       typeof item.routes[0]?.baseUrl === "string"
                     ? item.routes[0].baseUrl
-                    : "",
-            apiKey:
+                    : "";
+            const apiKey =
               typeof item?.apiKey === "string"
                 ? item.apiKey
                 : typeof item?.api_key === "string"
@@ -115,8 +121,8 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
                   : Array.isArray(item?.routes) &&
                       typeof item.routes[0]?.apiKey === "string"
                     ? item.routes[0].apiKey
-                    : "",
-            routeName:
+                    : "";
+            const routeName =
               typeof item?.routeName === "string"
                 ? item.routeName
                 : typeof item?.route_name === "string"
@@ -124,16 +130,45 @@ export function useCodexConfigState({ initialData }: UseCodexConfigStateProps) {
                   : Array.isArray(item?.routes) &&
                       typeof item.routes[0]?.name === "string"
                     ? item.routes[0].name
-                    : "",
-            authHeader:
+                    : "";
+            const authHeader =
               item?.authHeader === "x-api-key" || item?.authHeader === "bearer"
                 ? item.authHeader
                 : Array.isArray(item?.routes) &&
                     (item.routes[0]?.authHeader === "x-api-key" ||
                       item.routes[0]?.authHeader === "bearer")
                   ? item.routes[0].authHeader
-                  : undefined,
-          }))
+                  : undefined;
+            return {
+              model: typeof item?.model === "string" ? item.model : "",
+              displayName:
+                typeof item?.displayName === "string"
+                  ? item.displayName
+                  : typeof item?.display_name === "string"
+                    ? item.display_name
+                    : "",
+              contextWindow:
+                typeof item?.contextWindow === "string" ||
+                typeof item?.contextWindow === "number"
+                  ? item.contextWindow
+                  : typeof item?.context_window === "string" ||
+                      typeof item?.context_window === "number"
+                    ? item.context_window
+                    : "",
+              ...(supportsParallelToolCalls !== undefined
+                ? { supportsParallelToolCalls }
+                : {}),
+              ...(inputModalities ? { inputModalities } : {}),
+              ...(baseInstructions ? { baseInstructions } : {}),
+              ...(upstreamModel ? { upstreamModel } : {}),
+              ...(provider ? { provider } : {}),
+              ...(endpoint ? { endpoint } : {}),
+              ...(baseUrl ? { baseUrl } : {}),
+              ...(apiKey ? { apiKey } : {}),
+              ...(routeName ? { routeName } : {}),
+              ...(authHeader ? { authHeader } : {}),
+            };
+          })
           .filter((item: CodexCatalogModel) => item.model.trim()),
       );
 

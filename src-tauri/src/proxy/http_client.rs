@@ -249,7 +249,8 @@ fn build_client_with_proxy_policy(
         // 响应解压由 response_processor 根据 content-encoding 手动处理。
         .no_gzip()
         .no_brotli()
-        .no_deflate();
+        .no_deflate()
+        .no_zstd();
 
     if matches!(proxy_policy, ProxyPolicy::Direct) {
         builder = builder.no_proxy();
