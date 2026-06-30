@@ -2083,14 +2083,19 @@ impl RequestForwarder {
         let should_send_anthropic_headers = !is_joycode_anthropic_route
             && ((adapter.name() == "Claude"
                 && matches!(resolved_claude_api_format.as_deref(), Some("anthropic")))
-                || devin_upstream_is_messages);
-        let rebuild_json_headers_for_devin = matches!(app_type, AppType::Devin)
-            && devin_route.is_some()
-            && (devin_messages_to_chat
-                || devin_messages_to_responses
-                || devin_route_to_responses
-                || devin_upstream_is_responses
-                || devin_upstream_is_messages);
+                || devin_upstream_is_messages
+                || codex_model_catalog_to_messages);
+        let rebuild_json_headers_for_json_upstream =
+            should_rebuild_connect_headers_for_json_upstream(
+                app_type,
+                devin_route.is_some(),
+                devin_messages_to_chat,
+                devin_messages_to_responses,
+                devin_route_to_responses,
+                devin_upstream_is_responses,
+                devin_upstream_is_messages,
+                codex_model_catalog_to_messages,
+            );
 
         // 预计算 anthropic-beta 值（仅 Claude）
         let anthropic_beta_value = if should_send_anthropic_headers {
@@ -2225,10 +2230,11 @@ impl RequestForwarder {
                 continue;
             }
 
-            // Devin/Windsurf 本地入口的客户端头是 Connect-RPC/protobuf。
+            // Devin/Windsurf/Codex 本地入口可能是 Connect-RPC/protobuf。
             // 上游已经被转换成 JSON API，不能把原 content-type/content-encoding
             // 或 connect/grpc 私有头继续带过去，否则 NewAPI 会按非 JSON 解析 body。
-            if rebuild_json_headers_for_devin && is_devin_connect_header_for_json_upstream(key_str)
+            if rebuild_json_headers_for_json_upstream
+                && is_connect_header_for_json_upstream(key_str)
             {
                 continue;
             }
@@ -2543,7 +2549,7 @@ impl RequestForwarder {
             })?
         };
 
-        if rebuild_json_headers_for_devin {
+        if rebuild_json_headers_for_json_upstream {
             ordered_headers.insert(
                 http::header::CONTENT_TYPE,
                 if is_joycode_upstream {
@@ -3940,7 +3946,7 @@ fn append_anthropic_beta_tokens(parts: &mut Vec<String>, value: &str) {
     }
 }
 
-fn is_devin_connect_header_for_json_upstream(header_name: &str) -> bool {
+fn is_connect_header_for_json_upstream(header_name: &str) -> bool {
     if header_name.eq_ignore_ascii_case("content-type")
         || header_name.eq_ignore_ascii_case("content-encoding")
         || header_name.eq_ignore_ascii_case("accept")
@@ -3951,6 +3957,27 @@ fn is_devin_connect_header_for_json_upstream(header_name: &str) -> bool {
 
     let lower = header_name.to_ascii_lowercase();
     lower.starts_with("connect-") || lower.starts_with("grpc-")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_rebuild_connect_headers_for_json_upstream(
+    app_type: &AppType,
+    has_devin_route: bool,
+    devin_messages_to_chat: bool,
+    devin_messages_to_responses: bool,
+    devin_route_to_responses: bool,
+    devin_upstream_is_responses: bool,
+    devin_upstream_is_messages: bool,
+    codex_model_catalog_to_messages: bool,
+) -> bool {
+    codex_model_catalog_to_messages
+        || (matches!(app_type, AppType::Devin)
+            && has_devin_route
+            && (devin_messages_to_chat
+                || devin_messages_to_responses
+                || devin_route_to_responses
+                || devin_upstream_is_responses
+                || devin_upstream_is_messages))
 }
 
 fn is_joycode_provider(provider: &Provider, base_url: &str) -> bool {
@@ -6518,7 +6545,7 @@ wire_api = "responses""#,
     }
 
     #[test]
-    fn devin_json_upstream_drops_connect_rpc_headers() {
+    fn json_upstream_drops_connect_rpc_headers() {
         for header in [
             "content-type",
             "Content-Encoding",
@@ -6529,14 +6556,38 @@ wire_api = "responses""#,
             "grpc-timeout",
         ] {
             assert!(
-                is_devin_connect_header_for_json_upstream(header),
-                "{header} should be rebuilt for Devin JSON upstream"
+                is_connect_header_for_json_upstream(header),
+                "{header} should be rebuilt for JSON upstream"
             );
         }
 
-        assert!(!is_devin_connect_header_for_json_upstream("user-agent"));
-        assert!(!is_devin_connect_header_for_json_upstream("anthropic-beta"));
-        assert!(!is_devin_connect_header_for_json_upstream("x-custom"));
+        assert!(!is_connect_header_for_json_upstream("user-agent"));
+        assert!(!is_connect_header_for_json_upstream("anthropic-beta"));
+        assert!(!is_connect_header_for_json_upstream("x-custom"));
+    }
+
+    #[test]
+    fn codex_messages_catalog_route_rebuilds_connect_headers() {
+        assert!(should_rebuild_connect_headers_for_json_upstream(
+            &AppType::Codex,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(!should_rebuild_connect_headers_for_json_upstream(
+            &AppType::Codex,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]
