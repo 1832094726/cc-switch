@@ -1791,6 +1791,10 @@ impl RequestForwarder {
             mapped_body
         };
 
+        if is_joycode_anthropic_route {
+            request_body = normalize_joycode_anthropic_thinking(request_body);
+        }
+
         if matches!(app_type, AppType::Codex | AppType::Devin) {
             self.apply_media_prevention(&mut request_body, provider);
         }
@@ -5032,6 +5036,37 @@ fn normalize_anthropic_temperature_for_thinking(mut body: Value) -> Value {
     body
 }
 
+fn normalize_joycode_anthropic_thinking(mut body: Value) -> Value {
+    let thinking_type = body
+        .get("thinking")
+        .and_then(Value::as_object)
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    if thinking_type.as_deref() != Some("enabled") {
+        return body;
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "thinking".to_string(),
+            serde_json::json!({ "type": "adaptive" }),
+        );
+        let output_config = object
+            .entry("output_config".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(output_config_object) = output_config.as_object_mut() {
+            output_config_object
+                .entry("effort".to_string())
+                .or_insert_with(|| serde_json::json!("high"));
+        }
+    }
+
+    body
+}
+
 fn apply_devin_codex_responses_compat(mut body: Value, codex_fast_mode: bool) -> Value {
     body["store"] = Value::Bool(false);
     if codex_fast_mode {
@@ -6129,6 +6164,37 @@ mod tests {
         let normalized = normalize_anthropic_temperature_for_thinking(body);
 
         assert_eq!(normalized["temperature"], 0);
+    }
+
+    #[test]
+    fn joycode_anthropic_thinking_uses_adaptive_effort_shape() {
+        let body = json!({
+            "model": "Claude-Opus-4.8-hq",
+            "thinking": {"type": "enabled", "budget_tokens": 12000},
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1024
+        });
+
+        let normalized = normalize_joycode_anthropic_thinking(body);
+
+        assert_eq!(normalized["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(normalized["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn joycode_anthropic_thinking_preserves_existing_effort() {
+        let body = json!({
+            "model": "Claude-Opus-4.8-hq",
+            "thinking": {"type": "enabled", "budget_tokens": 12000},
+            "output_config": {"effort": "medium"},
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1024
+        });
+
+        let normalized = normalize_joycode_anthropic_thinking(body);
+
+        assert_eq!(normalized["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(normalized["output_config"]["effort"], "medium");
     }
 
     #[test]
