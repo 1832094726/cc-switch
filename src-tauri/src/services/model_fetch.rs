@@ -42,6 +42,12 @@ pub struct JoyCodeLoginState {
     pub tenant: String,
     pub login_type: String,
     pub pt_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_full_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// OpenAI 兼容的 /v1/models 响应格式
@@ -786,6 +792,9 @@ fn parse_joycode_login_state(value: &Value) -> Result<JoyCodeLoginState, String>
         tenant,
         login_type,
         pt_key,
+        master_base_url: first_string_field(value, &["masterBaseUrl", "master_base_url"]),
+        org_full_name: first_string_field(value, &["orgFullName", "org_full_name"]),
+        user_id: first_string_field(value, &["userId", "user_id", "erp"]),
     })
 }
 
@@ -1087,13 +1096,22 @@ mod tests {
             "userName": "hechengjun.9",
             "ptKey": "BJ.token",
             "loginType": "ERP",
-            "tenant": "JD"
+            "tenant": "JD",
+            "masterBaseUrl": "http://joycode-api-saas.jd.com",
+            "orgFullName": "京东集团",
+            "userId": "hechengjun.9"
         }))
         .unwrap();
         assert_eq!(state.user_name.as_deref(), Some("hechengjun.9"));
         assert_eq!(state.pt_key, "BJ.token");
         assert_eq!(state.login_type, "ERP");
         assert_eq!(state.tenant, "JD");
+        assert_eq!(
+            state.master_base_url.as_deref(),
+            Some("http://joycode-api-saas.jd.com")
+        );
+        assert_eq!(state.org_full_name.as_deref(), Some("京东集团"));
+        assert_eq!(state.user_id.as_deref(), Some("hechengjun.9"));
     }
 
     #[test]

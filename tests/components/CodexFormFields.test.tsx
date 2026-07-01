@@ -217,6 +217,9 @@ describe("CodexFormFields", () => {
       tenant: "JD",
       loginType: "ERP",
       ptKey: "synced-pt-key",
+      masterBaseUrl: "http://joycode-api-saas.jd.com",
+      orgFullName: "京东集团",
+      userId: "hechengjun.9",
     });
 
     renderCodexForm({
@@ -241,6 +244,9 @@ describe("CodexFormFields", () => {
             ptKey: "synced-pt-key",
             loginType: "ERP",
             tenant: "JD",
+            masterBaseUrl: "http://joycode-api-saas.jd.com",
+            orgFullName: "京东集团",
+            userId: "hechengjun.9",
           },
           null,
           2,

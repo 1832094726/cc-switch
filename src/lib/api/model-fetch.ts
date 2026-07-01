@@ -19,6 +19,9 @@ export interface JoyCodeLoginState {
   tenant: string;
   loginType: string;
   ptKey: string;
+  masterBaseUrl?: string | null;
+  orgFullName?: string | null;
+  userId?: string | null;
 }
 
 /**

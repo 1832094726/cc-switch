@@ -2163,10 +2163,15 @@ impl RequestForwarder {
             );
         }
         if is_joycode_upstream {
-            let prepare_base_url = devin_route
+            let prepare_base_url_fallback = devin_route
                 .as_ref()
                 .and_then(|route| route.base_url.as_deref())
                 .unwrap_or(&base_url);
+            let mut prepare_headers = joycode_provider_headers.clone();
+            prepare_headers.extend(devin_extra_headers.clone());
+            let prepare_base_url =
+                resolve_joycode_prepare_base_url(prepare_base_url_fallback, &prepare_headers);
+            let org_full_name = resolve_joycode_org_full_name(&prepare_headers);
             if is_joycode_anthropic_route {
                 log::debug!("[JoyCode] Detected Anthropic endpoint, calling prepare API");
             } else {
@@ -2210,13 +2215,13 @@ impl RequestForwarder {
 
                 match adapter
                     .get_model_prepare(
-                        prepare_base_url,
+                        &prepare_base_url,
                         upstream_model,
                         request_is_streaming,
                         pt_key,
                         login_type,
                         tenant,
-                        "京东集团", // orgFullName
+                        &org_full_name,
                     )
                     .await
                 {
@@ -4106,17 +4111,36 @@ fn collect_joycode_headers_from_json(value: &Value, headers: &mut Vec<(String, S
         "x-pt-key",
         "loginType",
         "tenant",
+        "masterBaseUrl",
+        "master_base_url",
+        "orgFullName",
+        "org_full_name",
+        "userId",
+        "user_id",
     ] {
         if let Some(value) = value.get(key).and_then(Value::as_str) {
             headers.push((key.to_string(), value.to_string()));
         }
     }
 
-    for section in ["headers", "env", "joycode"] {
+    for section in [
+        "headers",
+        "env",
+        "joycode",
+        "localProxyRequestOverrides",
+        "local_proxy_request_overrides",
+    ] {
         if let Some(object) = value.get(section).and_then(Value::as_object) {
             for (key, value) in object {
                 if let Some(value) = value.as_str() {
                     headers.push((key.clone(), value.to_string()));
+                }
+            }
+            if let Some(headers_object) = object.get("headers").and_then(Value::as_object) {
+                for (key, value) in headers_object {
+                    if let Some(value) = value.as_str() {
+                        headers.push((key.clone(), value.to_string()));
+                    }
                 }
             }
         }
@@ -4213,6 +4237,36 @@ fn extract_joycode_auth_params(headers: &[(String, String)]) -> Option<(String, 
         .unwrap_or_else(|| "JD".to_string());
 
     Some((pt_key, login_type, tenant))
+}
+
+fn find_joycode_header_value(headers: &[(String, String)], keys: &[&str]) -> Option<String> {
+    headers
+        .iter()
+        .rev()
+        .find(|(key, _)| keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate)))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_joycode_prepare_base_url(base_url: &str, headers: &[(String, String)]) -> String {
+    find_joycode_header_value(headers, &["masterBaseUrl", "master_base_url"])
+        .unwrap_or_else(|| {
+            if base_url
+                .to_ascii_lowercase()
+                .contains("joycode-api.jd.com")
+            {
+                "http://joycode-api-saas.jd.com".to_string()
+            } else {
+                base_url.to_string()
+            }
+        })
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn resolve_joycode_org_full_name(headers: &[(String, String)]) -> String {
+    find_joycode_header_value(headers, &["orgFullName", "org_full_name"])
+        .unwrap_or_else(|| "京东集团".to_string())
 }
 
 fn append_joycode_auth_headers(
@@ -6092,6 +6146,24 @@ mod tests {
         assert_eq!(outgoing["ptkey"], "BJ.secret");
         assert_eq!(outgoing["logintype"], "ERP");
         assert_eq!(outgoing["tenant"], "JD");
+    }
+
+    #[test]
+    fn joycode_prepare_base_url_uses_login_master_base_url() {
+        let headers = vec![
+            (
+                "masterBaseUrl".to_string(),
+                "http://joycode-api-saas.jd.com/".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            resolve_joycode_prepare_base_url(
+                "https://joycode-api.jd.com/api/saas/openai/v1",
+                &headers,
+            ),
+            "http://joycode-api-saas.jd.com"
+        );
     }
 
     #[test]

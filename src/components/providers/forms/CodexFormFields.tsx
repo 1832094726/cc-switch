@@ -169,7 +169,14 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
 
 function mergeJoyCodeAuthHeaders(
   headersJson: string,
-  auth: { ptKey: string; loginType: string; tenant: string },
+  auth: {
+    ptKey: string;
+    loginType: string;
+    tenant: string;
+    masterBaseUrl?: string | null;
+    orgFullName?: string | null;
+    userId?: string | null;
+  },
 ): string {
   let headers: Record<string, unknown> = {};
   if (headersJson.trim()) {
@@ -188,6 +195,9 @@ function mergeJoyCodeAuthHeaders(
       ptKey: auth.ptKey,
       loginType: auth.loginType,
       tenant: auth.tenant,
+      ...(auth.masterBaseUrl ? { masterBaseUrl: auth.masterBaseUrl } : {}),
+      ...(auth.orgFullName ? { orgFullName: auth.orgFullName } : {}),
+      ...(auth.userId ? { userId: auth.userId } : {}),
     },
     null,
     2,
@@ -478,6 +488,9 @@ export function CodexFormFields({
             ptKey: state.ptKey,
             loginType: state.loginType,
             tenant: state.tenant,
+            masterBaseUrl: state.masterBaseUrl,
+            orgFullName: state.orgFullName,
+            userId: state.userId,
           }),
         );
         toast.success(
