@@ -137,6 +137,13 @@ type PresetEntry = {
     | HermesProviderPreset;
 };
 
+const presetProviderType = (
+  preset: PresetEntry["preset"],
+): string | undefined =>
+  "providerType" in preset && typeof preset.providerType === "string"
+    ? preset.providerType
+    : undefined;
+
 const codexApiFormatFromWireApi = (
   wireApi: string | undefined,
 ): CodexApiFormat | undefined => {
@@ -420,6 +427,7 @@ function ProviderFormFull({
     category?: ProviderCategory;
     isPartner?: boolean;
     partnerPromotionKey?: string;
+    providerType?: string;
     suggestedDefaults?: OpenClawSuggestedDefaults;
   } | null>(null);
   const [isEndpointModalOpen, setIsEndpointModalOpen] = useState(false);
@@ -700,15 +708,15 @@ function ProviderFormFull({
       ? "openai_chat"
       : initialData?.meta?.apiFormat === "anthropic_messages"
         ? "anthropic_messages"
-      : initialData?.meta?.apiFormat === "openai_responses"
-        ? "openai_responses"
-        : (codexApiFormatFromWireApi(
-            extractCodexWireApi(
-              typeof initialData?.settingsConfig?.config === "string"
-                ? initialData.settingsConfig.config
-                : "",
-            ),
-          ) ?? "openai_responses");
+        : initialData?.meta?.apiFormat === "openai_responses"
+          ? "openai_responses"
+          : (codexApiFormatFromWireApi(
+              extractCodexWireApi(
+                typeof initialData?.settingsConfig?.config === "string"
+                  ? initialData.settingsConfig.config
+                  : "",
+              ),
+            ) ?? "openai_responses");
 
   const [localCodexApiFormat, setLocalCodexApiFormat] =
     useState<CodexApiFormat>(initialCodexApiFormat);
@@ -1251,6 +1259,7 @@ function ProviderFormFull({
       baseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
+      activePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
     if (isCopilotProvider && !isCopilotAuthenticated) {
       toast.error(
@@ -1383,13 +1392,21 @@ function ProviderFormFull({
       baseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
+      activePreset?.providerType === "codex_oauth" ||
       initialData?.meta?.providerType === "codex_oauth";
+    const isJoyCodeProvider =
+      activePreset?.providerType === "joycode" ||
+      initialData?.meta?.providerType === "joycode" ||
+      codexBaseUrl.toLowerCase().includes("joycode-api.jd.com");
 
     let settingsConfig: string;
 
     if (isCodexLikeApp) {
       try {
         const authJson = JSON.parse(codexAuth);
+        if (isJoyCodeProvider) {
+          delete authJson.OPENAI_API_KEY;
+        }
         let normalizedCodexConfig =
           category !== "official" && (codexConfig ?? "").trim()
             ? setCodexWireApi(codexConfig ?? "", "responses")
@@ -1409,7 +1426,7 @@ function ProviderFormFull({
           );
         }
         const authApiKey =
-          typeof authJson?.OPENAI_API_KEY === "string"
+          !isJoyCodeProvider && typeof authJson?.OPENAI_API_KEY === "string"
             ? authJson.OPENAI_API_KEY.trim()
             : "";
         normalizedCodexConfig = updateCodexExperimentalBearerToken(
@@ -1423,9 +1440,13 @@ function ProviderFormFull({
           auth: unknown;
           config: string;
           modelCatalog?: { models: CodexCatalogModel[] };
+          joycode?: Record<string, string>;
         };
         if (normalizedCatalogModels.length > 0) {
           configObj.modelCatalog = { models: normalizedCatalogModels };
+        }
+        if (isJoyCodeProvider && overridesResult.overrides?.headers) {
+          configObj.joycode = overridesResult.overrides.headers;
         }
         settingsConfig = JSON.stringify(configObj);
       } catch (err) {
@@ -1564,7 +1585,9 @@ function ProviderFormFull({
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+      templatePreset?.providerType ||
+      activePreset?.providerType ||
+      initialData?.meta?.providerType;
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
@@ -1782,6 +1805,7 @@ function ProviderFormFull({
       category: entry.preset.category,
       isPartner: entry.preset.isPartner,
       partnerPromotionKey: entry.preset.partnerPromotionKey,
+      providerType: presetProviderType(entry.preset),
     });
 
     if (isCodexLikeApp) {

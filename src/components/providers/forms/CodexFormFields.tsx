@@ -301,6 +301,7 @@ export function CodexFormFields({
   const isJoyCodeProvider =
     (providerId ?? "").toLowerCase().includes("joycode") ||
     codexBaseUrl.toLowerCase().includes("joycode-api.jd.com");
+  const usesJoyCodeLogin = appId === "codex" && isJoyCodeProvider;
   const isJoyCodeDevinProvider =
     isDevin &&
     (isJoyCodeProvider || /(?:127\.0\.0\.1|localhost):8081/.test(codexBaseUrl));
@@ -317,13 +318,14 @@ export function CodexFormFields({
   // 高级区在有任何可见配置时自动展开（仅折叠→展开，不会自动折叠）：自定义 UA /
   // 请求覆盖 / 已填模型映射 / 已配置思考能力。
   const hasRequestOverrides = Boolean(
-    localProxyHeadersOverride.trim() || localProxyBodyOverride.trim(),
+    (!usesJoyCodeLogin && localProxyHeadersOverride.trim()) ||
+      localProxyBodyOverride.trim(),
   );
   const hasAnyAdvancedValue =
     !!customUserAgent ||
     hasRequestOverrides ||
     apiFormat !== "openai_responses" ||
-    catalogModels.length > 0 ||
+    (!usesJoyCodeLogin && catalogModels.length > 0) ||
     supportsThinking ||
     supportsEffort;
   const [advancedExpanded, setAdvancedExpanded] = useState(hasAnyAdvancedValue);
@@ -467,16 +469,14 @@ export function CodexFormFields({
   );
 
   const handleJoyCodeLogin = useCallback(() => {
-    settingsApi
-      .openExternal(JOYCODE_LOGIN_URL)
-      .catch((err) => {
-        console.warn("[JoyCode] Failed to open login URL:", err);
-        toast.error(
-          t("providerForm.joycodeLoginFailed", {
-            defaultValue: "打开 JoyCode 登录页失败",
-          }),
-        );
-      });
+    settingsApi.openExternal(JOYCODE_LOGIN_URL).catch((err) => {
+      console.warn("[JoyCode] Failed to open login URL:", err);
+      toast.error(
+        t("providerForm.joycodeLoginFailed", {
+          defaultValue: "打开 JoyCode 登录页失败",
+        }),
+      );
+    });
   }, [t]);
 
   const handleSyncJoyCodeLogin = useCallback(() => {
@@ -530,7 +530,8 @@ export function CodexFormFields({
                 ? model.authHeader
                 : undefined;
             const responsesMode =
-              model.responsesMode === "standard" || model.responsesMode === "codex"
+              model.responsesMode === "standard" ||
+              model.responsesMode === "codex"
                 ? model.responsesMode
                 : undefined;
             const upstreamModel =
@@ -663,9 +664,7 @@ export function CodexFormFields({
     const isClaudeRoute = option?.family === "claude";
     const endpoint: CodexCatalogModel["endpoint"] =
       joycodeDefaults?.endpoint ??
-      (isClaudeRoute
-        ? "/v1/messages"
-        : resolveEndpointForApiFormat());
+      (isClaudeRoute ? "/v1/messages" : resolveEndpointForApiFormat());
 
     return {
       model,
@@ -719,57 +718,110 @@ export function CodexFormFields({
   return (
     <>
       {/* Codex API Key 输入框 */}
-      <ApiKeySection
-        id="codexApiKey"
-        label="API Key"
-        value={codexApiKey}
-        onChange={onApiKeyChange}
-        category={category}
-        shouldShowLink={shouldShowApiKeyLink}
-        websiteUrl={websiteUrl}
-        isPartner={isPartner}
-        partnerPromotionKey={partnerPromotionKey}
-        placeholder={{
-          official: t("providerForm.codexOfficialNoApiKey", {
-            defaultValue: "官方供应商无需 API Key",
-          }),
-          thirdParty: t("providerForm.codexApiKeyAutoFill", {
-            defaultValue: "输入 API Key，将自动填充到配置",
-          }),
-        }}
-      />
-      {isJoyCodeProvider && (
-        <div className="flex justify-end gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleJoyCodeLogin}
-            className="h-8 gap-1.5"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            {t("providerForm.loginWithJoyCode", {
-              defaultValue: "登录 JoyCode",
-            })}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={handleSyncJoyCodeLogin}
-            disabled={isSyncingJoyCodeLogin}
-            className="h-8 gap-1.5"
-          >
-            {isSyncingJoyCodeLogin ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Download className="h-3.5 w-3.5" />
-            )}
-            {t("providerForm.syncJoyCodeLogin", {
-              defaultValue: "同步 VS Code 登录态",
-            })}
-          </Button>
+      {usesJoyCodeLogin ? (
+        <div className="space-y-3 rounded-lg border border-border-default bg-muted/20 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-1">
+              <FormLabel>
+                {t("providerForm.joycodeLoginState", {
+                  defaultValue: "JoyCode 登录态",
+                })}
+              </FormLabel>
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {t("providerForm.joycodeCodexLoginStateHint", {
+                  defaultValue:
+                    "Codex 将通过 VS Code JoyCode 官方插件或本地 joycode.env 的登录态调用模型服务，无需填写 API Key。",
+                })}
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleJoyCodeLogin}
+                className="h-8 gap-1.5"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                {t("providerForm.loginWithJoyCode", {
+                  defaultValue: "登录 JoyCode",
+                })}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleSyncJoyCodeLogin}
+                disabled={isSyncingJoyCodeLogin}
+                className="h-8 gap-1.5"
+              >
+                {isSyncingJoyCodeLogin ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                {t("providerForm.syncJoyCodeLogin", {
+                  defaultValue: "同步 VS Code 登录态",
+                })}
+              </Button>
+            </div>
+          </div>
         </div>
+      ) : (
+        <>
+          <ApiKeySection
+            id="codexApiKey"
+            label="API Key"
+            value={codexApiKey}
+            onChange={onApiKeyChange}
+            category={category}
+            shouldShowLink={shouldShowApiKeyLink}
+            websiteUrl={websiteUrl}
+            isPartner={isPartner}
+            partnerPromotionKey={partnerPromotionKey}
+            placeholder={{
+              official: t("providerForm.codexOfficialNoApiKey", {
+                defaultValue: "官方供应商无需 API Key",
+              }),
+              thirdParty: t("providerForm.codexApiKeyAutoFill", {
+                defaultValue: "输入 API Key，将自动填充到配置",
+              }),
+            }}
+          />
+          {isJoyCodeProvider && (
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleJoyCodeLogin}
+                className="h-8 gap-1.5"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                {t("providerForm.loginWithJoyCode", {
+                  defaultValue: "登录 JoyCode",
+                })}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={handleSyncJoyCodeLogin}
+                disabled={isSyncingJoyCodeLogin}
+                className="h-8 gap-1.5"
+              >
+                {isSyncingJoyCodeLogin ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                {t("providerForm.syncJoyCodeLogin", {
+                  defaultValue: "同步 VS Code 登录态",
+                })}
+              </Button>
+            </div>
+          )}
+        </>
       )}
 
       {/* Codex Base URL 输入框 */}

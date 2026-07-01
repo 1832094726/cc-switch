@@ -36,6 +36,8 @@ export interface CodexProviderPreset {
   modelCatalog?: CodexCatalogModel[];
   // Codex Responses -> Chat Completions reasoning capability defaults
   codexChatReasoning?: CodexChatReasoning;
+  // Managed/local-login provider marker for special auth handling.
+  providerType?: "joycode" | "codex_oauth";
 }
 
 /**
@@ -121,7 +123,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     name: "JoyCode",
     websiteUrl: "https://joycode-api.jd.com",
     category: "third_party",
-    auth: generateThirdPartyAuth("sk-joycode-proxy"),
+    auth: generateThirdPartyAuth(""),
     config: `model_provider = "custom"
 model = "GPT 5.3-codex"
 review_model = "GPT 5.3-codex"
@@ -135,6 +137,7 @@ wire_api = "responses"
 requires_openai_auth = true`,
     endpointCandidates: ["https://joycode-api.jd.com/api/saas/openai/v1"],
     apiFormat: "openai_responses",
+    providerType: "joycode",
     modelCatalog: modelCatalog([
       {
         model: "GPT 5.3-codex",
@@ -1452,7 +1455,11 @@ base_url = "https://cc-api.pipellm.ai/v1"`,
     name: "Muyuan",
     websiteUrl: "https://muyuan.do",
     auth: generateThirdPartyAuth(""),
-    config: generateThirdPartyConfig("muyuan", "https://muyuan.do/v1", "gpt-5.5"),
+    config: generateThirdPartyConfig(
+      "muyuan",
+      "https://muyuan.do/v1",
+      "gpt-5.5",
+    ),
     endpointCandidates: ["https://muyuan.do/v1"],
     category: "aggregator",
     apiFormat: "openai_chat",
