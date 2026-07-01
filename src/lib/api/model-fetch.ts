@@ -5,6 +5,13 @@ import { toast } from "sonner";
 export interface FetchedModel {
   id: string;
   ownedBy: string | null;
+  displayName?: string | null;
+  contextWindow?: number | null;
+  upstreamModel?: string | null;
+  provider?: "openai" | "anthropic" | string | null;
+  endpoint?: string | null;
+  authHeader?: "bearer" | "x-api-key" | string | null;
+  responsesMode?: "standard" | "codex" | string | null;
 }
 
 export interface JoyCodeLoginState {

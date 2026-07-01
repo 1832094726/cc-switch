@@ -137,8 +137,25 @@ describe("CodexFormFields", () => {
   it("uses the JoyCode official model list command and merges fetched models into the catalog", async () => {
     const onCatalogModelsChange = vi.fn();
     modelFetchApiMock.fetchJoycodeModelsForConfig.mockResolvedValue([
-      { id: "GPT 5.3-codex", ownedBy: null },
-      { id: "Claude-Sonnet-4.6-hq", ownedBy: "claude-sonnet-4-6" },
+      {
+        id: "GPT-5.3-codex",
+        ownedBy: "openai-response",
+        displayName: "GPT-5.3-codex",
+        upstreamModel: "GPT 5.3-codex",
+        provider: "openai",
+        endpoint: "/v1/responses",
+        authHeader: "bearer",
+        responsesMode: "codex",
+      },
+      {
+        id: "Claude-Sonnet-4.6",
+        ownedBy: "anthropic",
+        displayName: "Claude-Sonnet-4.6",
+        upstreamModel: "Claude-Sonnet-4.6-hq",
+        provider: "anthropic",
+        endpoint: "/v1/messages",
+        authHeader: "x-api-key",
+      },
     ]);
 
     renderCodexForm({
@@ -159,8 +176,19 @@ describe("CodexFormFields", () => {
       );
       expect(onCatalogModelsChange).toHaveBeenCalledWith(
         expect.arrayContaining([
-          expect.objectContaining({ model: "GPT 5.3-codex" }),
-          expect.objectContaining({ model: "Claude-Sonnet-4.6-hq" }),
+          expect.objectContaining({
+            model: "GPT-5.3-codex",
+            upstreamModel: "GPT 5.3-codex",
+            endpoint: "/v1/responses",
+            responsesMode: "codex",
+          }),
+          expect.objectContaining({
+            model: "Claude-Sonnet-4.6",
+            upstreamModel: "Claude-Sonnet-4.6-hq",
+            provider: "anthropic",
+            endpoint: "/v1/messages",
+            authHeader: "x-api-key",
+          }),
         ]),
       );
     });

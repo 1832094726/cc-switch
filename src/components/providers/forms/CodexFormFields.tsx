@@ -358,7 +358,14 @@ export function CodexFormFields({
         provider,
         ...rest
       }) => {
-        if (!isDevin) return rest;
+        if (!isDevin) {
+          return {
+            ...rest,
+            ...(provider ? { provider } : {}),
+            ...(endpoint ? { endpoint } : {}),
+            ...(authHeader ? { authHeader } : {}),
+          };
+        }
         const normalizedEndpoint = endpoint ?? "/v1/responses";
         const routeBaseUrl = (
           isDevin ? codexBaseUrl || baseUrl : baseUrl
@@ -500,13 +507,35 @@ export function CodexFormFields({
         const seen = new Set(current.map((row) => row.model));
         const additions = models
           .filter((model) => model.id && !seen.has(model.id))
-          .map((model) =>
-            createCatalogRow({
+          .map((model) => {
+            const provider =
+              model.provider === "anthropic" || model.provider === "openai"
+                ? model.provider
+                : undefined;
+            const authHeader =
+              model.authHeader === "bearer" || model.authHeader === "x-api-key"
+                ? model.authHeader
+                : undefined;
+            const responsesMode =
+              model.responsesMode === "standard" || model.responsesMode === "codex"
+                ? model.responsesMode
+                : undefined;
+            const upstreamModel =
+              model.upstreamModel && model.upstreamModel !== model.id
+                ? model.upstreamModel
+                : undefined;
+
+            return createCatalogRow({
               model: model.id,
-              displayName: model.id,
-              contextWindow: 256000,
-            }),
-          );
+              displayName: model.displayName ?? model.id,
+              contextWindow: model.contextWindow ?? 256000,
+              upstreamModel,
+              provider,
+              endpoint: model.endpoint ?? undefined,
+              authHeader,
+              responsesMode,
+            });
+          });
         return additions.length > 0 ? [...current, ...additions] : current;
       });
     },

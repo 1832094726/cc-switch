@@ -1657,6 +1657,24 @@ impl RequestForwarder {
             adapter.build_url(&base_url, &effective_endpoint)
         };
 
+        if is_joycode_upstream {
+            let requested_model = mapped_body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>");
+            log::info!(
+                "[JoyCode] Routing request: app={:?} provider={} requested_model={} effective_endpoint={} color_gateway={} upstream_url={}",
+                app_type,
+                provider.name,
+                requested_model,
+                effective_endpoint,
+                is_joycode_anthropic_route
+                    || devin_upstream_is_responses
+                    || devin_upstream_is_chat,
+                url
+            );
+        }
+
         // 记录映射后的出站模型名（此时 mapped_body 已完成接管映射 / [1m] 剥离 /
         // Copilot 归一化）。格式转换后若 body 仍带 model 字段会在下方刷新覆盖；
         // gemini_native 等模型在 URL 中的格式则保留此处的转换前真值。
@@ -2134,6 +2152,16 @@ impl RequestForwarder {
         } else {
             None
         };
+        if is_joycode_upstream {
+            log::info!(
+                "[JoyCode] Auth state before upstream call: {}",
+                if joycode_auth_params.is_some() {
+                    "present"
+                } else {
+                    "missing"
+                }
+            );
+        }
         if is_joycode_upstream {
             let prepare_base_url = devin_route
                 .as_ref()

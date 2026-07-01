@@ -19,6 +19,20 @@ use std::time::Duration;
 pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +131,13 @@ pub async fn fetch_models(
                 .map(|m| FetchedModel {
                     id: m.id,
                     owned_by: m.owned_by,
+                    display_name: None,
+                    context_window: None,
+                    upstream_model: None,
+                    provider: None,
+                    endpoint: None,
+                    auth_header: None,
+                    responses_mode: None,
                 })
                 .collect();
 
@@ -571,18 +592,13 @@ fn normalize_joycode_model_list(value: &Value) -> Result<Vec<FetchedModel>, Stri
     let mut models: Vec<FetchedModel> = array
         .iter()
         .filter_map(|entry| {
-            let id = first_string_field(
-                entry,
-                &[
-                    "label",
-                    "model",
-                    "id",
-                    "name",
-                    "chatApiModel",
-                    "apiModel",
-                    "modelName",
-                ],
-            )?;
+            let label = first_string_field(entry, &["label", "name", "displayName"]);
+            let upstream_model =
+                first_string_field(entry, &["chatApiModel", "apiModel", "modelName", "model"]);
+            let id = label
+                .clone()
+                .or_else(|| upstream_model.clone())
+                .or_else(|| first_string_field(entry, &["id"]))?;
             let hidden = entry
                 .get("hidden")
                 .and_then(Value::as_bool)
@@ -597,9 +613,26 @@ fn normalize_joycode_model_list(value: &Value) -> Result<Vec<FetchedModel>, Stri
             ) {
                 return None;
             }
+            let adapter_type = joycode_adapter_type(entry);
+            let provider = joycode_provider_from_adapter(adapter_type.as_deref());
+            let endpoint = joycode_endpoint_from_adapter(adapter_type.as_deref());
+            let auth_header = joycode_auth_header_from_adapter(adapter_type.as_deref());
+            let responses_mode = adapter_type
+                .as_deref()
+                .is_some_and(|adapter| adapter.eq_ignore_ascii_case("openai-response"))
+                .then(|| "codex".to_string());
             Some(FetchedModel {
                 id,
-                owned_by: first_string_field(entry, &["chatApiModel", "provider", "owned_by"]),
+                owned_by: adapter_type
+                    .clone()
+                    .or_else(|| first_string_field(entry, &["provider", "owned_by"])),
+                display_name: label,
+                context_window: integer_field(entry, &["maxTotalTokens", "contextWindow"]),
+                upstream_model,
+                provider,
+                endpoint,
+                auth_header,
+                responses_mode,
             })
         })
         .collect();
@@ -607,6 +640,58 @@ fn normalize_joycode_model_list(value: &Value) -> Result<Vec<FetchedModel>, Stri
     models.sort_by(|a, b| a.id.cmp(&b.id));
     models.dedup_by(|a, b| a.id == b.id);
     Ok(models)
+}
+
+fn joycode_adapter_type(entry: &Value) -> Option<String> {
+    first_string_field(entry, &["adapterType", "adapter_type"]).or_else(|| {
+        entry
+            .get("extJson")
+            .and_then(|value| {
+                if let Some(raw) = value.as_str() {
+                    serde_json::from_str::<Value>(raw).ok()
+                } else {
+                    Some(value.clone())
+                }
+            })
+            .and_then(|ext| first_string_field(&ext, &["adapterType", "adapter_type"]))
+    })
+}
+
+fn joycode_provider_from_adapter(adapter_type: Option<&str>) -> Option<String> {
+    match adapter_type.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("anthropic") => Some("anthropic".to_string()),
+        Some("openai") | Some("openai-response") => Some("openai".to_string()),
+        _ => None,
+    }
+}
+
+fn joycode_endpoint_from_adapter(adapter_type: Option<&str>) -> Option<String> {
+    match adapter_type.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("anthropic") => Some("/v1/messages".to_string()),
+        Some("openai-response") => Some("/v1/responses".to_string()),
+        Some("openai") => Some("/v1/chat/completions".to_string()),
+        _ => None,
+    }
+}
+
+fn joycode_auth_header_from_adapter(adapter_type: Option<&str>) -> Option<String> {
+    match adapter_type.map(|value| value.to_ascii_lowercase()).as_deref() {
+        Some("anthropic") => Some("x-api-key".to_string()),
+        Some("openai") | Some("openai-response") => Some("bearer".to_string()),
+        _ => None,
+    }
+}
+
+fn integer_field(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+            })
+        })
+    })
 }
 
 fn first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
@@ -950,7 +1035,9 @@ mod tests {
             {
                 "label": "Claude-Sonnet-4.6-hq",
                 "chatApiModel": "claude-sonnet-4-6",
-                "modelFunctionType": "agent"
+                "modelFunctionType": "agent",
+                "maxTotalTokens": 256000,
+                "extJson": "{\"adapterType\":\"anthropic\"}"
             },
             {
                 "label": "Hidden",
@@ -970,11 +1057,25 @@ mod tests {
             vec![
                 FetchedModel {
                     id: "Claude-Sonnet-4.6-hq".to_string(),
-                    owned_by: Some("claude-sonnet-4-6".to_string()),
+                    owned_by: Some("anthropic".to_string()),
+                    display_name: Some("Claude-Sonnet-4.6-hq".to_string()),
+                    context_window: Some(256000),
+                    upstream_model: Some("claude-sonnet-4-6".to_string()),
+                    provider: Some("anthropic".to_string()),
+                    endpoint: Some("/v1/messages".to_string()),
+                    auth_header: Some("x-api-key".to_string()),
+                    responses_mode: None,
                 },
                 FetchedModel {
                     id: "GPT 5.3-codex".to_string(),
                     owned_by: None,
+                    display_name: None,
+                    context_window: None,
+                    upstream_model: Some("GPT 5.3-codex".to_string()),
+                    provider: None,
+                    endpoint: None,
+                    auth_header: None,
+                    responses_mode: None,
                 },
             ]
         );
