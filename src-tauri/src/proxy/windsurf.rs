@@ -1044,12 +1044,26 @@ impl StreamProcessor {
         }
     }
 
+    fn model_uid(&self) -> &str {
+        match self {
+            Self::Anthropic(processor) => &processor.model_uid,
+            Self::OpenAI(processor) => &processor.model_uid,
+        }
+    }
+
     fn process_sse_block(&mut self, block: &str, latency_ms: f64) -> Vec<Vec<u8>> {
         let Some(event) = parse_sse_block(block) else {
             return Vec::new();
         };
 
         if let Some(error) = error_message_from_sse(&event) {
+            log::error!(
+                "[Devin/Windsurf] Upstream SSE error event: message_id={}, model_uid={}, event={}, error={}",
+                self.message_id(),
+                self.model_uid(),
+                event.event,
+                super::sensitive_redaction::redact_sensitive_text(&error)
+            );
             let frames = vec![build_error_chunk(
                 self.message_id(),
                 &format!("[API Error] {error}"),
