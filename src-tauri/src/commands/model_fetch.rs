@@ -29,3 +29,14 @@ pub async fn fetch_models_for_config(
     )
     .await
 }
+
+/// 获取 JoyCode 官方模型列表。
+///
+/// JoyCode 官方插件使用 Color 网关 + 登录态头获取模型列表，不兼容普通
+/// OpenAI `/models`。`auth_headers_json` 复用表单里的本地代理 Header 覆盖。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn fetch_joycode_models_for_config(
+    auth_headers_json: Option<String>,
+) -> Result<Vec<FetchedModel>, String> {
+    model_fetch::fetch_joycode_models(auth_headers_json.as_deref()).await
+}

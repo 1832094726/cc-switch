@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ComponentProps, PropsWithChildren } from "react";
 import { useForm } from "react-hook-form";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,13 +6,22 @@ import { CodexFormFields } from "@/components/providers/forms/CodexFormFields";
 import { Form } from "@/components/ui/form";
 
 const modelFetchApiMock = vi.hoisted(() => ({
+  fetchJoycodeModelsForConfig: vi.fn(),
   fetchModelsForConfig: vi.fn(),
   showFetchModelsError: vi.fn(),
 }));
+const settingsApiMock = vi.hoisted(() => ({
+  openExternal: vi.fn(),
+}));
 
 vi.mock("@/lib/api/model-fetch", () => ({
+  fetchJoycodeModelsForConfig: modelFetchApiMock.fetchJoycodeModelsForConfig,
   fetchModelsForConfig: modelFetchApiMock.fetchModelsForConfig,
   showFetchModelsError: modelFetchApiMock.showFetchModelsError,
+}));
+
+vi.mock("@/lib/api", () => ({
+  settingsApi: settingsApiMock,
 }));
 
 type CodexFormFieldsProps = ComponentProps<typeof CodexFormFields>;
@@ -67,7 +76,9 @@ const renderCodexForm = (overrides: Partial<CodexFormFieldsProps> = {}) => {
 
 describe("CodexFormFields", () => {
   beforeEach(() => {
+    modelFetchApiMock.fetchJoycodeModelsForConfig.mockResolvedValue([]);
     modelFetchApiMock.fetchModelsForConfig.mockResolvedValue([]);
+    settingsApiMock.openExternal.mockResolvedValue(undefined);
     if (!Element.prototype.hasPointerCapture) {
       Element.prototype.hasPointerCapture = () => false;
     }
@@ -112,6 +123,54 @@ describe("CodexFormFields", () => {
     expect(screen.getByDisplayValue("claude-sonnet-4-6")).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "上游端点" })).toHaveTextContent(
       "/v1/messages",
+    );
+  });
+
+  it("uses the JoyCode official model list command and merges fetched models into the catalog", async () => {
+    const onCatalogModelsChange = vi.fn();
+    modelFetchApiMock.fetchJoycodeModelsForConfig.mockResolvedValue([
+      { id: "GPT 5.3-codex", ownedBy: null },
+      { id: "Claude-Sonnet-4.6-hq", ownedBy: "claude-sonnet-4-6" },
+    ]);
+
+    renderCodexForm({
+      providerId: "joycode",
+      codexBaseUrl: "https://joycode-api.jd.com/api/saas/openai/v1",
+      codexApiKey: "",
+      localProxyHeadersOverride: '{ "ptKey": "pt-key", "tenant": "JD" }',
+      onCatalogModelsChange,
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /providerForm.fetchModels/ }),
+    );
+
+    await waitFor(() => {
+      expect(modelFetchApiMock.fetchJoycodeModelsForConfig).toHaveBeenCalledWith(
+        '{ "ptKey": "pt-key", "tenant": "JD" }',
+      );
+      expect(onCatalogModelsChange).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({ model: "GPT 5.3-codex" }),
+          expect.objectContaining({ model: "Claude-Sonnet-4.6-hq" }),
+        ]),
+      );
+    });
+    expect(modelFetchApiMock.fetchModelsForConfig).not.toHaveBeenCalled();
+  });
+
+  it("shows a JoyCode login button that opens the official browser login page", () => {
+    renderCodexForm({
+      providerId: "joycode",
+      codexBaseUrl: "https://joycode-api.jd.com/api/saas/openai/v1",
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /登录 JoyCode|Login with JoyCode/ }),
+    );
+
+    expect(settingsApiMock.openExternal).toHaveBeenCalledWith(
+      "http://joycoder.jd.com?login=1&ideAppName=vscode&fromIde=joycode-plugin&redirect=0",
     );
   });
 });

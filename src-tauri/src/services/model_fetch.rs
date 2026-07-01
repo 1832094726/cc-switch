@@ -4,13 +4,15 @@
 //! 主要面向第三方聚合站（硅基流动、OpenRouter 等），以及把 Anthropic
 //! 协议挂在兼容子路径上的官方供应商（DeepSeek、Kimi、智谱 GLM 等）。
 
-use reqwest::header::{HeaderValue, USER_AGENT};
+use hmac::{Hmac, Mac};
+use reqwest::header::{HeaderValue, CONTENT_TYPE, USER_AGENT};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 /// 获取到的模型信息
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchedModel {
     pub id: String,
@@ -30,6 +32,11 @@ struct ModelEntry {
 }
 
 const FETCH_TIMEOUT_SECS: u64 = 15;
+const JOYCODE_COLOR_GATEWAY_URL: &str = "https://api-ai.jd.com/api";
+const JOYCODE_COLOR_GATEWAY_APPID: &str = "joycode_ide";
+const JOYCODE_COLOR_GATEWAY_SECRET: &[u8] = b"0691a3f0b37b4a85aeb63ad0fc7db3ed";
+const JOYCODE_PLUGIN_CONFIG_FUNCTION_ID: &str = "plugin_config";
+const JOYCODE_MODEL_LIST_FUNCTION_ID: &str = "joycode_modelList";
 
 /// 404/405 响应体截断长度：避免把几十 KB HTML 404 页整页保留到错误串里。
 const ERROR_BODY_MAX_CHARS: usize = 512;
@@ -122,6 +129,98 @@ pub async fn fetch_models(
     ))
 }
 
+/// 获取 JoyCode 官方模型列表。
+///
+/// 参考官方 JoyCode VS Code 插件：
+/// 1. JD 租户优先请求 `plugin_config` 的 `customModelList`
+/// 2. 无覆盖时请求 `joycode_modelList`
+/// 3. 两个接口均通过 Color 网关签名，并带 JoyCode 登录态头
+pub async fn fetch_joycode_models(
+    auth_headers_json: Option<&str>,
+) -> Result<Vec<FetchedModel>, String> {
+    let auth = collect_joycode_auth(auth_headers_json)?;
+    let client = crate::proxy::http_client::get();
+
+    if auth.tenant == "JD" {
+        if let Ok(Some(models)) = fetch_joycode_custom_model_list(&client, &auth).await {
+            return Ok(models);
+        }
+    }
+
+    let response =
+        post_joycode_color_gateway(&client, JOYCODE_MODEL_LIST_FUNCTION_ID, &auth, json!({}))
+            .await?;
+    let models = normalize_joycode_model_list(response.get("data").unwrap_or(&response))?;
+    Ok(models)
+}
+
+async fn fetch_joycode_custom_model_list(
+    client: &reqwest::Client,
+    auth: &JoyCodeAuth,
+) -> Result<Option<Vec<FetchedModel>>, String> {
+    let response = post_joycode_color_gateway(
+        client,
+        JOYCODE_PLUGIN_CONFIG_FUNCTION_ID,
+        auth,
+        json!({ "sceneType": "customModelList" }),
+    )
+    .await?;
+    let root = response.get("data").unwrap_or(&response);
+    let Some(custom_model_list) = root.get("customModelList") else {
+        return Ok(None);
+    };
+    let enabled = custom_model_list
+        .get("enable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+    let Some(model_list) = custom_model_list.get("modelList") else {
+        return Ok(None);
+    };
+    let models = normalize_joycode_model_list(model_list)?;
+    if models.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(models))
+    }
+}
+
+async fn post_joycode_color_gateway(
+    client: &reqwest::Client,
+    function_id: &str,
+    auth: &JoyCodeAuth,
+    body: Value,
+) -> Result<Value, String> {
+    let url = build_joycode_color_gateway_url(function_id)?;
+    let response = client
+        .post(url)
+        .header(CONTENT_TYPE, "application/json; charset=UTF-8")
+        .header("ptKey", auth.pt_key.clone())
+        .header("loginType", auth.login_type.clone())
+        .header("tenant", auth.tenant.clone())
+        .json(&body)
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|e| format!("JoyCode model list request failed: {e}"))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read JoyCode model list response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", truncate_body(text)));
+    }
+    if text.contains("<!DOCTYPE html>") {
+        return Err("Server returned HTML error page instead of JSON".to_string());
+    }
+    serde_json::from_str(&text)
+        .map_err(|e| format!("Failed to parse JoyCode model list response: {e}"))
+}
+
 /// 构造「模型列表端点」的候选 URL 列表
 ///
 /// 候选顺序：
@@ -207,6 +306,295 @@ fn truncate_body(body: String) -> String {
         s.push('…');
         s
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoyCodeAuth {
+    pt_key: String,
+    login_type: String,
+    tenant: String,
+}
+
+fn build_joycode_color_gateway_url(function_id: &str) -> Result<String, String> {
+    let timestamp_ms = chrono::Utc::now().timestamp_millis().to_string();
+    let params = vec![
+        ("appid", JOYCODE_COLOR_GATEWAY_APPID.to_string()),
+        ("functionId", function_id.to_string()),
+        ("t", timestamp_ms),
+    ];
+    let sign = joycode_color_gateway_sign(&params);
+    let mut url = url::Url::parse(JOYCODE_COLOR_GATEWAY_URL)
+        .map_err(|e| format!("Invalid JoyCode gateway URL: {e}"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in &params {
+            query.append_pair(key, value);
+        }
+        query.append_pair("sign", &sign);
+    }
+    Ok(url.to_string())
+}
+
+fn joycode_color_gateway_sign(params: &[(&str, String)]) -> String {
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    let mut pairs = params.iter().collect::<Vec<_>>();
+    pairs.sort_by(|left, right| left.0.cmp(right.0));
+    let sign_text = pairs
+        .into_iter()
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let mut mac = HmacSha256::new_from_slice(JOYCODE_COLOR_GATEWAY_SECRET)
+        .expect("JoyCode color gateway HMAC key is valid");
+    mac.update(sign_text.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn collect_joycode_auth(auth_headers_json: Option<&str>) -> Result<JoyCodeAuth, String> {
+    let mut headers = Vec::new();
+
+    if let Ok(cookie) = std::env::var("JOYCODE_COOKIE") {
+        headers.push(("cookie".to_string(), cookie));
+    }
+    if let Ok(cookie) = std::env::var("DEVIN_JOYCODE_COOKIE") {
+        headers.push(("cookie".to_string(), cookie));
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        for path in [
+            format!("{home}/.ccswitch/joycode.env"),
+            format!("{home}/.ccswitch/devin.toml"),
+        ] {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                collect_joycode_headers_from_env_like(&content, &mut headers);
+                collect_joycode_headers_from_toml(&content, &mut headers);
+                break;
+            }
+        }
+    }
+
+    // 表单里显式填写的 Header 覆盖优先级最高；环境变量 / 文件只作为兜底。
+    collect_joycode_headers_from_json_str(auth_headers_json, &mut headers);
+
+    promote_joycode_cookie_header_pairs(&mut headers);
+
+    let pt_key = find_header_value(&headers, &["ptKey", "ptkey", "pt_key", "x-pt-key"])
+        .or_else(|| {
+            find_header_value(&headers, &["cookie"])
+                .and_then(|cookie| extract_cookie_value(&cookie, "pt_key"))
+        })
+        .ok_or_else(|| {
+            "JoyCode 登录态缺少 ptKey；请在本地代理 Header 覆盖、JOYCODE_COOKIE 或 ~/.ccswitch/joycode.env 中配置".to_string()
+        })?;
+
+    let login_type = find_header_value(&headers, &["loginType", "logintype"])
+        .unwrap_or_else(|| "ERP".to_string());
+    let tenant = find_header_value(&headers, &["tenant"]).unwrap_or_else(|| "JD".to_string());
+
+    Ok(JoyCodeAuth {
+        pt_key,
+        login_type,
+        tenant,
+    })
+}
+
+fn collect_joycode_headers_from_json_str(raw: Option<&str>, headers: &mut Vec<(String, String)>) {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return;
+    };
+    collect_joycode_headers_from_json_value(&value, headers);
+}
+
+fn collect_joycode_headers_from_json_value(value: &Value, headers: &mut Vec<(String, String)>) {
+    for key in [
+        "cookie",
+        "joycode_cookie",
+        "joycodeCookie",
+        "pt_key",
+        "ptKey",
+        "ptkey",
+        "x-pt-key",
+        "loginType",
+        "tenant",
+    ] {
+        if let Some(value) = value.get(key).and_then(Value::as_str) {
+            headers.push((key.to_string(), value.to_string()));
+        }
+    }
+
+    for section in ["headers", "env", "joycode"] {
+        if let Some(object) = value.get(section).and_then(Value::as_object) {
+            for (key, value) in object {
+                if let Some(value) = value.as_str() {
+                    headers.push((key.clone(), value.to_string()));
+                }
+            }
+        }
+    }
+}
+
+fn collect_joycode_headers_from_env_like(content: &str, headers: &mut Vec<(String, String)>) {
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if !value.is_empty() {
+            headers.push((key.trim().to_string(), value));
+        }
+    }
+}
+
+fn collect_joycode_headers_from_toml(content: &str, headers: &mut Vec<(String, String)>) {
+    let Ok(doc) = content.parse::<toml::Value>() else {
+        return;
+    };
+    collect_joycode_headers_from_toml_value(&doc, headers);
+    for section in ["headers", "env", "joycode"] {
+        if let Some(value) = doc.get(section) {
+            collect_joycode_headers_from_toml_value(value, headers);
+            if section == "joycode" {
+                if let Some(value) = value.get("headers") {
+                    collect_joycode_headers_from_toml_value(value, headers);
+                }
+                if let Some(value) = value.get("env") {
+                    collect_joycode_headers_from_toml_value(value, headers);
+                }
+            }
+        }
+    }
+}
+
+fn collect_joycode_headers_from_toml_value(
+    value: &toml::Value,
+    headers: &mut Vec<(String, String)>,
+) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (key, value) in table {
+        let value = match value {
+            toml::Value::String(value) => Some(value.trim().to_string()),
+            toml::Value::Integer(value) => Some(value.to_string()),
+            toml::Value::Float(value) => Some(value.to_string()),
+            toml::Value::Boolean(value) => Some(value.to_string()),
+            _ => None,
+        };
+        if let Some(value) = value.filter(|value| !value.is_empty()) {
+            headers.push((key.clone(), value));
+        }
+    }
+}
+
+fn promote_joycode_cookie_header_pairs(headers: &mut Vec<(String, String)>) {
+    let cookie = find_header_value(headers, &["cookie", "joycode_cookie", "joycodeCookie"]);
+
+    if let Some(cookie) = cookie {
+        headers.push(("cookie".to_string(), cookie.clone()));
+        if let Some(pt_key) = extract_cookie_value(&cookie, "pt_key") {
+            headers.push(("pt_key".to_string(), pt_key.clone()));
+            headers.push(("x-pt-key".to_string(), pt_key));
+        }
+    }
+}
+
+fn find_header_value(headers: &[(String, String)], keys: &[&str]) -> Option<String> {
+    headers
+        .iter()
+        .rev()
+        .find(|(key, _)| {
+            keys.iter()
+                .any(|candidate| key.eq_ignore_ascii_case(candidate))
+        })
+        .map(|(_, value)| value.clone())
+}
+
+fn extract_cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+fn normalize_joycode_model_list(value: &Value) -> Result<Vec<FetchedModel>, String> {
+    let array = if let Some(array) = value.as_array() {
+        array
+    } else if let Some(array) = value.get("modelList").and_then(Value::as_array) {
+        array
+    } else if let Some(array) = value.get("models").and_then(Value::as_array) {
+        array
+    } else {
+        return Ok(Vec::new());
+    };
+
+    let mut models: Vec<FetchedModel> = array
+        .iter()
+        .filter_map(|entry| {
+            let id = first_string_field(
+                entry,
+                &[
+                    "label",
+                    "model",
+                    "id",
+                    "name",
+                    "chatApiModel",
+                    "apiModel",
+                    "modelName",
+                ],
+            )?;
+            let hidden = entry
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if hidden {
+                return None;
+            }
+            let function_type = first_string_field(entry, &["modelFunctionType"]);
+            if !matches!(
+                function_type.as_deref(),
+                None | Some("ALL") | Some("chat") | Some("agent")
+            ) {
+                return None;
+            }
+            Some(FetchedModel {
+                id,
+                owned_by: first_string_field(entry, &["chatApiModel", "provider", "owned_by"]),
+            })
+        })
+        .collect();
+
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
+
+fn first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 /// 若 baseURL 以任一已知兼容子路径结尾，返回剥离后的剩余部分；否则 `None`。
@@ -416,6 +804,71 @@ mod tests {
                 "https://www.right.codes/claude/v1/models",
                 "https://www.right.codes/v1/models",
                 "https://www.right.codes/models",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_joycode_color_gateway_sign_matches_official_algorithm() {
+        let sign = joycode_color_gateway_sign(&[
+            ("functionId", "joycode_modelList".to_string()),
+            ("appid", "joycode_ide".to_string()),
+            ("t", "1700000000000".to_string()),
+        ]);
+        assert_eq!(
+            sign,
+            "75c751241df294d1fc67f241bdbd535e07b95a7b5c95a99a7b78464d5d9b93a7"
+        );
+    }
+
+    #[test]
+    fn test_collect_joycode_auth_from_headers_json_cookie() {
+        let auth = collect_joycode_auth(Some(
+            r#"{"cookie":"pt_key=abc; other=1","loginType":"N_PIN_PC","tenant":"JD"}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            auth,
+            JoyCodeAuth {
+                pt_key: "abc".to_string(),
+                login_type: "N_PIN_PC".to_string(),
+                tenant: "JD".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_normalize_joycode_model_list_filters_and_sorts() {
+        let models = normalize_joycode_model_list(&json!([
+            {
+                "label": "Claude-Sonnet-4.6-hq",
+                "chatApiModel": "claude-sonnet-4-6",
+                "modelFunctionType": "agent"
+            },
+            {
+                "label": "Hidden",
+                "hidden": true
+            },
+            {
+                "label": "Embedding",
+                "modelFunctionType": "embedding"
+            },
+            {
+                "model": "GPT 5.3-codex"
+            }
+        ]))
+        .unwrap();
+        assert_eq!(
+            models,
+            vec![
+                FetchedModel {
+                    id: "Claude-Sonnet-4.6-hq".to_string(),
+                    owned_by: Some("claude-sonnet-4-6".to_string()),
+                },
+                FetchedModel {
+                    id: "GPT 5.3-codex".to_string(),
+                    owned_by: None,
+                },
             ]
         );
     }

@@ -30,6 +30,20 @@ export async function fetchModelsForConfig(
 }
 
 /**
+ * 获取 JoyCode 官方模型列表。
+ *
+ * JoyCode 官方插件通过 Color 网关和登录态头获取模型列表，不兼容普通
+ * OpenAI `/models`。这里复用本地代理 Header 覆盖中的 ptKey/cookie 等字段。
+ */
+export async function fetchJoycodeModelsForConfig(
+  authHeadersJson?: string,
+): Promise<FetchedModel[]> {
+  return invoke("fetch_joycode_models_for_config", {
+    authHeadersJson: authHeadersJson || null,
+  });
+}
+
+/**
  * 获取 Codex OAuth (ChatGPT Plus/Pro 反代) 可用模型列表
  *
  * Codex OAuth 使用 ChatGPT 的 backend-api/codex 端点，不兼容普通 /v1/models。

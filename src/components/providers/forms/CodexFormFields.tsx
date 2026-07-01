@@ -22,6 +22,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  ExternalLink,
   Loader2,
   Plus,
   Trash2,
@@ -29,10 +30,12 @@ import {
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelDropdown } from "./shared";
 import {
+  fetchJoycodeModelsForConfig,
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
+import { settingsApi } from "@/lib/api";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { DEVIN_WINDSURF_MODEL_OPTIONS } from "@/config/devinProviderPresets";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
@@ -100,6 +103,8 @@ type CodexCatalogRow = CodexCatalogModel & { rowId: string };
 const DEVIN_CUSTOM_MODEL_VALUE = "__cc_switch_devin_custom_model__";
 const DEVIN_DEFAULT_AUTH_HEADER: NonNullable<CodexCatalogModel["authHeader"]> =
   "bearer";
+const JOYCODE_LOGIN_URL =
+  "http://joycoder.jd.com?login=1&ideAppName=vscode&fromIde=joycode-plugin&redirect=0";
 const JOYCODE_DEVIN_ROUTE_DEFAULTS: Record<
   string,
   Pick<
@@ -254,10 +259,12 @@ export function CodexFormFields({
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const isDevin = appId === "devin";
+  const isJoyCodeProvider =
+    (providerId ?? "").toLowerCase().includes("joycode") ||
+    codexBaseUrl.toLowerCase().includes("joycode-api.jd.com");
   const isJoyCodeDevinProvider =
     isDevin &&
-    ((providerId ?? "").toLowerCase().includes("joycode") ||
-      /(?:127\.0\.0\.1|localhost):8081/.test(codexBaseUrl));
+    (isJoyCodeProvider || /(?:127\.0\.0\.1|localhost):8081/.test(codexBaseUrl));
   // 思考能力随 Chat 格式显示（仅 Chat Completions 转换路径用得上）；模型映射常驻
   //（填了才生成 catalog）。两者都已与「路由接管」概念解耦。
   const isChatFormat = apiFormat === "openai_chat";
@@ -413,24 +420,63 @@ export function CodexFormFields({
     [codexChatReasoning, onCodexChatReasoningChange],
   );
 
+  const handleJoyCodeLogin = useCallback(() => {
+    settingsApi
+      .openExternal(JOYCODE_LOGIN_URL)
+      .catch((err) => {
+        console.warn("[JoyCode] Failed to open login URL:", err);
+        toast.error(
+          t("providerForm.joycodeLoginFailed", {
+            defaultValue: "打开 JoyCode 登录页失败",
+          }),
+        );
+      });
+  }, [t]);
+
+  const mergeFetchedModelsIntoCatalog = useCallback(
+    (models: FetchedModel[]) => {
+      if (!onCatalogModelsChange || !isJoyCodeProvider || models.length === 0) {
+        return;
+      }
+      setCatalogRows((current) => {
+        const seen = new Set(current.map((row) => row.model));
+        const additions = models
+          .filter((model) => model.id && !seen.has(model.id))
+          .map((model) =>
+            createCatalogRow({
+              model: model.id,
+              displayName: model.id,
+              contextWindow: 256000,
+            }),
+          );
+        return additions.length > 0 ? [...current, ...additions] : current;
+      });
+    },
+    [isJoyCodeProvider, onCatalogModelsChange],
+  );
+
   const handleFetchModels = useCallback(() => {
-    if (!codexBaseUrl || !codexApiKey) {
+    if (!codexBaseUrl || (!codexApiKey && !isJoyCodeProvider)) {
       showFetchModelsError(null, t, {
-        hasApiKey: !!codexApiKey,
+        hasApiKey: !!codexApiKey || isJoyCodeProvider,
         hasBaseUrl: !!codexBaseUrl,
       });
       return;
     }
     setIsFetchingModels(true);
-    fetchModelsForConfig(
-      codexBaseUrl,
-      codexApiKey,
-      isFullUrl,
-      undefined,
-      customUserAgent,
-    )
+    const fetcher = isJoyCodeProvider
+      ? fetchJoycodeModelsForConfig(localProxyHeadersOverride)
+      : fetchModelsForConfig(
+          codexBaseUrl,
+          codexApiKey,
+          isFullUrl,
+          undefined,
+          customUserAgent,
+        );
+    fetcher
       .then((models) => {
         setFetchedModels(models);
+        mergeFetchedModelsIntoCatalog(models);
         if (models.length === 0) {
           toast.info(t("providerForm.fetchModelsEmpty"));
         } else {
@@ -444,7 +490,16 @@ export function CodexFormFields({
         showFetchModelsError(err, t);
       })
       .finally(() => setIsFetchingModels(false));
-  }, [codexBaseUrl, codexApiKey, isFullUrl, customUserAgent, t]);
+  }, [
+    codexBaseUrl,
+    codexApiKey,
+    customUserAgent,
+    isFullUrl,
+    isJoyCodeProvider,
+    localProxyHeadersOverride,
+    mergeFetchedModelsIntoCatalog,
+    t,
+  ]);
 
   const resolveEndpointForApiFormat = useCallback(() => {
     if (apiFormat === "anthropic_messages") return "/v1/messages";
@@ -583,6 +638,22 @@ export function CodexFormFields({
           }),
         }}
       />
+      {isJoyCodeProvider && (
+        <div className="flex justify-end">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleJoyCodeLogin}
+            className="h-8 gap-1.5"
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            {t("providerForm.loginWithJoyCode", {
+              defaultValue: "登录 JoyCode",
+            })}
+          </Button>
+        </div>
+      )}
 
       {/* Codex Base URL 输入框 */}
       {shouldShowSpeedTest && (
