@@ -35,6 +35,8 @@ const DEFAULT_SMALL_MODEL_BASE_URL: &str = "https://api.siliconflow.cn";
 const DEFAULT_SMALL_MODEL_API_KEY: &str = "sk-apbaxuqgkkfkhkkqhihwctdvffjqublsqnlwnxbrdnpbekle";
 const DEFAULT_SMALL_MODEL_UPSTREAM: &str = "deepseek-ai/DeepSeek-V3.2";
 const DEFAULT_SMALL_MODEL_ENDPOINT: &str = "/v1/chat/completions";
+const JOYCODE_SMALL_MODEL_BASE_URL: &str = "https://joycode-api.jd.com/api/saas/openai/v1";
+const JOYCODE_SMALL_MODEL_UPSTREAM: &str = "deepseek-v4-pro";
 
 pub fn apply_devin_common_variables(provider: &mut Provider, snippet: Option<&str>) {
     // Fallback: read from environment variable or config file
@@ -98,7 +100,8 @@ pub fn apply_devin_common_variables(provider: &mut Provider, snippet: Option<&st
         toml::Value::Table(toml::map::Map::new())
     };
 
-    apply_small_model_routes(&mut provider.settings_config, &doc);
+    let is_joycode = is_joycode_provider(provider);
+    apply_small_model_routes(&mut provider.settings_config, &doc, is_joycode);
 
     let headers = devin_variable_headers(provider, &doc);
     if !headers.is_empty() {
@@ -281,8 +284,8 @@ fn merge_json_headers(target: &mut Value, headers: &BTreeMap<String, String>) {
     }
 }
 
-fn apply_small_model_routes(settings_config: &mut Value, doc: &toml::Value) {
-    let Some(route) = small_model_route_from_doc(doc) else {
+fn apply_small_model_routes(settings_config: &mut Value, doc: &toml::Value, is_joycode: bool) {
+    let Some(route) = small_model_route_from_doc(doc, is_joycode) else {
         return;
     };
 
@@ -344,7 +347,7 @@ struct SmallModelRoute {
     request_aliases: Vec<String>,
 }
 
-fn small_model_route_from_doc(doc: &toml::Value) -> Option<SmallModelRoute> {
+fn small_model_route_from_doc(doc: &toml::Value, is_joycode: bool) -> Option<SmallModelRoute> {
     let table = doc.get("small_models").and_then(toml::Value::as_table);
     let enabled = table
         .and_then(|table| table.get("enabled"))
@@ -357,16 +360,16 @@ fn small_model_route_from_doc(doc: &toml::Value) -> Option<SmallModelRoute> {
     Some(SmallModelRoute {
         base_url: small_model_table_value(table, &["base_url", "baseUrl"])
             .and_then(toml_scalar_to_string)
-            .unwrap_or_else(|| DEFAULT_SMALL_MODEL_BASE_URL.to_string()),
+            .unwrap_or_else(|| default_small_model_base_url(is_joycode).to_string()),
         api_key: small_model_table_value(table, &["api_key", "apiKey"])
             .and_then(toml_scalar_to_string)
-            .unwrap_or_else(|| DEFAULT_SMALL_MODEL_API_KEY.to_string()),
+            .unwrap_or_else(|| default_small_model_api_key(is_joycode).to_string()),
         upstream_model: small_model_table_value(
             table,
             &["model", "upstream_model", "upstreamModel"],
         )
         .and_then(toml_scalar_to_string)
-        .unwrap_or_else(|| DEFAULT_SMALL_MODEL_UPSTREAM.to_string()),
+        .unwrap_or_else(|| default_small_model_upstream(is_joycode).to_string()),
         endpoint: small_model_table_value(table, &["endpoint"])
             .and_then(toml_scalar_to_string)
             .unwrap_or_else(|| DEFAULT_SMALL_MODEL_ENDPOINT.to_string()),
@@ -375,6 +378,30 @@ fn small_model_route_from_doc(doc: &toml::Value) -> Option<SmallModelRoute> {
             .unwrap_or(false),
         request_aliases: small_model_request_aliases(table),
     })
+}
+
+fn default_small_model_base_url(is_joycode: bool) -> &'static str {
+    if is_joycode {
+        JOYCODE_SMALL_MODEL_BASE_URL
+    } else {
+        DEFAULT_SMALL_MODEL_BASE_URL
+    }
+}
+
+fn default_small_model_api_key(is_joycode: bool) -> &'static str {
+    if is_joycode {
+        ""
+    } else {
+        DEFAULT_SMALL_MODEL_API_KEY
+    }
+}
+
+fn default_small_model_upstream(is_joycode: bool) -> &'static str {
+    if is_joycode {
+        JOYCODE_SMALL_MODEL_UPSTREAM
+    } else {
+        DEFAULT_SMALL_MODEL_UPSTREAM
+    }
 }
 
 fn small_model_table_value<'a>(
@@ -494,6 +521,50 @@ mod tests {
                 ["x-pt-key"],
             "secret"
         );
+    }
+
+    #[test]
+    fn joycode_defaults_small_models_to_joycode_deepseek_v4_pro() {
+        let mut provider = Provider::with_id(
+            "devin-joycode-proxy".to_string(),
+            "JoyCode".to_string(),
+            json!({
+                "modelCatalog": {
+                    "models": [{
+                        "model": "swe-1-6-slow",
+                        "routes": [{ "name": "primary" }]
+                    }]
+                }
+            }),
+            None,
+        );
+
+        apply_devin_common_variables(&mut provider, None);
+
+        let models = provider.settings_config["modelCatalog"]["models"]
+            .as_array()
+            .expect("models array");
+        for alias in ["MODEL_GPT_5_NANO", "MODEL_GOOGLE_GEMINI_2_5_FLASH"] {
+            let model = models
+                .iter()
+                .find(|model| model.get("model").and_then(Value::as_str) == Some(alias))
+                .expect("JoyCode small model alias");
+            assert_eq!(model["upstreamModel"], "deepseek-v4-pro");
+            assert_eq!(model["endpoint"], "/v1/chat/completions");
+            assert_eq!(
+                model["baseUrl"],
+                "https://joycode-api.jd.com/api/saas/openai/v1"
+            );
+            assert_eq!(model["apiKey"], "");
+            assert_eq!(model["authHeader"], "bearer");
+            assert_eq!(model["thinkingEnabled"], false);
+            assert_eq!(model["routes"][0]["name"], "devin-small-model");
+            assert_eq!(
+                model["routes"][0]["baseUrl"],
+                "https://joycode-api.jd.com/api/saas/openai/v1"
+            );
+            assert_eq!(model["routes"][0]["apiKey"], "");
+        }
     }
 
     #[test]
