@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useQuery } from "@tanstack/react-query";
@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  ExternalLink,
   Loader2,
   Plus,
   Trash2,
@@ -61,8 +62,10 @@ import {
 import {
   fetchModelsForConfig,
   showFetchModelsError,
+  syncJoycodeLoginFromVscode,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
+import { settingsApi } from "@/lib/api";
 import {
   providersApi,
   type ClaudeDesktopDefaultRoute,
@@ -80,6 +83,17 @@ export type ClaudeDesktopProviderFormValues = ProviderFormData & {
 };
 
 type ApiKeyField = "ANTHROPIC_AUTH_TOKEN" | "ANTHROPIC_API_KEY";
+const JOYCODE_LOGIN_URL =
+  "http://joycoder.jd.com?login=1&ideAppName=vscode&fromIde=joycode-plugin&redirect=0";
+
+type JoyCodeAuthHeaders = {
+  ptKey: string;
+  loginType: string;
+  tenant: string;
+  masterBaseUrl?: string;
+  orgFullName?: string;
+  userId?: string;
+};
 
 type PresetEntry = {
   id: string;
@@ -291,6 +305,9 @@ export function ClaudeDesktopProviderForm({
   const [codexFastMode, setCodexFastMode] = useState<boolean>(
     () => initialData?.meta?.codexFastMode ?? false,
   );
+  const [joyCodeAuthHeaders, setJoyCodeAuthHeaders] =
+    useState<JoyCodeAuthHeaders | null>(null);
+  const [isSyncingJoyCodeLogin, setIsSyncingJoyCodeLogin] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(
     "custom",
   );
@@ -392,6 +409,8 @@ export function ClaudeDesktopProviderForm({
     activePreset?.requiresOAuth === true ||
     activeProviderType === "github_copilot" ||
     activeProviderType === "codex_oauth";
+  const usesJoyCodeLogin = activeProviderType === "joycode";
+  const usesManagedAuth = usesManagedOAuth || usesJoyCodeLogin;
 
   // API Key 获取/邀请链接（与 Claude Code 表单同款，见 ClaudeFormFields）
   const apiKeyLinkCategory = activePreset?.category ?? initialData?.category;
@@ -439,6 +458,49 @@ export function ClaudeDesktopProviderForm({
       setRoutes([]);
     }
   };
+
+  const handleJoyCodeLogin = useCallback(() => {
+    settingsApi.openExternal(JOYCODE_LOGIN_URL).catch((err) => {
+      console.warn("[JoyCode] Failed to open login URL:", err);
+      toast.error(
+        t("providerForm.joycodeLoginFailed", {
+          defaultValue: "打开 JoyCode 登录页失败",
+        }),
+      );
+    });
+  }, [t]);
+
+  const handleSyncJoyCodeLogin = useCallback(() => {
+    setIsSyncingJoyCodeLogin(true);
+    syncJoycodeLoginFromVscode()
+      .then((state) => {
+        setJoyCodeAuthHeaders({
+          ptKey: state.ptKey,
+          loginType: state.loginType,
+          tenant: state.tenant,
+          ...(state.masterBaseUrl
+            ? { masterBaseUrl: state.masterBaseUrl }
+            : {}),
+          ...(state.orgFullName ? { orgFullName: state.orgFullName } : {}),
+          ...(state.userId ? { userId: state.userId } : {}),
+        });
+        toast.success(
+          t("providerForm.joycodeLoginSyncSuccess", {
+            user: state.userName || state.tenant,
+            defaultValue: "已同步 JoyCode 登录态",
+          }),
+        );
+      })
+      .catch((err) => {
+        console.warn("[JoyCode] Failed to sync VS Code login state:", err);
+        toast.error(
+          t("providerForm.joycodeLoginSyncFailed", {
+            defaultValue: "同步 VS Code JoyCode 登录态失败",
+          }),
+        );
+      })
+      .finally(() => setIsSyncingJoyCodeLogin(false));
+  }, [t]);
 
   const handlePresetChange = (value: string) => {
     setSelectedPresetId(value);
@@ -584,7 +646,7 @@ export function ClaudeDesktopProviderForm({
       );
       return;
     }
-    if (!usesManagedOAuth && !apiKey.trim()) {
+    if (!usesManagedAuth && !apiKey.trim()) {
       toast.error(
         t("providerForm.fetchModelsNeedApiKey", {
           defaultValue: "请先填写 API Key",
@@ -647,7 +709,7 @@ export function ClaudeDesktopProviderForm({
     const env = clonePlainRecord(settingsConfig.env);
     delete env.ANTHROPIC_AUTH_TOKEN;
     delete env.ANTHROPIC_API_KEY;
-    settingsConfig.env = usesManagedOAuth
+    settingsConfig.env = usesManagedAuth
       ? {
           ...env,
           ANTHROPIC_BASE_URL: baseUrl.trim().replace(/\/+$/, ""),
@@ -657,6 +719,12 @@ export function ClaudeDesktopProviderForm({
           ANTHROPIC_BASE_URL: baseUrl.trim().replace(/\/+$/, ""),
           [apiKeyField]: apiKey.trim(),
         };
+    if (usesJoyCodeLogin && joyCodeAuthHeaders) {
+      settingsConfig.joycode = {
+        ...clonePlainRecord(settingsConfig.joycode),
+        ...joyCodeAuthHeaders,
+      };
+    }
 
     const routeMap = routeEntries.reduce<
       Record<string, ClaudeDesktopModelRoute>
@@ -714,7 +782,7 @@ export function ClaudeDesktopProviderForm({
 
   const renderActionButtons = (onAdd: () => void, addLabel: string) => (
     <div className="flex gap-1">
-      {!usesManagedOAuth && (
+      {!usesManagedAuth && (
         <Button
           type="button"
           variant="outline"
@@ -789,6 +857,55 @@ export function ClaudeDesktopProviderForm({
                     onFastModeChange={setCodexFastMode}
                   />
                 )}
+              </div>
+            ) : usesJoyCodeLogin ? (
+              <div className="space-y-3 rounded-lg border border-border-default bg-muted/20 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-1">
+                    <Label>
+                      {t("providerForm.joycodeLoginState", {
+                        defaultValue: "JoyCode 登录态",
+                      })}
+                    </Label>
+                    <p className="text-xs leading-relaxed text-muted-foreground">
+                      {t("providerForm.joycodeLoginStateHint", {
+                        defaultValue:
+                          "使用 VS Code JoyCode 官方插件或本地 joycode.env 中的登录态调用模型服务，无需填写 API Key。",
+                      })}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleJoyCodeLogin}
+                      className="h-8 gap-1.5"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      {t("providerForm.loginWithJoyCode", {
+                        defaultValue: "登录 JoyCode",
+                      })}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSyncJoyCodeLogin}
+                      disabled={isSyncingJoyCodeLogin}
+                      className="h-8 gap-1.5"
+                    >
+                      {isSyncingJoyCodeLogin ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Download className="h-3.5 w-3.5" />
+                      )}
+                      {t("providerForm.syncJoyCodeLogin", {
+                        defaultValue: "同步 VS Code 登录态",
+                      })}
+                    </Button>
+                  </div>
+                </div>
               </div>
             ) : (
               <ApiKeySection
@@ -899,7 +1016,7 @@ export function ClaudeDesktopProviderForm({
                           defaultValue: "模型映射",
                         })}
                       </Label>
-                      {!usesManagedOAuth && (
+                      {!usesManagedAuth && (
                         <Button
                           type="button"
                           variant="outline"

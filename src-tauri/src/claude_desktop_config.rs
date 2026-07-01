@@ -371,7 +371,7 @@ pub fn validate_direct_provider(provider: &Provider) -> Result<(), AppError> {
 
         if matches!(
             meta.provider_type.as_deref(),
-            Some("github_copilot") | Some("codex_oauth")
+            Some("github_copilot") | Some("codex_oauth") | Some("joycode")
         ) {
             return Err(AppError::localized(
                 "claude_desktop.provider.type_unsupported",
@@ -446,7 +446,7 @@ fn has_proxy_base_url_and_key(provider: &Provider) -> bool {
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
 
-    if is_managed_oauth_proxy_provider(provider) {
+    if is_managed_auth_proxy_provider(provider) {
         return has_base_url;
     }
 
@@ -471,12 +471,14 @@ fn has_proxy_base_url_and_key(provider: &Provider) -> bool {
     has_base_url && has_key
 }
 
-fn is_managed_oauth_proxy_provider(provider: &Provider) -> bool {
+fn is_managed_auth_proxy_provider(provider: &Provider) -> bool {
     provider
         .meta
         .as_ref()
         .and_then(|meta| meta.provider_type.as_deref())
-        .is_some_and(|provider_type| matches!(provider_type, "github_copilot" | "codex_oauth"))
+        .is_some_and(|provider_type| {
+            matches!(provider_type, "github_copilot" | "codex_oauth" | "joycode")
+        })
 }
 
 pub fn validate_provider(provider: &Provider) -> Result<(), AppError> {
@@ -1462,6 +1464,50 @@ mod tests {
         provider
     }
 
+    fn joycode_proxy_provider(id: &str) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            "JoyCode".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://joycode-api.jd.com/api/saas/openai/v1"
+                },
+                "joycode": {
+                    "ptKey": "pt_key=test",
+                    "loginType": "ERP",
+                    "tenant": "JD"
+                }
+            }),
+            Some("https://joycode-api.jd.com".to_string()),
+        );
+        provider.category = Some("cn_official".to_string());
+        provider.meta = Some(ProviderMeta {
+            claude_desktop_mode: Some(ClaudeDesktopMode::Proxy),
+            api_format: Some("openai_chat".to_string()),
+            provider_type: Some("joycode".to_string()),
+            claude_desktop_model_routes: std::collections::HashMap::from([
+                (
+                    "claude-sonnet-4-6".to_string(),
+                    ClaudeDesktopModelRoute {
+                        model: "deepseek-v4-pro".to_string(),
+                        label_override: Some("deepseek-v4-pro".to_string()),
+                        supports_1m: Some(false),
+                    },
+                ),
+                (
+                    "claude-haiku-4-5".to_string(),
+                    ClaudeDesktopModelRoute {
+                        model: "deepseek-v4-flash".to_string(),
+                        label_override: Some("deepseek-v4-flash".to_string()),
+                        supports_1m: Some(false),
+                    },
+                ),
+            ]),
+            ..Default::default()
+        });
+        provider
+    }
+
     fn direct_provider_with_models(id: &str) -> Provider {
         let mut provider = direct_provider(id);
         provider.meta = Some(ProviderMeta {
@@ -1602,6 +1648,35 @@ mod tests {
                 json!([{ "name": "claude-sonnet-4-6", "labelOverride": "GPT-5.4" }])
             );
         }
+    }
+
+    #[test]
+    fn claude_desktop_proxy_accepts_joycode_login_state_without_static_key() {
+        let provider = joycode_proxy_provider("joycode");
+        validate_proxy_provider(&provider).expect("joycode proxy provider should validate");
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        let db = test_db();
+        apply_provider_to_paths(&db, &provider, &paths).expect("apply joycode proxy provider");
+
+        let profile: Value = read_json_file(&paths.profile_path).expect("read profile");
+        assert_eq!(
+            profile["inferenceGatewayBaseUrl"],
+            json!("http://127.0.0.1:15721/claude-desktop")
+        );
+        let inference_models = profile["inferenceModels"]
+            .as_array()
+            .expect("inference models");
+        assert!(inference_models
+            .contains(&json!({ "name": "claude-sonnet-4-6", "labelOverride": "deepseek-v4-pro" })));
+        assert!(inference_models.contains(
+            &json!({ "name": "claude-haiku-4-5", "labelOverride": "deepseek-v4-flash" })
+        ));
+        assert!(!provider
+            .settings_config
+            .to_string()
+            .contains("ANTHROPIC_AUTH_TOKEN"));
     }
 
     #[test]

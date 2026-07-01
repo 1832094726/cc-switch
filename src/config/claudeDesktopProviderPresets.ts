@@ -56,7 +56,7 @@ export interface ClaudeDesktopProviderPreset {
   mode: "direct" | "proxy";
   apiFormat?: ClaudeDesktopApiFormat;
   modelRoutes?: ClaudeDesktopRoutePreset[];
-  providerType?: "github_copilot" | "codex_oauth";
+  providerType?: "github_copilot" | "codex_oauth" | "joycode";
   requiresOAuth?: boolean;
 
   endpointCandidates?: string[];
@@ -356,6 +356,23 @@ export const claudeDesktopProviderPresets: ClaudeDesktopProviderPreset[] = [
     modelRoutes: brandedRoutes("gpt-5.5", "gpt-5.5", "gpt-5.4-mini"),
     icon: "openai",
     iconColor: "#000000",
+  },
+  {
+    name: "JoyCode",
+    websiteUrl: "https://joycode-api.jd.com",
+    category: "cn_official",
+    baseUrl: "https://joycode-api.jd.com/api/saas/openai/v1",
+    mode: "proxy",
+    apiFormat: "openai_chat",
+    providerType: "joycode",
+    modelRoutes: brandedRoutes(
+      "deepseek-v4-pro",
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+    ),
+    endpointCandidates: ["https://joycode-api.jd.com/api/saas/openai/v1"],
+    icon: "deepseek",
+    iconColor: "#E1251B",
   },
   {
     name: "DeepSeek",
