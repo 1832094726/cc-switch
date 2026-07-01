@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useMemo, useRef } from "react";
 import {
   useQuery,
   type UseQueryResult,
@@ -52,24 +52,80 @@ export interface UseProvidersQueryOptions {
   isProxyRunning?: boolean; // 代理服务是否运行中
 }
 
+const PROVIDERS_CACHE_PREFIX = "cc-switch:providers-cache:v1:";
+const PROVIDERS_STALE_MS = 30 * 1000;
+const PROVIDERS_GC_MS = 10 * 60 * 1000;
+
+interface CachedProvidersQueryData {
+  data: ProvidersQueryData;
+  updatedAt: number;
+}
+
+const providersCacheKey = (appId: AppId) => `${PROVIDERS_CACHE_PREFIX}${appId}`;
+
+const readProvidersCache = (
+  appId: AppId,
+): CachedProvidersQueryData | undefined => {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.localStorage.getItem(providersCacheKey(appId));
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw) as Partial<CachedProvidersQueryData>;
+    if (
+      !parsed ||
+      typeof parsed.updatedAt !== "number" ||
+      !parsed.data ||
+      typeof parsed.data !== "object" ||
+      !parsed.data.providers ||
+      typeof parsed.data.providers !== "object" ||
+      typeof parsed.data.currentProviderId !== "string"
+    ) {
+      return undefined;
+    }
+    return parsed as CachedProvidersQueryData;
+  } catch {
+    return undefined;
+  }
+};
+
+const writeProvidersCache = (appId: AppId, data: ProvidersQueryData) => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(
+      providersCacheKey(appId),
+      JSON.stringify({ data, updatedAt: Date.now() }),
+    );
+  } catch {
+    // Cache is an optimization only; ignore quota/private-mode failures.
+  }
+};
+
 export const useProvidersQuery = (
   appId: AppId,
   options?: UseProvidersQueryOptions,
 ): UseQueryResult<ProvidersQueryData> => {
   const { isProxyRunning = false } = options || {};
+  const cached = useMemo(() => readProvidersCache(appId), [appId]);
 
   return useQuery({
     queryKey: ["providers", appId],
+    initialData: cached?.data,
+    initialDataUpdatedAt: cached?.updatedAt,
     placeholderData: keepPreviousData,
+    staleTime: isProxyRunning ? 5000 : PROVIDERS_STALE_MS,
+    gcTime: PROVIDERS_GC_MS,
+    refetchOnWindowFocus: false,
     // 当代理服务运行时，每 10 秒刷新一次供应商列表
     // 这样可以自动反映后端熔断器自动禁用代理目标的变更
     refetchInterval: isProxyRunning ? 10000 : false,
     queryFn: async () => {
       let providers: Record<string, Provider> = {};
       let currentProviderId = "";
+      let providersLoaded = false;
 
       try {
         providers = await providersApi.getAll(appId);
+        providersLoaded = true;
       } catch (error) {
         console.error("获取供应商列表失败:", error);
       }
@@ -80,10 +136,14 @@ export const useProvidersQuery = (
         console.error("获取当前供应商失败:", error);
       }
 
-      return {
+      const result = {
         providers: sortProviders(providers),
         currentProviderId,
       };
+      if (providersLoaded) {
+        writeProvidersCache(appId, result);
+      }
+      return result;
     },
   });
 };
