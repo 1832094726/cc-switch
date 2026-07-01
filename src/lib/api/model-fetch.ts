@@ -7,6 +7,13 @@ export interface FetchedModel {
   ownedBy: string | null;
 }
 
+export interface JoyCodeLoginState {
+  userName: string | null;
+  tenant: string;
+  loginType: string;
+  ptKey: string;
+}
+
 /**
  * 从供应商获取可用模型列表
  *
@@ -41,6 +48,10 @@ export async function fetchJoycodeModelsForConfig(
   return invoke("fetch_joycode_models_for_config", {
     authHeadersJson: authHeadersJson || null,
   });
+}
+
+export async function syncJoycodeLoginFromVscode(): Promise<JoyCodeLoginState> {
+  return invoke("sync_joycode_login_from_vscode");
 }
 
 /**

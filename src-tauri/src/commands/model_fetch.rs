@@ -2,7 +2,7 @@
 //!
 //! 提供 Tauri 命令，供前端在供应商表单中获取可用模型列表。
 
-use crate::services::model_fetch::{self, FetchedModel};
+use crate::services::model_fetch::{self, FetchedModel, JoyCodeLoginState};
 
 /// 获取供应商的可用模型列表
 ///
@@ -39,4 +39,12 @@ pub async fn fetch_joycode_models_for_config(
     auth_headers_json: Option<String>,
 ) -> Result<Vec<FetchedModel>, String> {
     model_fetch::fetch_joycode_models(auth_headers_json.as_deref()).await
+}
+
+/// 从官方 JoyCode VS Code 插件同步登录态。
+#[tauri::command]
+pub async fn sync_joycode_login_from_vscode() -> Result<JoyCodeLoginState, String> {
+    tokio::task::spawn_blocking(model_fetch::read_vscode_joycode_login_state)
+        .await
+        .map_err(|e| format!("读取 VS Code JoyCode 登录态任务失败: {e}"))?
 }

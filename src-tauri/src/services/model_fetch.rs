@@ -7,8 +7,10 @@
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderValue, CONTENT_TYPE, USER_AGENT};
 use reqwest::StatusCode;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// 获取到的模型信息
@@ -17,6 +19,15 @@ use std::time::Duration;
 pub struct FetchedModel {
     pub id: String,
     pub owned_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JoyCodeLoginState {
+    pub user_name: Option<String>,
+    pub tenant: String,
+    pub login_type: String,
+    pub pt_key: String,
 }
 
 /// OpenAI 兼容的 /v1/models 响应格式
@@ -152,6 +163,18 @@ pub async fn fetch_joycode_models(
             .await?;
     let models = normalize_joycode_model_list(response.get("data").unwrap_or(&response))?;
     Ok(models)
+}
+
+/// 从官方 JoyCode VS Code 插件的 globalState 中读取登录态。
+pub fn read_vscode_joycode_login_state() -> Result<JoyCodeLoginState, String> {
+    let state = read_vscode_joycode_global_state()?;
+    let info = state
+        .get("jdhLoginInfo")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "VS Code JoyCode 插件未找到 jdhLoginInfo，请先在 VS Code 中完成登录".to_string()
+        })?;
+    parse_joycode_login_state(&Value::Object(info.clone()))
 }
 
 async fn fetch_joycode_custom_model_list(
@@ -597,6 +620,90 @@ fn first_string_field(value: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
+fn read_vscode_joycode_global_state() -> Result<Value, String> {
+    let mut errors = Vec::new();
+    for db_path in vscode_global_state_db_candidates() {
+        if !db_path.exists() {
+            continue;
+        }
+        match read_joycode_state_from_vscode_db(&db_path) {
+            Ok(value) => return Ok(value),
+            Err(err) => errors.push(format!("{}: {err}", db_path.display())),
+        }
+    }
+
+    Err(if errors.is_empty() {
+        "未找到 VS Code globalStorage/state.vscdb；请确认已安装并登录官方 JoyCode VS Code 插件"
+            .to_string()
+    } else {
+        format!("读取 VS Code JoyCode 登录态失败：{}", errors.join("; "))
+    })
+}
+
+fn vscode_global_state_db_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        #[cfg(target_os = "macos")]
+        {
+            candidates
+                .push(home.join("Library/Application Support/Code/User/globalStorage/state.vscdb"));
+            candidates.push(home.join(
+                "Library/Application Support/Code - Insiders/User/globalStorage/state.vscdb",
+            ));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(appdata) = std::env::var("APPDATA") {
+                let appdata = PathBuf::from(appdata);
+                candidates.push(appdata.join("Code/User/globalStorage/state.vscdb"));
+                candidates.push(appdata.join("Code - Insiders/User/globalStorage/state.vscdb"));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            candidates.push(home.join(".config/Code/User/globalStorage/state.vscdb"));
+            candidates.push(home.join(".config/Code - Insiders/User/globalStorage/state.vscdb"));
+        }
+    }
+    candidates
+}
+
+fn read_joycode_state_from_vscode_db(db_path: &PathBuf) -> Result<Value, String> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("打开 SQLite 失败: {e}"))?;
+
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'JoyCoder.joycoder-fe'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("读取 JoyCoder.joycoder-fe 失败: {e}"))?;
+
+    serde_json::from_str(&value).map_err(|e| format!("解析 JoyCode 插件状态失败: {e}"))
+}
+
+fn parse_joycode_login_state(value: &Value) -> Result<JoyCodeLoginState, String> {
+    let pt_key = first_string_field(value, &["ptKey", "pt_key", "ptkey"])
+        .or_else(|| {
+            first_string_field(value, &["cookiesStr"])
+                .and_then(|cookie| extract_cookie_value(&cookie, "pt_key"))
+        })
+        .ok_or_else(|| "VS Code JoyCode 登录态缺少 ptKey，请重新登录 JoyCode".to_string())?;
+    let login_type =
+        first_string_field(value, &["loginType", "logintype"]).unwrap_or_else(|| "ERP".to_string());
+    let tenant = first_string_field(value, &["tenant"]).unwrap_or_else(|| "JD".to_string());
+    Ok(JoyCodeLoginState {
+        user_name: first_string_field(value, &["userName", "erp", "realName"]),
+        tenant,
+        login_type,
+        pt_key,
+    })
+}
+
 /// 若 baseURL 以任一已知兼容子路径结尾，返回剥离后的剩余部分；否则 `None`。
 ///
 /// 依赖 [`KNOWN_COMPAT_SUFFIXES`] 按长度降序排列，确保最长前缀优先命中
@@ -871,6 +978,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_joycode_login_state_from_vscode_state() {
+        let state = parse_joycode_login_state(&json!({
+            "userName": "hechengjun.9",
+            "ptKey": "BJ.token",
+            "loginType": "ERP",
+            "tenant": "JD"
+        }))
+        .unwrap();
+        assert_eq!(state.user_name.as_deref(), Some("hechengjun.9"));
+        assert_eq!(state.pt_key, "BJ.token");
+        assert_eq!(state.login_type, "ERP");
+        assert_eq!(state.tenant, "JD");
+    }
+
+    #[test]
+    fn test_parse_joycode_login_state_falls_back_to_cookie_pt_key() {
+        let state = parse_joycode_login_state(&json!({
+            "cookiesStr": "a=1; pt_key=BJ.from-cookie; b=2"
+        }))
+        .unwrap();
+        assert_eq!(state.pt_key, "BJ.from-cookie");
+        assert_eq!(state.login_type, "ERP");
+        assert_eq!(state.tenant, "JD");
     }
 
     #[test]

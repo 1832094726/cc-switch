@@ -33,6 +33,7 @@ import {
   fetchJoycodeModelsForConfig,
   fetchModelsForConfig,
   showFetchModelsError,
+  syncJoycodeLoginFromVscode,
   type FetchedModel,
 } from "@/lib/api/model-fetch";
 import { settingsApi } from "@/lib/api";
@@ -166,6 +167,33 @@ function createCatalogRow(seed?: Partial<CodexCatalogModel>): CodexCatalogRow {
   };
 }
 
+function mergeJoyCodeAuthHeaders(
+  headersJson: string,
+  auth: { ptKey: string; loginType: string; tenant: string },
+): string {
+  let headers: Record<string, unknown> = {};
+  if (headersJson.trim()) {
+    try {
+      const parsed = JSON.parse(headersJson);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        headers = parsed;
+      }
+    } catch {
+      headers = {};
+    }
+  }
+  return JSON.stringify(
+    {
+      ...headers,
+      ptKey: auth.ptKey,
+      loginType: auth.loginType,
+      tenant: auth.tenant,
+    },
+    null,
+    2,
+  );
+}
+
 // Compares rows (with rowId) to incoming models (without) by data fields only,
 // so both sync effects can use the same equality definition. Hidden native-profile
 // fields are included so switching between providers with identical visible fields
@@ -258,6 +286,7 @@ export function CodexFormFields({
 
   const [fetchedModels, setFetchedModels] = useState<FetchedModel[]>([]);
   const [isFetchingModels, setIsFetchingModels] = useState(false);
+  const [isSyncingJoyCodeLogin, setIsSyncingJoyCodeLogin] = useState(false);
   const isDevin = appId === "devin";
   const isJoyCodeProvider =
     (providerId ?? "").toLowerCase().includes("joycode") ||
@@ -432,6 +461,35 @@ export function CodexFormFields({
         );
       });
   }, [t]);
+
+  const handleSyncJoyCodeLogin = useCallback(() => {
+    setIsSyncingJoyCodeLogin(true);
+    syncJoycodeLoginFromVscode()
+      .then((state) => {
+        onLocalProxyHeadersOverrideChange(
+          mergeJoyCodeAuthHeaders(localProxyHeadersOverride, {
+            ptKey: state.ptKey,
+            loginType: state.loginType,
+            tenant: state.tenant,
+          }),
+        );
+        toast.success(
+          t("providerForm.joycodeLoginSyncSuccess", {
+            user: state.userName || state.tenant,
+            defaultValue: "已同步 JoyCode 登录态",
+          }),
+        );
+      })
+      .catch((err) => {
+        console.warn("[JoyCode] Failed to sync VS Code login state:", err);
+        toast.error(
+          t("providerForm.joycodeLoginSyncFailed", {
+            defaultValue: "同步 VS Code JoyCode 登录态失败",
+          }),
+        );
+      })
+      .finally(() => setIsSyncingJoyCodeLogin(false));
+  }, [localProxyHeadersOverride, onLocalProxyHeadersOverrideChange, t]);
 
   const mergeFetchedModelsIntoCatalog = useCallback(
     (models: FetchedModel[]) => {
@@ -639,7 +697,7 @@ export function CodexFormFields({
         }}
       />
       {isJoyCodeProvider && (
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
           <Button
             type="button"
             variant="outline"
@@ -650,6 +708,23 @@ export function CodexFormFields({
             <ExternalLink className="h-3.5 w-3.5" />
             {t("providerForm.loginWithJoyCode", {
               defaultValue: "登录 JoyCode",
+            })}
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleSyncJoyCodeLogin}
+            disabled={isSyncingJoyCodeLogin}
+            className="h-8 gap-1.5"
+          >
+            {isSyncingJoyCodeLogin ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download className="h-3.5 w-3.5" />
+            )}
+            {t("providerForm.syncJoyCodeLogin", {
+              defaultValue: "同步 VS Code 登录态",
             })}
           </Button>
         </div>

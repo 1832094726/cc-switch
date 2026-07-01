@@ -1281,6 +1281,7 @@ pub fn run() {
             // model list fetch (OpenAI-compatible /v1/models)
             commands::fetch_models_for_config,
             commands::fetch_joycode_models_for_config,
+            commands::sync_joycode_login_from_vscode,
             // ours: endpoint speed test + custom endpoint management
             commands::test_api_endpoints,
             commands::get_custom_endpoints,

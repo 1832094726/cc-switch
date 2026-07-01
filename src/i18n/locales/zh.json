@@ -1139,7 +1139,10 @@
     "fetchModelsEndpointNotFound": "未找到可用的模型列表端点，请检查 Base URL 或确认供应商是否开放该接口",
     "fetchModelsTimeout": "请求超时，请检查网络连接",
     "loginWithJoyCode": "登录 JoyCode",
-    "joycodeLoginFailed": "打开 JoyCode 登录页失败"
+    "joycodeLoginFailed": "打开 JoyCode 登录页失败",
+    "syncJoyCodeLogin": "同步 VS Code 登录态",
+    "joycodeLoginSyncSuccess": "已同步 JoyCode 登录态：{{user}}",
+    "joycodeLoginSyncFailed": "同步 VS Code JoyCode 登录态失败"
   },
   "copilot": {
     "authSection": "GitHub Copilot 认证",

@@ -9,6 +9,7 @@ const modelFetchApiMock = vi.hoisted(() => ({
   fetchJoycodeModelsForConfig: vi.fn(),
   fetchModelsForConfig: vi.fn(),
   showFetchModelsError: vi.fn(),
+  syncJoycodeLoginFromVscode: vi.fn(),
 }));
 const settingsApiMock = vi.hoisted(() => ({
   openExternal: vi.fn(),
@@ -18,6 +19,7 @@ vi.mock("@/lib/api/model-fetch", () => ({
   fetchJoycodeModelsForConfig: modelFetchApiMock.fetchJoycodeModelsForConfig,
   fetchModelsForConfig: modelFetchApiMock.fetchModelsForConfig,
   showFetchModelsError: modelFetchApiMock.showFetchModelsError,
+  syncJoycodeLoginFromVscode: modelFetchApiMock.syncJoycodeLoginFromVscode,
 }));
 
 vi.mock("@/lib/api", () => ({
@@ -78,6 +80,12 @@ describe("CodexFormFields", () => {
   beforeEach(() => {
     modelFetchApiMock.fetchJoycodeModelsForConfig.mockResolvedValue([]);
     modelFetchApiMock.fetchModelsForConfig.mockResolvedValue([]);
+    modelFetchApiMock.syncJoycodeLoginFromVscode.mockResolvedValue({
+      userName: "hechengjun.9",
+      tenant: "JD",
+      loginType: "ERP",
+      ptKey: "pt-key",
+    });
     settingsApiMock.openExternal.mockResolvedValue(undefined);
     if (!Element.prototype.hasPointerCapture) {
       Element.prototype.hasPointerCapture = () => false;
@@ -172,5 +180,44 @@ describe("CodexFormFields", () => {
     expect(settingsApiMock.openExternal).toHaveBeenCalledWith(
       "http://joycoder.jd.com?login=1&ideAppName=vscode&fromIde=joycode-plugin&redirect=0",
     );
+  });
+
+  it("syncs JoyCode login state from the official VS Code extension into header overrides", async () => {
+    const onHeadersChange = vi.fn();
+    modelFetchApiMock.syncJoycodeLoginFromVscode.mockResolvedValue({
+      userName: "hechengjun.9",
+      tenant: "JD",
+      loginType: "ERP",
+      ptKey: "synced-pt-key",
+    });
+
+    renderCodexForm({
+      providerId: "joycode",
+      codexBaseUrl: "https://joycode-api.jd.com/api/saas/openai/v1",
+      localProxyHeadersOverride: '{ "X-Provider": "cc-switch" }',
+      onLocalProxyHeadersOverrideChange: onHeadersChange,
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /同步 VS Code 登录态|Sync VS Code Login/,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(modelFetchApiMock.syncJoycodeLoginFromVscode).toHaveBeenCalled();
+      expect(onHeadersChange).toHaveBeenCalledWith(
+        JSON.stringify(
+          {
+            "X-Provider": "cc-switch",
+            ptKey: "synced-pt-key",
+            loginType: "ERP",
+            tenant: "JD",
+          },
+          null,
+          2,
+        ),
+      );
+    });
   });
 });
