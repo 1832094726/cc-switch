@@ -533,11 +533,11 @@ mod tests {
             .release_permit_neutral("a", "claude", first.used_half_open_permit)
             .await;
 
-       // 第三次请求应被允许（名额已释放）
-       let third = router.allow_provider_request("a", "claude").await;
-       assert!(third.allowed);
-       assert!(third.used_half_open_permit);
-   }
+        // 第三次请求应被允许（名额已释放）
+        let third = router.allow_provider_request("a", "claude").await;
+        assert!(third.allowed);
+        assert!(third.used_half_open_permit);
+    }
 
     #[tokio::test]
     #[serial]

@@ -424,22 +424,22 @@ fn convert_message_to_openai(
                         "content": content_str
                     }));
                 }
-               "thinking" => {
-                   if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
-                       if !thinking.is_empty() {
-                           reasoning_parts.push(thinking.to_string());
-                       }
-                   }
-               }
-               "redacted_thinking" => {
-                   // Claude Code encrypts historical thinking into redacted_thinking blocks.
-                   // MiMo/DeepSeek require non-empty reasoning_content on assistant tool-call
-                   // messages, so inject a minimal placeholder when the real content is
-                   // unavailable.
-                   if preserve_reasoning_content {
-                       reasoning_parts.push("[redacted thinking]".to_string());
-                   }
-               }
+                "thinking" => {
+                    if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
+                        if !thinking.is_empty() {
+                            reasoning_parts.push(thinking.to_string());
+                        }
+                    }
+                }
+                "redacted_thinking" => {
+                    // Claude Code encrypts historical thinking into redacted_thinking blocks.
+                    // MiMo/DeepSeek require non-empty reasoning_content on assistant tool-call
+                    // messages, so inject a minimal placeholder when the real content is
+                    // unavailable.
+                    if preserve_reasoning_content {
+                        reasoning_parts.push("[redacted thinking]".to_string());
+                    }
+                }
                 _ => {}
             }
         }
@@ -718,6 +718,19 @@ pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     Ok(result)
 }
 
+/// 给一个内容块（`{"type":"text",...}` / tool 定义 / tool_result 等对象）
+/// 打上 Anthropic prompt caching 的 `cache_control: {"type":"ephemeral"}` 断点。
+/// 若目标不是 JSON 对象则原样返回。
+fn set_cache_control(mut block: Value) -> Value {
+    if let Some(obj) = block.as_object_mut() {
+        obj.insert(
+            "cache_control".to_string(),
+            json!({ "type": "ephemeral" }),
+        );
+    }
+    block
+}
+
 /// Convert an OpenAI Chat Completions request into an Anthropic Messages request.
 ///
 /// Devin can enter cc-switch through a Chat-shaped local route while the selected
@@ -802,6 +815,26 @@ pub fn openai_chat_request_to_anthropic(body: Value) -> Result<Value, ProxyError
         }));
     }
 
+    // 在最后两条 user 消息的末尾内容块打 Anthropic prompt caching 断点，
+    // 用于增量缓存不断增长的对话历史（配合 system/tools 的断点，总数 ≤ 4，
+    // 符合 Anthropic 的断点上限）。断点须落在 content 数组的块上。
+    let user_indices: Vec<usize> = anthropic_messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(Value::as_str) == Some("user"))
+        .map(|(i, _)| i)
+        .collect();
+    for &idx in user_indices.iter().rev().take(2) {
+        if let Some(content) = anthropic_messages[idx]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        {
+            if let Some(last_block) = content.pop() {
+                content.push(set_cache_control(last_block));
+            }
+        }
+    }
+
     let mut result = json!({
         "messages": anthropic_messages,
         "max_tokens": body
@@ -816,7 +849,12 @@ pub fn openai_chat_request_to_anthropic(body: Value) -> Result<Value, ProxyError
         result["model"] = model.clone();
     }
     if !system_parts.is_empty() {
-        result["system"] = json!(system_parts.join("\n\n"));
+        // 用结构化 system 数组（而非纯字符串），以便在末尾块打 Anthropic
+        // prompt caching 断点，缓存稳定的系统提示前缀。
+        result["system"] = json!([set_cache_control(json!({
+            "type": "text",
+            "text": system_parts.join("\n\n")
+        }))]);
     }
 
     for key in ["temperature", "top_p", "stream"] {
@@ -826,11 +864,15 @@ pub fn openai_chat_request_to_anthropic(body: Value) -> Result<Value, ProxyError
     }
 
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let anthropic_tools: Vec<Value> = tools
+        let mut anthropic_tools: Vec<Value> = tools
             .iter()
             .filter_map(openai_chat_tool_to_anthropic_tool)
             .collect();
         if !anthropic_tools.is_empty() {
+            // 工具定义整体是稳定前缀：在最后一个工具打断点即可缓存全部工具。
+            if let Some(last) = anthropic_tools.pop() {
+                anthropic_tools.push(set_cache_control(last));
+            }
             result["tools"] = json!(anthropic_tools);
         }
     }
@@ -1016,19 +1058,42 @@ fn data_url_to_anthropic_image_block(url: &str) -> Option<Value> {
 }
 
 fn openai_chat_tool_to_anthropic_tool(tool: &Value) -> Option<Value> {
-    let function = tool.get("function")?;
-    let name = function.get("name").and_then(Value::as_str)?;
-    let mut result = json!({
-        "name": name,
-        "input_schema": function
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
-    });
-    if let Some(description) = function.get("description").and_then(Value::as_str) {
-        result["description"] = json!(description);
+    // 情况一：OpenAI Chat 嵌套格式 {"type":"function","function":{"name",...}}。
+    if let Some(function) = tool.get("function") {
+        let name = function.get("name").and_then(Value::as_str)?;
+        let mut result = json!({
+            "name": name,
+            "input_schema": function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+        });
+        if let Some(description) = function.get("description").and_then(Value::as_str) {
+            result["description"] = json!(description);
+        }
+        return Some(result);
     }
-    Some(result)
+
+    // 情况二：工具已经是 Anthropic 原生格式 {"name","input_schema","description"}。
+    // Codex 的 custom/freeform 工具（如 exec_command）经上游转换后即为此形态，
+    // 顶层直接带 name，没有嵌套的 function 字段。此前会被误判丢弃，导致上游
+    // 收不到工具定义、模型只能手写 <invoke> XML 文本泄漏。这里直接透传。
+    if let Some(name) = tool.get("name").and_then(Value::as_str) {
+        let mut result = json!({
+            "name": name,
+            "input_schema": tool
+                .get("input_schema")
+                .or_else(|| tool.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+        });
+        if let Some(description) = tool.get("description").and_then(Value::as_str) {
+            result["description"] = json!(description);
+        }
+        return Some(result);
+    }
+
+    None
 }
 
 fn openai_chat_tool_choice_to_anthropic(tool_choice: &Value) -> Option<Value> {
@@ -1278,17 +1343,20 @@ mod tests {
             }]
         });
 
-       let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
-       let msg = &result["messages"][0];
-       assert_eq!(msg["role"], "assistant");
-       assert_eq!(msg["reasoning_content"], "I should call the tool.");
+        let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
+        let msg = &result["messages"][0];
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["reasoning_content"], "I should call the tool.");
         // Thinking content must NOT leak into visible content.
-        assert!(msg["content"].is_null() || !msg["content"]
-            .as_str()
-            .map(|c| c.contains("cc-switch:thinking"))
-            .unwrap_or(false));
-       assert!(msg.get("tool_calls").is_some());
-       assert_eq!(msg["tool_calls"][0]["id"], "call_123");
+        assert!(
+            msg["content"].is_null()
+                || !msg["content"]
+                    .as_str()
+                    .map(|c| c.contains("cc-switch:thinking"))
+                    .unwrap_or(false)
+        );
+        assert!(msg.get("tool_calls").is_some());
+        assert_eq!(msg["tool_calls"][0]["id"], "call_123");
     }
 
     #[test]
@@ -1326,15 +1394,18 @@ mod tests {
             }]
         });
 
-       let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
-       let msg = &result["messages"][0];
-       assert_eq!(msg["reasoning_content"], "[redacted thinking]");
+        let result = anthropic_to_openai_with_reasoning_content(input, true).unwrap();
+        let msg = &result["messages"][0];
+        assert_eq!(msg["reasoning_content"], "[redacted thinking]");
         // Redacted thinking must NOT leak into visible content.
-        assert!(msg["content"].is_null() || !msg["content"]
-            .as_str()
-            .map(|c| c.contains("cc-switch:redacted_thinking"))
-            .unwrap_or(false));
-       assert_eq!(msg["tool_calls"][0]["id"], "call_123");
+        assert!(
+            msg["content"].is_null()
+                || !msg["content"]
+                    .as_str()
+                    .map(|c| c.contains("cc-switch:redacted_thinking"))
+                    .unwrap_or(false)
+        );
+        assert_eq!(msg["tool_calls"][0]["id"], "call_123");
     }
 
     #[test]
@@ -1351,38 +1422,41 @@ mod tests {
             }]
         });
 
-       let result = anthropic_to_openai(input).unwrap();
-       let msg = &result["messages"][0];
-       assert_eq!(msg["role"], "assistant");
-       assert!(msg.get("tool_calls").is_some());
-       assert!(msg.get("reasoning_content").is_none());
+        let result = anthropic_to_openai(input).unwrap();
+        let msg = &result["messages"][0];
+        assert_eq!(msg["role"], "assistant");
+        assert!(msg.get("tool_calls").is_some());
+        assert!(msg.get("reasoning_content").is_none());
         // Default path does not emit reasoning_content; thinking should not
         // leak into content either.
-        assert!(msg["content"].is_null() || !msg["content"]
-            .as_str()
-            .map(|c| c.contains("cc-switch:thinking"))
-            .unwrap_or(false));
+        assert!(
+            msg["content"].is_null()
+                || !msg["content"]
+                    .as_str()
+                    .map(|c| c.contains("cc-switch:thinking"))
+                    .unwrap_or(false)
+        );
     }
 
     #[test]
-   fn test_anthropic_to_openai_degrades_thinking_only_message() {
-       let input = json!({
-           "model": "claude-3-opus",
-           "max_tokens": 1024,
-           "messages": [{
-               "role": "assistant",
-               "content": [
-                   {"type": "thinking", "thinking": "No visible content yet."}
-               ]
-           }]
-       });
+    fn test_anthropic_to_openai_degrades_thinking_only_message() {
+        let input = json!({
+            "model": "claude-3-opus",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "No visible content yet."}
+                ]
+            }]
+        });
 
-      let result = anthropic_to_openai(input).unwrap();
-       // Thinking content must NOT leak into visible content.
-       // A thinking-only message produces no content_parts and no tool_calls,
-       // so the entire message is dropped — thinking must not become visible.
-       assert!(result["messages"].as_array().unwrap().is_empty());
-   }
+        let result = anthropic_to_openai(input).unwrap();
+        // Thinking content must NOT leak into visible content.
+        // A thinking-only message produces no content_parts and no tool_calls,
+        // so the entire message is dropped — thinking must not become visible.
+        assert!(result["messages"].as_array().unwrap().is_empty());
+    }
 
     #[test]
     fn test_anthropic_to_openai_tool_result() {
@@ -2112,5 +2186,54 @@ mod tests {
             run_tool_choice(json!({"type": "tool", "name": "search"})),
             json!({"type": "function", "function": {"name": "search"}}),
         );
+    }
+
+    #[test]
+    fn chat_to_anthropic_preserves_native_anthropic_tool() {
+        // Codex custom/freeform 工具经上游转换后已是 Anthropic 原生格式
+        // （顶层 name + input_schema，无嵌套 function）。回归钉桩：此前
+        // openai_chat_tool_to_anthropic_tool 只认嵌套 function 会把它丢弃，
+        // 导致上游收不到 exec_command、模型手写 <invoke> XML 泄漏。
+        let input = json!({
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "exec_command",
+                    "description": "Runs a shell command",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"]
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }
+            ]
+        });
+
+        let result = openai_chat_request_to_anthropic(input).unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "两个工具都应保留，custom 工具不能被丢弃");
+
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"exec_command"));
+        assert!(names.contains(&"get_weather"));
+
+        let exec = tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("exec_command"))
+            .unwrap();
+        assert_eq!(exec["description"], "Runs a shell command");
+        assert_eq!(exec["input_schema"]["required"][0], "cmd");
     }
 }

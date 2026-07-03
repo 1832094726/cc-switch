@@ -493,7 +493,11 @@ fn strip_cc_switch_thinking_tags(body: &mut Value) {
         return;
     };
     for msg in messages.iter_mut() {
-        if msg.get("content").and_then(|c| c.as_str()).is_some_and(|s| s.contains(TAG_OPEN)) {
+        if msg
+            .get("content")
+            .and_then(|c| c.as_str())
+            .is_some_and(|s| s.contains(TAG_OPEN))
+        {
             if let Some(content) = msg.get_mut("content") {
                 let cleaned = strip_tag_pair(content.as_str().unwrap_or(""), TAG_OPEN, TAG_CLOSE);
                 *content = Value::String(cleaned);
@@ -501,9 +505,14 @@ fn strip_cc_switch_thinking_tags(body: &mut Value) {
         }
         if let Some(blocks) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
             for block in blocks.iter_mut() {
-                if block.get("text").and_then(|t| t.as_str()).is_some_and(|s| s.contains(TAG_OPEN)) {
+                if block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|s| s.contains(TAG_OPEN))
+                {
                     if let Some(text_val) = block.get_mut("text") {
-                        let cleaned = strip_tag_pair(text_val.as_str().unwrap_or(""), TAG_OPEN, TAG_CLOSE);
+                        let cleaned =
+                            strip_tag_pair(text_val.as_str().unwrap_or(""), TAG_OPEN, TAG_CLOSE);
                         *text_val = Value::String(cleaned);
                     }
                 }

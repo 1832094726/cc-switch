@@ -2,9 +2,9 @@
 //!
 //! 实现 OpenAI SSE → Anthropic SSE 格式转换
 
+use crate::proxy::providers::codex_chat_common::extract_reasoning_field_text;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
-use crate::proxy::providers::codex_chat_common::extract_reasoning_field_text;
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

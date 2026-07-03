@@ -3,7 +3,7 @@ REM === cc-switch dev launcher for Windows ===
 
 set ROOT_DIR=D:\syn\jd\hechengjun\cc-switch
 
-REM ── 环境自检 ──────────────────────────────────────
+REM --- Environment self-check ---
 where node >nul 2>&1
 if errorlevel 1 (
     echo [cc-switch-dev] ERROR: node not found in PATH
@@ -30,7 +30,7 @@ if errorlevel 1 (
 )
 echo [cc-switch-dev] pnpm: %PNPM_CMD%
 
-REM ── 依赖完整性检查 ────────────────────────────────
+REM --- Dependency integrity check ---
 if not exist "%ROOT_DIR%\node_modules\.bin\tauri.cmd" (
     echo [cc-switch-dev] node_modules missing, installing...
     cd /d "%ROOT_DIR%"
@@ -58,9 +58,11 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":15721 " ^| findstr "LISTENI
 call "D:\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
 set CARGO_TARGET_DIR=D:\cc-switch-cargo-target
 cd /d D:\syn\jd\hechengjun\cc-switch
-REM ── 编译产物清理 ──────────────────────────────────
-REM target 目录超过阈值时自动清理孤立产物，保留增量编译缓存。
-REM 阈值默认 8GB，可通过环境变量 CC_SWITCH_DEV_TARGET_MAX_GB 覆盖。
+
+REM --- Build artifact cleanup ---
+REM When the target dir exceeds a threshold, sweep orphaned artifacts
+REM while keeping incremental compilation cache intact.
+REM Default threshold is 8GB, override via CC_SWITCH_DEV_TARGET_MAX_GB.
 if not defined CC_SWITCH_DEV_TARGET_MAX_GB set CC_SWITCH_DEV_TARGET_MAX_GB=8
 where cargo-sweep >nul 2>&1
 if not errorlevel 1 (
@@ -68,7 +70,7 @@ if not errorlevel 1 (
         echo [cc-switch-dev] checking target dir size...
         powershell -NoProfile -Command ^
             "$td='%CARGO_TARGET_DIR%'; $max=[int64]'%CC_SWITCH_DEV_TARGET_MAX_GB%'*1GB;" ^
-            "$cur=(Get-ChildItem -Path $td -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum;" ^
+            "$cur=(Get-ChildItem -Path $td -Recurse -File -ErrorAction SilentlyContinue ^| Measure-Object -Property Length -Sum).Sum;" ^
             "if ($cur -le $max) { exit 100 } else { exit 0 }"
         if not errorlevel 100 (
             echo [cc-switch-dev] target exceeds %CC_SWITCH_DEV_TARGET_MAX_GB%GB, cleaning orphaned artifacts...

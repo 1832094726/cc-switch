@@ -385,6 +385,10 @@ pub fn codex_auth_has_oauth_login_material(auth: &Value) -> bool {
     })
 }
 
+pub fn codex_auth_is_official_oauth_only(auth: &Value) -> bool {
+    codex_auth_has_oauth_login_material(auth) && extract_codex_auth_api_key(auth).is_none()
+}
+
 pub fn should_restore_codex_provider_token_for_backfill(
     category: Option<&str>,
     template_settings: &Value,
@@ -1496,8 +1500,14 @@ pub fn write_codex_live_for_provider(
         };
     let config_text = unified_official_config.as_deref().or(config_text);
 
-    let should_write_auth = (category == Some("official") && codex_auth_has_login_material(auth))
+    // 用户在 auth.json 编辑器里粘贴完整官方登录态时，即使历史数据里的
+    // category 不是 official，也要把这份显式保存的 auth 写回 Codex live。
+    // 这避免保存后仍停留在旧的 PROXY_MANAGED/旧登录态，看起来像“保存无效”。
+    let has_official_oauth_auth = codex_auth_is_official_oauth_only(auth);
+    let should_write_auth = ((category == Some("official") || has_official_oauth_auth)
+        && codex_auth_has_login_material(auth))
         || (category != Some("official")
+            && !has_official_oauth_auth
             && !crate::settings::preserve_codex_official_auth_on_switch());
 
     if should_write_auth {

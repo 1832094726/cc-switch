@@ -664,7 +664,10 @@ fn joycode_adapter_type(entry: &Value) -> Option<String> {
 }
 
 fn joycode_provider_from_adapter(adapter_type: Option<&str>) -> Option<String> {
-    match adapter_type.map(|value| value.to_ascii_lowercase()).as_deref() {
+    match adapter_type
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("anthropic") => Some("anthropic".to_string()),
         Some("openai") | Some("openai-response") => Some("openai".to_string()),
         _ => None,
@@ -672,7 +675,10 @@ fn joycode_provider_from_adapter(adapter_type: Option<&str>) -> Option<String> {
 }
 
 fn joycode_endpoint_from_adapter(adapter_type: Option<&str>) -> Option<String> {
-    match adapter_type.map(|value| value.to_ascii_lowercase()).as_deref() {
+    match adapter_type
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("anthropic") => Some("/v1/messages".to_string()),
         Some("openai-response") => Some("/v1/responses".to_string()),
         Some("openai") => Some("/v1/chat/completions".to_string()),
@@ -681,7 +687,10 @@ fn joycode_endpoint_from_adapter(adapter_type: Option<&str>) -> Option<String> {
 }
 
 fn joycode_auth_header_from_adapter(adapter_type: Option<&str>) -> Option<String> {
-    match adapter_type.map(|value| value.to_ascii_lowercase()).as_deref() {
+    match adapter_type
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("anthropic") => Some("x-api-key".to_string()),
         Some("openai") | Some("openai-response") => Some("bearer".to_string()),
         _ => None,

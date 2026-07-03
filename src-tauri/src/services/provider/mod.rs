@@ -1901,10 +1901,23 @@ impl ProviderService {
             let live_taken_over = state
                 .proxy_service
                 .detect_takeover_in_live_config_for_app(&app_type);
+            let proxy_running = futures::executor::block_on(state.proxy_service.is_running());
+            let has_explicit_codex_official_auth = matches!(app_type, AppType::Codex)
+                && provider
+                    .settings_config
+                    .get("auth")
+                    .is_some_and(crate::codex_config::codex_auth_is_official_oauth_only);
+            // 如果只有 live 文件残留 PROXY_MANAGED、没有备份且代理未运行，
+            // 用户此时保存完整官方 auth.json 应直接修复 live，而不是继续写入备份。
+            let stale_codex_takeover_marker = live_taken_over
+                && !has_live_backup
+                && !proxy_running
+                && has_explicit_codex_official_auth;
             // Backup or live placeholders mean the live file is currently owned
             // by proxy takeover, including the short activation window before
             // proxy_config.enabled is committed.
-            let should_sync_via_proxy = has_live_backup || live_taken_over;
+            let should_sync_via_proxy =
+                has_live_backup || (live_taken_over && !stale_codex_takeover_marker);
 
             if should_sync_via_proxy {
                 if matches!(app_type, AppType::ClaudeDesktop) {
@@ -1918,9 +1931,7 @@ impl ProviderService {
                     .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
                 }
 
-                if matches!(app_type, AppType::Claude)
-                    && futures::executor::block_on(state.proxy_service.is_running())
-                {
+                if matches!(app_type, AppType::Claude) && proxy_running {
                     futures::executor::block_on(
                         state
                             .proxy_service

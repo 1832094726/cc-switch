@@ -116,7 +116,7 @@ impl WindsurfChatRequest {
     }
 }
 
-fn is_devin_small_model_alias(model: &str) -> bool {
+pub fn is_devin_small_model_alias(model: &str) -> bool {
     matches!(
         model.trim(),
         "MODEL_GPT_5_NANO" | "MODEL_GOOGLE_GEMINI_2_5_FLASH" | "MODEL_CHAT_GPT_4_1_MINI_2025_04_14"
@@ -526,20 +526,20 @@ fn prompt_to_anthropic_message(prompt: &ParsedPrompt) -> Option<Value> {
         }
         SOURCE_SYSTEM | SOURCE_UNKNOWN => {
             let mut content = Vec::new();
-           if !prompt.thinking.is_empty() {
-               if !prompt.signature.is_empty() {
-                   content.push(json!({
-                       "type": "thinking",
-                       "thinking": prompt.thinking,
-                       "signature": prompt.signature
-                   }));
-               } else {
+            if !prompt.thinking.is_empty() {
+                if !prompt.signature.is_empty() {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": prompt.thinking,
+                        "signature": prompt.signature
+                    }));
+                } else {
                     // Without a signature we cannot reconstruct a valid
                     // thinking block. Drop it silently rather than wrapping
                     // it in a visible <cc-switch:thinking> text tag that
                     // would leak into the conversation.
-               }
-           }
+                }
+            }
             if !prompt.prompt.is_empty() {
                 content.push(json!({ "type": "text", "text": prompt.prompt }));
             }
@@ -1811,7 +1811,7 @@ mod tests {
         assert!(!responses_body["input"]
             .to_string()
             .contains("cc-switch:thinking"));
-       assert!(responses_body["input"]
+        assert!(responses_body["input"]
             .to_string()
             .contains(r#"<cc-switch:tool_result is_error=\"true\">"#));
 
@@ -1831,7 +1831,7 @@ mod tests {
         assert!(!chat_body["messages"][2]["content"]
             .to_string()
             .contains("cc-switch:thinking"));
-       assert_eq!(chat_body["messages"][3]["role"], "tool");
+        assert_eq!(chat_body["messages"][3]["role"], "tool");
         assert!(chat_body["messages"][3].get("is_error").is_none());
         assert!(chat_body["messages"][3]["content"]
             .as_str()
@@ -1839,30 +1839,27 @@ mod tests {
             .contains(r#"<cc-switch:tool_result is_error="true">"#));
         assert_eq!(chat_body["tool_choice"], "required");
 
-       let round_tripped = transform::openai_chat_request_to_anthropic(chat_body).unwrap();
-       assert_eq!(round_tripped["system"], "base system\nworkspace rules");
-       assert_eq!(round_tripped["messages"][0]["content"][0]["type"], "image");
-       assert_eq!(round_tripped["messages"][1]["content"][0]["type"], "text");
+        let round_tripped = transform::openai_chat_request_to_anthropic(chat_body).unwrap();
+        assert_eq!(round_tripped["system"], "base system\nworkspace rules");
+        assert_eq!(round_tripped["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(round_tripped["messages"][1]["content"][0]["type"], "text");
         // Thinking dropped → tool_use is now at index 1 (was index 2)
         assert_eq!(
             round_tripped["messages"][1]["content"][1]["type"],
             "tool_use"
         );
-      assert!(round_tripped["messages"][1]["content"]
-           .as_array()
-           .unwrap()
-           .iter()
-           .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
+        assert!(round_tripped["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
         // Unsigned thinking is now dropped, not wrapped in visible tags.
-        assert_eq!(
-            round_tripped["messages"][1]["content"][0]["type"],
-            "text"
-        );
+        assert_eq!(round_tripped["messages"][1]["content"][0]["type"], "text");
         assert!(!round_tripped["messages"][1]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("cc-switch:thinking"));
-       assert!(round_tripped["messages"][2]["content"][0]
+        assert!(round_tripped["messages"][2]["content"][0]
             .get("is_error")
             .is_none());
         assert!(round_tripped["messages"][2]["content"][0]["content"]
@@ -1872,42 +1869,42 @@ mod tests {
     }
 
     #[test]
-   fn unsigned_historical_thinking_degrades_to_text_for_anthropic_replay() {
-       let mut assistant_message = Vec::new();
-       assistant_message.extend(write_varint_field(2, SOURCE_SYSTEM));
-       assistant_message.extend(write_string_field(3, "I will inspect the files"));
-       assistant_message.extend(write_string_field(11, "Need to inspect before editing."));
-       assistant_message.extend(write_message_field(
-           6,
-           tool_call_proto("call_1", "Read", r#"{"path":"src/main.rs"}"#),
-       ));
+    fn unsigned_historical_thinking_degrades_to_text_for_anthropic_replay() {
+        let mut assistant_message = Vec::new();
+        assistant_message.extend(write_varint_field(2, SOURCE_SYSTEM));
+        assistant_message.extend(write_string_field(3, "I will inspect the files"));
+        assistant_message.extend(write_string_field(11, "Need to inspect before editing."));
+        assistant_message.extend(write_message_field(
+            6,
+            tool_call_proto("call_1", "Read", r#"{"path":"src/main.rs"}"#),
+        ));
 
-       let mut root = Vec::new();
-       root.extend(write_message_field(3, assistant_message));
+        let mut root = Vec::new();
+        root.extend(write_message_field(3, assistant_message));
 
-      let parsed = parse_get_chat_message_request(&root, &HeaderMap::new()).unwrap();
-      assert_eq!(parsed.messages.len(), 1);
-      let content = parsed.messages[0]["content"].as_array().unwrap();
-       // Unsigned thinking is dropped — no thinking blocks, no cc-switch tags.
-       assert!(content
-           .iter()
-           .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
-       assert!(content
-           .iter()
-           .all(|block| {
-               block.get("text")
-                   .and_then(Value::as_str)
-                   .map(|t| !t.contains("cc-switch:thinking"))
-                   .unwrap_or(true)
-           }));
-       // Prompt text and tool_use should still be present.
-       assert!(content
-           .iter()
-           .any(|block| block.get("text").and_then(Value::as_str) == Some("I will inspect the files")));
-       assert!(content
-           .iter()
-           .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use")));
-   }
+        let parsed = parse_get_chat_message_request(&root, &HeaderMap::new()).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        let content = parsed.messages[0]["content"].as_array().unwrap();
+        // Unsigned thinking is dropped — no thinking blocks, no cc-switch tags.
+        assert!(content
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
+        assert!(content.iter().all(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|t| !t.contains("cc-switch:thinking"))
+                .unwrap_or(true)
+        }));
+        // Prompt text and tool_use should still be present.
+        assert!(content
+            .iter()
+            .any(|block| block.get("text").and_then(Value::as_str)
+                == Some("I will inspect the files")));
+        assert!(content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use")));
+    }
 
     #[test]
     fn chat_sse_delta_builds_windsurf_text_and_stop_frames() {

@@ -923,9 +923,21 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
 
         tokio::pin!(stream);
 
+        let mut diag_chunk_count: usize = 0;
+        let mut diag_total_bytes: usize = 0;
+
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    diag_chunk_count += 1;
+                    diag_total_bytes += bytes.len();
+                    if diag_chunk_count <= 5 {
+                        log::debug!(
+                            "[CodexChat] 上游原始 chunk #{diag_chunk_count} ({} bytes): {}",
+                            bytes.len(),
+                            String::from_utf8_lossy(&bytes).chars().take(800).collect::<String>()
+                        );
+                    }
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
                     while let Some(block) = take_sse_block(&mut buffer) {
@@ -989,6 +1001,12 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
         }
 
         if !stream_failed {
+            log::debug!(
+                "[CodexChat] 上游流结束: chunks={diag_chunk_count}, total_bytes={diag_total_bytes}, completed={}, finish_reason={:?}, has_output={}",
+                state.completed,
+                state.finish_reason,
+                state.has_substantive_output()
+            );
             if state.completed || state.finish_reason.is_some() {
                 for event in state.finalize() {
                     yield Ok(event);

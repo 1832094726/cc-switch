@@ -19,6 +19,7 @@ use super::{
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream, get_adapter, get_claude_api_format,
+        streaming_anthropic_to_chat::create_chat_sse_stream_from_anthropic,
         streaming::create_anthropic_sse_stream,
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
@@ -1461,6 +1462,7 @@ async fn handle_responses_for_app(
             is_stream,
             connection_guard,
             codex_tool_context,
+            result.codex_anthropic_upstream,
         )
         .await;
     }
@@ -1557,6 +1559,7 @@ async fn handle_responses_compact_for_app(
             is_stream,
             connection_guard,
             codex_tool_context,
+            result.codex_anthropic_upstream,
         )
         .await;
     }
@@ -2053,6 +2056,7 @@ async fn handle_codex_chat_to_responses_transform(
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
     tool_context: transform_codex_chat::CodexToolContext,
+    anthropic_upstream: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -2065,7 +2069,18 @@ async fn handle_codex_chat_to_responses_transform(
 
     if is_stream || response.is_sse() {
         let stream = response.bytes_stream();
-        let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
+        let sse_stream: Box<
+            dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
+        > = if anthropic_upstream {
+            let chat_stream = create_chat_sse_stream_from_anthropic(stream);
+            let resp_stream =
+                create_responses_sse_stream_from_chat_with_context(chat_stream, tool_context);
+            Box::new(Box::pin(resp_stream))
+        } else {
+            let resp_stream =
+                create_responses_sse_stream_from_chat_with_context(stream, tool_context);
+            Box::new(Box::pin(resp_stream))
+        };
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
         let usage_collector = if usage_logging_enabled(state) {

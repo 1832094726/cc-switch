@@ -2025,14 +2025,89 @@ pub(crate) fn custom_tool_input_from_chat_arguments(arguments: &str) -> String {
     if arguments.trim().is_empty() {
         return String::new();
     }
-    match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::Object(obj)) => obj
-            .get(CUSTOM_TOOL_INPUT_FIELD)
-            .and_then(|value| value.as_str())
-            .unwrap_or(arguments)
-            .to_string(),
-        _ => arguments.to_string(),
+    // 情况一：合法 JSON 且是 {"input": "..."} 包裹 —— 直接取字段值。
+    if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(arguments) {
+        if let Some(input) = obj.get(CUSTOM_TOOL_INPUT_FIELD).and_then(Value::as_str) {
+            return input.to_string();
+        }
+        // 是合法 JSON 对象但没有 input 字段：非本包装格式，原样返回。
+        return arguments.to_string();
     }
+
+    // 情况二：JSON 非法。模型常把 freeform 原文（含裸换行/引号的 patch）塞进
+    // {"input":"..."} 却未正确转义，导致 serde 解析失败。若直接原样透传，下游
+    // apply_patch 会看到首行是 `{"input":"*** Begin Patch` 而非 `*** Begin Patch`，
+    // 校验失败。这里做宽松解包：剥掉 `{"input":"` 前缀与结尾 `"}`，并对已有的
+    // JSON 转义做最小还原，尽量恢复出原始 freeform 文本。
+    if let Some(unwrapped) = loosely_unwrap_custom_tool_input(arguments) {
+        return unwrapped;
+    }
+
+    // 情况三：模型直接输出了裸 freeform 文本（未加 JSON 壳），原样透传。
+    arguments.to_string()
+}
+
+/// 从非法 JSON 的 `{"input":"..."}` 壳里宽松提取 input 文本。
+///
+/// 仅在标准 `serde_json` 解析失败时兜底使用。返回 `None` 表示不像被包裹，交由
+/// 上层按裸文本透传。
+fn loosely_unwrap_custom_tool_input(arguments: &str) -> Option<String> {
+    let trimmed = arguments.trim();
+    // 必须形如 {"input": "..."}（键名可带空白），否则不认为是包裹。
+    let after_brace = trimmed.strip_prefix('{')?.trim_start();
+    let rest = after_brace
+        .strip_prefix(&format!("\"{CUSTOM_TOOL_INPUT_FIELD}\""))?
+        .trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let inner = rest.strip_prefix('"')?;
+    // 去掉结尾的 "} / " / }（容忍缺失或多余闭合）。
+    let inner = inner.trim_end();
+    let inner = inner.strip_suffix('}').map(str::trim_end).unwrap_or(inner);
+    let inner = inner.strip_suffix('"').unwrap_or(inner);
+    Some(unescape_json_string_body(inner))
+}
+
+/// 对 JSON 字符串体做最小转义还原：\n \r \t \" \\ \/ 以及 \uXXXX。
+/// 未知转义序列保留反斜杠原样，避免破坏 patch 内容。
+fn unescape_json_string_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('/') => out.push('/'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if hex.len() == 4 {
+                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(code) {
+                            out.push(ch);
+                            continue;
+                        }
+                    }
+                }
+                out.push('\\');
+                out.push('u');
+                out.push_str(&hex);
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 pub(crate) fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
@@ -3478,6 +3553,48 @@ mod tests {
         assert_eq!(
             result["output"][0]["input"],
             "*** Begin Patch\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn custom_tool_input_unwraps_valid_json_wrapper() {
+        // 合法 JSON 壳（正确转义）——取 input 字段。
+        let args = r#"{"input":"*** Begin Patch\n*** End Patch"}"#;
+        assert_eq!(
+            custom_tool_input_from_chat_arguments(args),
+            "*** Begin Patch\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn custom_tool_input_recovers_from_malformed_json_wrapper() {
+        // 复现 apply_patch verification failed 的根因：模型把 freeform patch 塞进
+        // {"input":"..."} 却含未转义的裸换行，导致 serde 解析失败。旧逻辑会原样
+        // 返回带 `{"input":"` 壳的字符串，使下游 apply_patch 首行校验失败。
+        let malformed = "{\"input\":\"*** Begin Patch\n@@ -1 +1 @@\n-old\n+new\n*** End Patch\"}";
+        let recovered = custom_tool_input_from_chat_arguments(malformed);
+        assert!(
+            recovered.starts_with("*** Begin Patch"),
+            "首行必须是裸 patch 头，实际: {recovered:?}"
+        );
+        assert!(recovered.trim_end().ends_with("*** End Patch"));
+        assert!(!recovered.contains("\"input\""));
+    }
+
+    #[test]
+    fn custom_tool_input_passes_through_bare_patch() {
+        // 模型直接输出裸 freeform 文本（无 JSON 壳），原样透传。
+        let bare = "*** Begin Patch\n*** End Patch";
+        assert_eq!(custom_tool_input_from_chat_arguments(bare), bare);
+    }
+
+    #[test]
+    fn custom_tool_input_handles_escaped_quotes_in_malformed_wrapper() {
+        // 非法 JSON 壳但内部引号已转义：宽松解包需还原 \" 与 \n。
+        let malformed = "{\"input\":\"line \\\"quoted\\\"\nnext\"}";
+        assert_eq!(
+            custom_tool_input_from_chat_arguments(malformed),
+            "line \"quoted\"\nnext"
         );
     }
 

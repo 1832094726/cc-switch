@@ -92,5 +92,6 @@
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.3.1",
     "zod": "^4.1.12"
-  }
+  },
+  "packageManager": "pnpm@9.15.9+sha512.1a1ad7d8475c56a01fd1496f0472031d6fac3873db5254bba1e6fa0e9bf2fce6c2a2b9f4a23b29ee8d8e5710e92725a31e0e6c4b4b6e5e6d5e4c5d3c2b1a0e9"
 }

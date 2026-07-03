@@ -4,6 +4,20 @@ pub(crate) fn strip_sse_field<'a>(line: &'a str, field: &str) -> Option<&'a str>
         .or_else(|| line.strip_prefix(&format!("{field}:")))
 }
 
+/// Repeatedly strip leading `data:` prefixes from a single SSE line.
+///
+/// Some upstream gateways double-wrap Anthropic SSE by prefixing every physical
+/// line (including inner `event:`/`data:` lines) with another `data: `. This
+/// returns the innermost payload after removing all outer `data:` layers.
+#[inline]
+pub(crate) fn strip_nested_data_prefix(line: &str) -> &str {
+    let mut current = line.trim_end();
+    while let Some(inner) = strip_sse_field(current, "data") {
+        current = inner;
+    }
+    current
+}
+
 #[inline]
 pub(crate) fn take_sse_block(buffer: &mut String) -> Option<String> {
     let mut best: Option<(usize, usize)> = None;

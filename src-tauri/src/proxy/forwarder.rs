@@ -59,6 +59,8 @@ pub struct ForwardResult {
     pub(crate) codex_responses_to_chat: bool,
     /// 本次上游调用是否把本地 Chat Completions 请求转换成 Responses。
     pub(crate) codex_chat_to_responses: bool,
+    /// 本次上游调用是否来自 JoyCode Anthropic 路由（上游返回 Anthropic SSE）。
+    pub(crate) codex_anthropic_upstream: bool,
     /// 活跃连接 RAII guard：随响应一起流转到 response_processor / handle_claude_transform，
     /// 最终被 move 进流式 body future（或非流式响应作用域），覆盖整个响应生命周期。
     pub(crate) connection_guard: Option<ActiveConnectionGuard>,
@@ -399,6 +401,21 @@ impl RequestForwarder {
             });
         }
 
+        // 小模型不故障转移：限制为仅尝试第一个 provider，
+        // 避免小模型请求被故障转移到其他昂贵的大模型 provider。
+        let providers = if body
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(super::windsurf::is_devin_small_model_alias)
+        {
+            if providers.len() > 1 {
+                log::info!("[{app_type_str}] 小模型请求，跳过故障转移，仅使用首个 provider");
+            }
+            providers.into_iter().take(1).collect::<Vec<_>>()
+        } else {
+            providers
+        };
+
         let mut last_error = None;
         let mut last_provider = None;
         let mut attempted_providers = 0usize;
@@ -410,12 +427,15 @@ impl RequestForwarder {
         for provider in providers.iter() {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
-           let mut rectifier_retried = false;
-           let mut budget_rectifier_retried = false;
-           let mut media_rectifier_retried = false;
+            let mut rectifier_retried = false;
+            let mut budget_rectifier_retried = false;
+            let mut media_rectifier_retried = false;
             // 同供应商超时重试计数器：首包超时通常是瞬时网络问题，最多重试 3 次
             let mut timeout_retries = 0u32;
             const MAX_TIMEOUT_RETRIES: u32 = 3;
+            // 同供应商 429 限流重试计数器：上游限流通常瞬时，等待后重试即可
+            let mut rate_limit_retries = 0u32;
+            const MAX_RATE_LIMIT_RETRIES: u32 = 2;
 
             // 上限检查：尊重用户在 AppProxyConfig.max_retries 上配置的「重试次数」。
             // 放在熔断器 allow 检查之前，避免在已经超限时还占用 HalfOpen 探测名额。
@@ -493,6 +513,7 @@ impl RequestForwarder {
                     outbound_model,
                     codex_responses_to_chat,
                     codex_chat_to_responses,
+                    codex_anthropic_upstream,
                 )) => {
                     // 成功：普通闭合熔断状态异步记录，避免阻塞流式首包返回；
                     // HalfOpen 探测仍同步等待，保证 permit 与熔断状态及时释放。
@@ -544,6 +565,7 @@ impl RequestForwarder {
                         outbound_model,
                         codex_responses_to_chat,
                         codex_chat_to_responses,
+                        codex_anthropic_upstream,
                         connection_guard: None,
                     });
                 }
@@ -600,6 +622,7 @@ impl RequestForwarder {
                                     outbound_model,
                                     codex_responses_to_chat,
                                     codex_chat_to_responses,
+                                    codex_anthropic_upstream,
                                 )) => {
                                     log::info!(
                                         "[{app_type_str}] [Media] Unsupported-image retry succeeded"
@@ -655,6 +678,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         codex_responses_to_chat,
                                         codex_chat_to_responses,
+                                        codex_anthropic_upstream,
                                         connection_guard: None,
                                     });
                                 }
@@ -754,6 +778,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         codex_responses_to_chat,
                                         codex_chat_to_responses,
+                                        codex_anthropic_upstream,
                                     )) => {
                                         log::info!("[{app_type_str}] [RECT-002] 整流重试成功");
                                         self.record_success_result(
@@ -812,6 +837,7 @@ impl RequestForwarder {
                                             outbound_model,
                                             codex_responses_to_chat,
                                             codex_chat_to_responses,
+                                            codex_anthropic_upstream,
                                             connection_guard: None,
                                         });
                                     }
@@ -928,6 +954,7 @@ impl RequestForwarder {
                                     outbound_model,
                                     codex_responses_to_chat,
                                     codex_chat_to_responses,
+                                    codex_anthropic_upstream,
                                 )) => {
                                     log::info!("[{app_type_str}] [RECT-011] budget 整流重试成功");
                                     self.record_success_result(
@@ -980,6 +1007,7 @@ impl RequestForwarder {
                                         outbound_model,
                                         codex_responses_to_chat,
                                         codex_chat_to_responses,
+                                        codex_anthropic_upstream,
                                         connection_guard: None,
                                     });
                                 }
@@ -1060,112 +1088,224 @@ impl RequestForwarder {
                                 providers.len(),
                                 &e,
                             );
-                           log::warn!("[{app_type_str}] [{log_code}] {log_message}");
+                            log::warn!("[{app_type_str}] [{log_code}] {log_message}");
 
-                           // 首包超时通常是瞬时网络问题，重试同一供应商最多 3 次
-                           while timeout_retries < MAX_TIMEOUT_RETRIES && matches!(e, ProxyError::Timeout(_)) {
-                               timeout_retries += 1;
-                               log::info!(
+                            // 首包超时通常是瞬时网络问题，重试同一供应商最多 3 次
+                            while timeout_retries < MAX_TIMEOUT_RETRIES
+                                && matches!(e, ProxyError::Timeout(_))
+                            {
+                                timeout_retries += 1;
+                                log::info!(
                                    "[{app_type_str}] [FWD-011] 首包超时，重试同一供应商 {} (第 {}/{})",
                                    provider.name, timeout_retries, MAX_TIMEOUT_RETRIES
                                );
 
-                               // 释放当前 permit（避免 HalfOpen 名额泄漏）
-                               self.router
-                                   .release_permit_neutral(
-                                       &provider.id,
-                                       app_type_str,
-                                       used_half_open_permit,
-                                   )
-                                   .await;
+                                // 释放当前 permit（避免 HalfOpen 名额泄漏）
+                                self.router
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
 
-                               match self
-                                   .forward(
-                                       app_type,
-                                       &method,
-                                       provider,
-                                       endpoint,
-                                       &provider_body,
-                                       &headers,
-                                       &extensions,
-                                       adapter.as_ref(),
-                                   )
-                                   .await
-                               {
-                                   Ok((
-                                       response,
-                                       claude_api_format,
-                                       outbound_model,
-                                       codex_responses_to_chat,
-                                       codex_chat_to_responses,
-                                   )) => {
-                                       log::info!(
-                                           "[{app_type_str}] [FWD-012] 超时重试成功: {}",
-                                           provider.name
-                                       );
-                                       self.record_success_result(
-                                           &provider.id,
-                                           app_type_str,
-                                           false,
-                                       )
-                                       .await;
+                                match self
+                                    .forward(
+                                        app_type,
+                                        &method,
+                                        provider,
+                                        endpoint,
+                                        &provider_body,
+                                        &headers,
+                                        &extensions,
+                                        adapter.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    Ok((
+                                        response,
+                                        claude_api_format,
+                                        outbound_model,
+                                        codex_responses_to_chat,
+                                        codex_chat_to_responses,
+                                        codex_anthropic_upstream,
+                                    )) => {
+                                        log::info!(
+                                            "[{app_type_str}] [FWD-012] 超时重试成功: {}",
+                                            provider.name
+                                        );
+                                        self.record_success_result(
+                                            &provider.id,
+                                            app_type_str,
+                                            false,
+                                        )
+                                        .await;
 
-                                       {
-                                           let mut current_providers =
-                                               self.current_providers.write().await;
-                                           current_providers.insert(
-                                               app_type_str.to_string(),
-                                               (provider.id.clone(), provider.name.clone()),
-                                           );
-                                       }
+                                        {
+                                            let mut current_providers =
+                                                self.current_providers.write().await;
+                                            current_providers.insert(
+                                                app_type_str.to_string(),
+                                                (provider.id.clone(), provider.name.clone()),
+                                            );
+                                        }
 
-                                       {
-                                           let mut status = self.status.write().await;
-                                           status.success_requests += 1;
-                                           status.last_error = None;
-                                       }
+                                        {
+                                            let mut status = self.status.write().await;
+                                            status.success_requests += 1;
+                                            status.last_error = None;
+                                        }
 
-                                       return Ok(ForwardResult {
-                                           response,
-                                           provider: provider.clone(),
-                                           claude_api_format,
-                                           outbound_model,
-                                           codex_responses_to_chat,
-                                           codex_chat_to_responses,
-                                           connection_guard: None,
-                                       });
-                                   }
-                                   Err(retry_err) => {
-                                       log::warn!(
+                                        return Ok(ForwardResult {
+                                            response,
+                                            provider: provider.clone(),
+                                            claude_api_format,
+                                            outbound_model,
+                                            codex_responses_to_chat,
+                                            codex_chat_to_responses,
+                                            codex_anthropic_upstream,
+                                            connection_guard: None,
+                                        });
+                                    }
+                                    Err(retry_err) => {
+                                        log::warn!(
                                            "[{app_type_str}] [FWD-013] 超时重试第 {} 次仍失败: {retry_err}",
                                            timeout_retries
                                        );
-                                       if !matches!(retry_err, ProxyError::Timeout(_)) {
-                                           last_error = Some(retry_err);
-                                           last_provider = Some(provider.clone());
-                                           break;
-                                       }
-                                   }
-                               }
-                           }
+                                        if !matches!(retry_err, ProxyError::Timeout(_)) {
+                                            last_error = Some(retry_err);
+                                            last_provider = Some(provider.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
 
-                           // 超时重试已执行：last_error 已在循环内设置（非超时错误）或需回退到原始错误
-                           if timeout_retries > 0 {
-                               if last_error.is_none() {
-                                   last_error = Some(e);
-                               }
-                               if last_provider.is_none() {
-                                   last_provider = Some(provider.clone());
-                               }
-                               continue;
-                           }
+                            // 超时重试已执行：last_error 已在循环内设置（非超时错误）或需回退到原始错误
+                            if timeout_retries > 0 {
+                                if last_error.is_none() {
+                                    last_error = Some(e);
+                                }
+                                if last_provider.is_none() {
+                                    last_provider = Some(provider.clone());
+                                }
+                                continue;
+                            }
+
+                            // 429 限流重试：上游返回 429（如"该模型当前访问量过大"）时，
+                            // 等待短暂延迟后重试同一供应商，避免在单 provider 场景下直接失败。
+                            while rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+                                && matches!(&e, ProxyError::UpstreamError { status, .. } if *status == 429)
+                            {
+                                rate_limit_retries += 1;
+                                let delay_ms = 1000u64 * (1 << (rate_limit_retries - 1));
+                                log::info!(
+                                   "[{app_type_str}] [FWD-014] 上游 429 限流，等待 {delay_ms}ms 后重试供应商 {} (第 {}/{})",
+                                   provider.name, rate_limit_retries, MAX_RATE_LIMIT_RETRIES
+                               );
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms))
+                                    .await;
+
+                                // 释放当前 permit（避免 HalfOpen 名额泄漏）
+                                self.router
+                                    .release_permit_neutral(
+                                        &provider.id,
+                                        app_type_str,
+                                        used_half_open_permit,
+                                    )
+                                    .await;
+
+                                match self
+                                    .forward(
+                                        app_type,
+                                        &method,
+                                        provider,
+                                        endpoint,
+                                        &provider_body,
+                                        &headers,
+                                        &extensions,
+                                        adapter.as_ref(),
+                                    )
+                                    .await
+                                {
+                                    Ok((
+                                        response,
+                                        claude_api_format,
+                                        outbound_model,
+                                        codex_responses_to_chat,
+                                        codex_chat_to_responses,
+                                        codex_anthropic_upstream,
+                                    )) => {
+                                        log::info!(
+                                            "[{app_type_str}] [FWD-015] 429 限流重试成功: {}",
+                                            provider.name
+                                        );
+                                        self.record_success_result(
+                                            &provider.id,
+                                            app_type_str,
+                                            false,
+                                        )
+                                        .await;
+
+                                        {
+                                            let mut current_providers =
+                                                self.current_providers.write().await;
+                                            current_providers.insert(
+                                                app_type_str.to_string(),
+                                                (provider.id.clone(), provider.name.clone()),
+                                            );
+                                        }
+
+                                        {
+                                            let mut status = self.status.write().await;
+                                            status.success_requests += 1;
+                                            status.last_error = None;
+                                        }
+
+                                        return Ok(ForwardResult {
+                                            response,
+                                            provider: provider.clone(),
+                                            claude_api_format,
+                                            outbound_model,
+                                            codex_responses_to_chat,
+                                            codex_chat_to_responses,
+                                            codex_anthropic_upstream,
+                                            connection_guard: None,
+                                        });
+                                    }
+                                    Err(retry_err) => {
+                                        log::warn!(
+                                           "[{app_type_str}] [FWD-016] 429 限流重试第 {} 次仍失败: {retry_err}",
+                                           rate_limit_retries
+                                       );
+                                        if !matches!(&retry_err, ProxyError::UpstreamError { status, .. } if *status == 429)
+                                        {
+                                            last_error = Some(retry_err);
+                                            last_provider = Some(provider.clone());
+                                            break;
+                                        }
+                                        // 仍然是 429，继续循环等待重试
+                                    }
+                                }
+                            }
+
+                            // 429 重试已执行
+                            if rate_limit_retries > 0 {
+                                if last_error.is_none() {
+                                    last_error = Some(e);
+                                }
+                                if last_provider.is_none() {
+                                    last_provider = Some(provider.clone());
+                                }
+                                continue;
+                            }
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
                             // 继续尝试下一个供应商
                             continue;
                         }
-                       ErrorCategory::FailoverNeutral => {
+                        ErrorCategory::FailoverNeutral => {
                             // 模型/端点级错误（如 404）：触发故障转移到下一家供应商，
                             // 但不污染熔断器健康度——该供应商对其他模型/端点可能完全正常。
                             self.router
@@ -1191,7 +1331,7 @@ impl RequestForwarder {
                             last_provider = Some(provider.clone());
                             continue;
                         }
-                       ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
+                        ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
                             // 不可重试：客户端层错误或客户端断连 → 不污染健康度，仅释放 HalfOpen permit
                             self.router
                                 .release_permit_neutral(
@@ -1262,7 +1402,7 @@ impl RequestForwarder {
 
     /// 转发单个请求（使用适配器）
     ///
-    /// 成功时返回 `(response, claude_api_format, outbound_model, codex_responses_to_chat, codex_chat_to_responses)`。
+    /// 成功时返回 `(response, claude_api_format, outbound_model, codex_responses_to_chat, codex_chat_to_responses, codex_anthropic_upstream)`。
     /// 其中 `outbound_model` 是最终发往上游的模型名（所有映射/改写之后）。
     #[allow(clippy::too_many_arguments)]
     async fn forward(
@@ -1275,7 +1415,7 @@ impl RequestForwarder {
         headers: &axum::http::HeaderMap,
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
-    ) -> Result<(ProxyResponse, Option<String>, Option<String>, bool, bool), ProxyError> {
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>, bool, bool, bool), ProxyError> {
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -1564,6 +1704,12 @@ impl RequestForwarder {
         let codex_model_catalog_to_messages = model_catalog_route
             .as_ref()
             .is_some_and(|route| route.endpoint.as_deref().is_some_and(is_messages_endpoint));
+        let codex_model_catalog_to_chat = model_catalog_route
+            .as_ref()
+            .is_some_and(|route| route.endpoint.as_deref().is_some_and(is_chat_completions_endpoint));
+        let codex_model_catalog_to_responses = model_catalog_route
+            .as_ref()
+            .is_some_and(|route| route.endpoint.as_deref().is_some_and(is_responses_endpoint));
         let codex_responses_to_chat = if matches!(app_type, AppType::Devin) && devin_route.is_some()
         {
             is_responses_endpoint(endpoint)
@@ -1593,6 +1739,7 @@ impl RequestForwarder {
             matches!(app_type, AppType::Codex | AppType::Devin)
                 && super::providers::should_convert_codex_chat_to_responses(provider, endpoint)
         };
+        let codex_anthropic_upstream = is_joycode_anthropic_route;
         let (effective_endpoint, passthrough_query) = if let Some(route) = devin_route.as_ref() {
             (
                 replace_endpoint_path_preserve_query(endpoint, &route.endpoint),
@@ -1645,6 +1792,10 @@ impl RequestForwarder {
             build_joycode_color_gateway_url("responses_completions")
         } else if is_joycode_upstream && devin_upstream_is_chat {
             build_joycode_color_gateway_url("chat_completions")
+        } else if is_joycode_upstream && codex_model_catalog_to_chat {
+            build_joycode_color_gateway_url("chat_completions")
+        } else if is_joycode_upstream && codex_model_catalog_to_responses {
+            build_joycode_color_gateway_url("responses_completions")
         } else if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
             super::gemini_url::resolve_gemini_native_url(
                 &base_url,
@@ -1670,7 +1821,9 @@ impl RequestForwarder {
                 effective_endpoint,
                 is_joycode_anthropic_route
                     || devin_upstream_is_responses
-                    || devin_upstream_is_chat,
+                    || devin_upstream_is_chat
+                    || codex_model_catalog_to_chat
+                    || codex_model_catalog_to_responses,
                 url
             );
         }
@@ -2532,7 +2685,7 @@ impl RequestForwarder {
             }
         }
 
-        if is_joycode_anthropic_route {
+        if is_joycode_anthropic_route || codex_model_catalog_to_chat || codex_model_catalog_to_responses {
             if let Some(chat_id) = joycode_chat_id.as_deref() {
                 if let Some(object) = filtered_body.as_object_mut() {
                     object.insert(
@@ -2789,6 +2942,7 @@ impl RequestForwarder {
                 outbound_model,
                 codex_responses_to_chat,
                 codex_chat_to_responses,
+                codex_anthropic_upstream,
             ))
         } else {
             let status_code = status.as_u16();
@@ -3295,29 +3449,33 @@ pub(crate) fn resolve_devin_model_route(
     let exact_model_entry = requested_model
         .as_ref()
         .and_then(|model| find_devin_model_entry(models, model, &requested_key));
-   // 非主模型（小模型）请求不 fallback 到主模型条目，避免小模型被
-   // 路由到昂贵的上游（如 glm-5.2），产生意外费用。
-   // 小模型请求若无法在当前供应商解析路由则返回 None，请求会带着原始
-   // 模型名发往当前供应商（上游通常返回 404/400 触发故障转移）。
+    // 非主模型（小模型）请求不 fallback 到主模型条目，避免小模型被
+    // 路由到昂贵的上游（如 glm-5.2），产生意外费用。
+    // 小模型请求若无法在当前供应商解析路由则返回 None，请求会带着原始
+    // 模型名发往当前供应商（上游通常返回 404/400 触发故障转移）。
     // picpi 是代理聚合服务，上游自行处理模型路由，保留原有 fallback 行为
     let is_non_primary = requested_model
-       .as_deref()
-       .is_some_and(|m| !is_devin_primary_model_alias(m));
+        .as_deref()
+        .is_some_and(|m| !is_devin_primary_model_alias(m));
     let is_picpi = is_picpi_devin_catalog(models, provider);
     let model_entry = if is_non_primary && !is_picpi {
-       exact_model_entry.or_else(|| find_devin_small_model_entry(models))
-   } else {
-       exact_model_entry
-           .or_else(|| {
-               requested_model
-                   .as_deref()
-                   .filter(|model| !is_devin_primary_model_alias(model))
-                   .and_then(|_| find_devin_small_model_entry(models))
-           })
-           .or_else(|| find_devin_fallback_model_entry(models, provider))
-           .or_else(|| models.first())
-   };
-   let model_entry = model_entry?;
+        exact_model_entry.or_else(|| find_devin_small_model_entry(models))
+    } else {
+        exact_model_entry
+            .or_else(|| {
+                requested_model
+                    .as_deref()
+                    .filter(|model| !is_devin_primary_model_alias(model))
+                    .and_then(|_| find_devin_small_model_entry(models))
+            })
+            .or_else(|| find_devin_fallback_model_entry(models, provider))
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|entry| !is_devin_small_model_catalog_entry(entry))
+            })
+    };
+    let model_entry = model_entry?;
 
     let endpoint = resolve_devin_model_endpoint(model_entry, provider)?;
     let upstream_model = devin_upstream_model(model_entry, provider);
@@ -3454,9 +3612,21 @@ fn find_devin_fallback_model_entry<'a>(
         }
     }
 
-    models
-        .iter()
-        .find(|entry| devin_upstream_model(entry, provider).is_some())
+    models.iter().find(|entry| {
+        devin_upstream_model(entry, provider).is_some()
+            && !is_devin_small_model_catalog_entry(entry)
+    })
+}
+
+fn is_devin_small_model_catalog_entry(entry: &Value) -> bool {
+    entry
+        .get("routes")
+        .and_then(Value::as_array)
+        .is_some_and(|routes| {
+            routes
+                .iter()
+                .any(|route| string_field(route, &["name"]).as_deref() == Some("devin-small-model"))
+        })
 }
 
 fn is_picpi_devin_catalog(models: &[Value], provider: &Provider) -> bool {
@@ -3676,7 +3846,16 @@ fn should_use_direct_http_client_for_upstream(
         })
         || {
             let lower = provider.name.to_ascii_lowercase();
-            lower.contains("pipi") || lower.contains("picpi")
+            lower.contains("joycode") || lower.contains("pipi") || lower.contains("picpi")
+        }
+        || {
+            // 兜底：Codex 等无 devin_route 的链路，从 provider 自身配置里探测
+            // joycode-api 内网上游，确保始终绕过系统代理（Clash）。
+            let config_lower = provider
+                .settings_config
+                .to_string()
+                .to_ascii_lowercase();
+            config_lower.contains("joycode-api")
         }
 }
 
@@ -4247,7 +4426,10 @@ fn find_joycode_header_value(headers: &[(String, String)], keys: &[&str]) -> Opt
     headers
         .iter()
         .rev()
-        .find(|(key, _)| keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate)))
+        .find(|(key, _)| {
+            keys.iter()
+                .any(|candidate| key.eq_ignore_ascii_case(candidate))
+        })
         .map(|(_, value)| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -4255,10 +4437,7 @@ fn find_joycode_header_value(headers: &[(String, String)], keys: &[&str]) -> Opt
 fn resolve_joycode_prepare_base_url(base_url: &str, headers: &[(String, String)]) -> String {
     find_joycode_header_value(headers, &["masterBaseUrl", "master_base_url"])
         .unwrap_or_else(|| {
-            if base_url
-                .to_ascii_lowercase()
-                .contains("joycode-api.jd.com")
-            {
+            if base_url.to_ascii_lowercase().contains("joycode-api.jd.com") {
                 "http://joycode-api-saas.jd.com".to_string()
             } else {
                 base_url.to_string()
@@ -4621,6 +4800,7 @@ fn compact_long_devin_text(
 fn normalize_devin_cache_text(value: &str, preserve_whitespace: bool) -> String {
     let mut text = value.to_string();
     for (regex, replacement) in [
+        (elided_digest_regex(), "elided: chars=[n], sha256=[digest]"),
         (iso_timestamp_regex(), "[timestamp]"),
         (request_id_regex(), "$1[id]"),
         (uuid_regex(), "[uuid]"),
@@ -4643,9 +4823,33 @@ fn normalize_devin_cache_text(value: &str, preserve_whitespace: bool) -> String 
 }
 
 fn inject_devin_anthropic_cache_control(body: &mut Value) {
+    // 客户端（如 Windsurf/Cascade）常会给几乎每个内容块都打 cache_control，
+    // 实测单请求可达 80+ 个。但 Anthropic 硬性限制最多 4 个 cache_control 断点，
+    // 超过会返回 400。因此先彻底剥离客户端原有断点，再由下面按
+    // system(1) + tools(1) + 稳定历史(DEVIN_STABLE_HISTORY_CACHE_POINTS) 精确注入，
+    // 保证总数 ≤ 4。
+    strip_all_cache_control(body);
     inject_anthropic_system_cache_control(body);
     inject_anthropic_tools_cache_control(body);
     inject_stable_history_cache_control(body);
+}
+
+/// 递归移除 JSON 中所有的 `cache_control` 字段。
+fn strip_all_cache_control(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("cache_control");
+            for v in object.values_mut() {
+                strip_all_cache_control(v);
+            }
+        }
+        Value::Array(values) => {
+            for v in values.iter_mut() {
+                strip_all_cache_control(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn inject_anthropic_system_cache_control(body: &mut Value) -> bool {
@@ -5005,6 +5209,20 @@ fn var_folders_regex() -> &'static Regex {
 fn whitespace_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"\s+").unwrap())
+}
+
+/// 归一化“再次省略”场景下的自引用摘要头。
+///
+/// 历史里的超长 tool_result 会被 compact_long_devin_text 折叠成
+/// `[... elided: chars=18715, sha256=<hex>]`。这段文本又会作为历史被下一轮
+/// 请求再次归一化。其中 `chars=<n>` 与 `sha256=<hex>` 会随上游内容/重算而
+/// 抖动（长度固定，不改变 char_count，却让整体 hash 变化），导致缓存前缀在
+/// 该消息处断裂、命中率骤降。这里把这段易变摘要统一替换为稳定占位符。
+fn elided_digest_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)elided:\s*chars=\d+,\s*sha256=[0-9a-f]+").unwrap()
+    })
 }
 
 fn normalize_anthropic_temperature_for_thinking(mut body: Value) -> Value {
@@ -6081,6 +6299,27 @@ mod tests {
     }
 
     #[test]
+    fn normalize_stabilizes_repeated_elided_digest_header() {
+        // 复现缓存命中率骤降的根因：历史里被折叠过的 tool_result 形如
+        // `[tool_result elided: chars=N, sha256=<hex>]`，作为历史再次进入
+        // 归一化时，chars/sha256 会抖动（长度固定却改变整体 hash），导致
+        // 缓存前缀在该消息处断裂。归一化后两者必须产生相同结果。
+        let a = "[tool_result elided: chars=18715, sha256=543e8a0a79008eb7]\n\
+                 The search for the query: foo bar baz";
+        let b = "[tool_result elided: chars=18715, sha256=296bcc5aceaf9271]\n\
+                 The search for the query: foo bar baz";
+
+        let na = normalize_devin_cache_text(a, false);
+        let nb = normalize_devin_cache_text(b, false);
+
+        assert_eq!(na, nb, "同内容不同摘要头归一化后必须一致");
+        assert!(na.contains("sha256=[digest]"));
+        assert!(na.contains("chars=[n]"));
+        assert!(!na.contains("543e8a0a"));
+        assert!(!na.contains("296bcc5a"));
+    }
+
+    #[test]
     fn devin_prompt_cache_key_uses_stable_conversation_prefix() {
         let provider = test_provider_with_type(Some("codex"));
         let base = json!({
@@ -6216,17 +6455,15 @@ mod tests {
 
     #[test]
     fn joycode_prepare_base_url_uses_login_master_base_url() {
-        let headers = vec![
-            (
-                "masterBaseUrl".to_string(),
-                "http://joycode-api-saas.jd.com/".to_string(),
-            ),
-        ];
+        let headers = vec![(
+            "masterBaseUrl".to_string(),
+            "http://joycode-api-saas.jd.com/".to_string(),
+        )];
 
         assert_eq!(
             resolve_joycode_prepare_base_url(
                 "https://joycode-api.jd.com/api/saas/openai/v1",
-                &headers,
+                &headers
             ),
             "http://joycode-api-saas.jd.com"
         );
@@ -6408,7 +6645,7 @@ mod tests {
             );
             assert_eq!(route.thinking_enabled, Some(false));
         }
-   }
+    }
 
     #[test]
     fn devin_small_model_no_fallback_to_primary_on_non_picpi() {
@@ -6435,21 +6672,15 @@ mod tests {
         });
 
         // 小模型请求在当前供应商没有匹配条目，应返回 None（不 fallback 到 glm-5.2）
-        let result = resolve_devin_model_route(
-            &provider,
-            &json!({ "model": "MODEL_GPT_5_NANO" }),
-        );
+        let result = resolve_devin_model_route(&provider, &json!({ "model": "MODEL_GPT_5_NANO" }));
         assert!(
             result.is_none(),
             "Small model request should not fall back to primary model on non-picpi provider"
         );
 
         // 主模型请求仍应正常路由
-        let route = resolve_devin_model_route(
-            &provider,
-            &json!({ "model": "swe-1-6-slow" }),
-        )
-        .unwrap();
+        let route =
+            resolve_devin_model_route(&provider, &json!({ "model": "swe-1-6-slow" })).unwrap();
         assert_eq!(route.upstream_model.as_deref(), Some("glm-5.2"));
     }
 

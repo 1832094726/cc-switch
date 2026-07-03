@@ -28,6 +28,7 @@ pub mod models;
 pub mod streaming;
 pub mod streaming_codex_chat;
 pub mod streaming_gemini;
+pub mod streaming_anthropic_to_chat;
 pub mod streaming_responses;
 pub mod transform;
 pub mod transform_codex_chat;
@@ -48,9 +49,9 @@ pub use claude::{
 };
 pub use codex::CodexAdapter;
 pub use codex::{
-    apply_codex_chat_upstream_model, codex_provider_upstream_model,
-    is_origin_only_url, resolve_codex_chat_reasoning_config,
-    should_convert_codex_chat_to_responses, should_convert_codex_responses_to_chat,
+    apply_codex_chat_upstream_model, codex_provider_upstream_model, is_origin_only_url,
+    resolve_codex_chat_reasoning_config, should_convert_codex_chat_to_responses,
+    should_convert_codex_responses_to_chat,
 };
 pub use gemini::GeminiAdapter;
 pub(crate) use joycode_anthropic::{

@@ -976,6 +976,60 @@ fn provider_service_switch_codex_official_accounts_write_auth_json() {
 }
 
 #[test]
+fn provider_service_update_current_codex_oauth_auth_writes_live_even_if_category_is_custom() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    enable_codex_official_auth_preservation();
+    let _home = ensure_test_home();
+
+    let legacy_auth = json!({ "OPENAI_API_KEY": "PROXY_MANAGED" });
+    write_codex_live_atomic(&legacy_auth, Some("")).expect("seed proxy placeholder auth");
+
+    let mut provider = Provider::with_id(
+        "codex-official".to_string(),
+        "Codex Official".to_string(),
+        json!({
+            "auth": {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": null,
+                "tokens": {
+                    "access_token": "fresh-official-token",
+                    "account_id": "acct-fresh"
+                }
+            },
+            "config": ""
+        }),
+        None,
+    );
+    // 历史数据可能没有被正确归类为 official；保存 auth.json 仍应落到 live。
+    provider.category = Some("custom".to_string());
+
+    let mut initial_config = MultiAppConfig::default();
+    {
+        let manager = initial_config
+            .get_manager_mut(&AppType::Codex)
+            .expect("codex manager");
+        manager.current = provider.id.clone();
+        manager
+            .providers
+            .insert(provider.id.clone(), provider.clone());
+    }
+
+    let state = create_test_state_with_config(&initial_config).expect("create test state");
+    ProviderService::update(&state, AppType::Codex, None, provider)
+        .expect("updating current provider should write explicit official auth");
+
+    let auth: serde_json::Value =
+        read_json_file(&cc_switch_lib::get_codex_auth_path()).expect("read live auth");
+    assert_eq!(
+        auth.pointer("/tokens/access_token")
+            .and_then(|value| value.as_str()),
+        Some("fresh-official-token"),
+        "explicitly saved official Codex auth.json should replace live placeholder"
+    );
+}
+
+#[test]
 fn provider_service_switch_codex_backfill_keeps_provider_specific_model_provider_id() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();

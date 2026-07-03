@@ -496,7 +496,7 @@ fn sse_json_payloads(data: &str) -> Vec<&str> {
         .filter(|payload| {
             !payload.is_empty()
                 && *payload != "[DONE]"
-        && (payload.starts_with('{') || payload.starts_with('['))
+                && (payload.starts_with('{') || payload.starts_with('['))
         })
         .collect()
 }

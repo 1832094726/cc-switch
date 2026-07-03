@@ -24,17 +24,17 @@ use std::time::Instant;
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
-use crate::proxy::providers::{get_adapter, ClaudeAdapter, ProviderAdapter};
-use bytes::Bytes;
-use futures::StreamExt;
-use hmac::{Hmac, Mac};
-use serde_json::{json, Value};
 use crate::proxy::gemini_url::{normalize_gemini_model_id, resolve_gemini_native_url};
 use crate::proxy::providers::copilot_auth;
 use crate::proxy::providers::transform::anthropic_to_openai;
 use crate::proxy::providers::transform_gemini::anthropic_to_gemini;
 use crate::proxy::providers::transform_responses::anthropic_to_responses;
+use crate::proxy::providers::{get_adapter, ClaudeAdapter, ProviderAdapter};
 use crate::proxy::providers::{AuthInfo, AuthStrategy};
+use bytes::Bytes;
+use futures::StreamExt;
+use hmac::{Hmac, Mac};
+use serde_json::{json, Value};
 
 /// 健康状态枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -102,7 +102,6 @@ pub struct StreamCheckResult {
 
 /// 连通性检查服务
 pub struct StreamCheckService;
-
 
 #[derive(Debug, Clone)]
 struct DevinCatalogRoute {
@@ -196,7 +195,6 @@ fn merge_header_fields(
         }
     }
 }
-
 
 impl StreamCheckService {
     /// 执行连通性检查（仅对超时类失败重试）。
@@ -1933,13 +1931,13 @@ impl StreamCheckService {
 
         let success_count = results.iter().filter(|r| r.success).count();
         let total = results.len();
-       let status = if success_count == total {
-           if results.iter().any(|r| r.status == HealthStatus::Degraded) {
-               HealthStatus::Degraded
-           } else {
-               HealthStatus::Operational
-           }
-       } else {
+        let status = if success_count == total {
+            if results.iter().any(|r| r.status == HealthStatus::Degraded) {
+                HealthStatus::Degraded
+            } else {
+                HealthStatus::Operational
+            }
+        } else {
             // Partial model failures (e.g. small models mapped to upstream
             // models the provider doesn't support) should degrade, not fail.
             if success_count > 0 {
@@ -1947,18 +1945,18 @@ impl StreamCheckService {
             } else {
                 HealthStatus::Failed
             }
-       };
+        };
         let failed = results
             .iter()
             .filter(|r| !r.success)
             .map(|r| format!("{}: {}", r.model_used, r.message))
             .collect::<Vec<_>>();
 
-       StreamCheckResult {
-           status,
+        StreamCheckResult {
+            status,
             // Provider is usable as long as at least one model passes.
             success: success_count > 0,
-           message: if failed.is_empty() {
+            message: if failed.is_empty() {
                 format!("All {total} models check succeeded")
             } else {
                 format!(
@@ -1996,8 +1994,6 @@ impl StreamCheckService {
         }
         current.to_string()
     }
-
-
 }
 
 #[cfg(test)]
@@ -2095,17 +2091,17 @@ mod tests {
 
         // testConfig 启用并覆盖部分字段
         let mut p2 = make_provider(serde_json::json!({}));
-       p2.meta = Some(ProviderMeta {
-           test_config: Some(ProviderTestConfig {
-               enabled: true,
-               timeout_secs: Some(20),
-               degraded_threshold_ms: Some(3000),
-               max_retries: None,
-               test_prompt: None,
-               test_model: None,
-           }),
-           ..Default::default()
-       });
+        p2.meta = Some(ProviderMeta {
+            test_config: Some(ProviderTestConfig {
+                enabled: true,
+                timeout_secs: Some(20),
+                degraded_threshold_ms: Some(3000),
+                max_retries: None,
+                test_prompt: None,
+                test_model: None,
+            }),
+            ..Default::default()
+        });
         let merged2 = StreamCheckService::merge_provider_config(&p2, &global);
         assert_eq!(merged2.timeout_secs, 20);
         assert_eq!(merged2.degraded_threshold_ms, 3000);
@@ -2113,17 +2109,17 @@ mod tests {
 
         // testConfig 存在但未启用 → 忽略，用全局
         let mut p3 = make_provider(serde_json::json!({}));
-       p3.meta = Some(ProviderMeta {
-           test_config: Some(ProviderTestConfig {
-               enabled: false,
-               timeout_secs: Some(99),
-               degraded_threshold_ms: None,
-               max_retries: None,
-               test_prompt: None,
-               test_model: None,
-           }),
-           ..Default::default()
-       });
+        p3.meta = Some(ProviderMeta {
+            test_config: Some(ProviderTestConfig {
+                enabled: false,
+                timeout_secs: Some(99),
+                degraded_threshold_ms: None,
+                max_retries: None,
+                test_prompt: None,
+                test_model: None,
+            }),
+            ..Default::default()
+        });
         let merged3 = StreamCheckService::merge_provider_config(&p3, &global);
         assert_eq!(merged3.timeout_secs, global.timeout_secs);
     }
