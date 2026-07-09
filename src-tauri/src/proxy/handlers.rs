@@ -19,8 +19,8 @@ use super::{
     providers::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream, get_adapter, get_claude_api_format,
-        streaming_anthropic_to_chat::create_chat_sse_stream_from_anthropic,
         streaming::create_anthropic_sse_stream,
+        streaming_anthropic_to_chat::create_chat_sse_stream_from_anthropic,
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
@@ -1425,17 +1425,47 @@ async fn handle_responses_for_app(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
+    let providers = ctx.get_providers();
+    let codex_continue_native_only = matches!(app_type, AppType::Codex)
+        && !providers.iter().any(|provider| {
+            super::providers::should_convert_codex_responses_to_chat(provider, &endpoint)
+        });
+    let codex_continue_config = if codex_continue_native_only {
+        Some(
+            state
+                .db
+                .get_codex_continue_config()
+                .map(super::codex_continue::CodexContinueConfig::from_settings_with_env)
+                .unwrap_or_else(|e| {
+                    log::warn!("[CodexContinue] failed to load config, using env/defaults: {e}");
+                    super::codex_continue::CodexContinueConfig::from_env()
+                }),
+        )
+    } else {
+        None
+    };
+    let codex_continue_enabled = codex_continue_config
+        .as_ref()
+        .is_some_and(|config| super::codex_continue::should_enable_for_request(&body, config));
+    let initial_body = if codex_continue_enabled {
+        super::codex_continue::prepare_initial_payload(&body)
+    } else {
+        body.clone()
+    };
+    let original_body = initial_body.clone();
+    let original_headers = headers.clone();
+    let original_extensions = extensions.clone();
 
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
             &app_type,
-            method,
+            method.clone(),
             &endpoint,
-            body,
+            initial_body,
             headers,
             extensions,
-            ctx.get_providers(),
+            providers.clone(),
         )
         .await
     {
@@ -1467,6 +1497,26 @@ async fn handle_responses_for_app(
         .await;
     }
 
+    if let Some(codex_continue_config) = codex_continue_config {
+        if codex_continue_enabled && response.is_sse() {
+            let response = super::codex_continue::build_folded_proxy_response(
+                super::codex_continue::FoldedProxyResponseArgs {
+                    first_response: response,
+                    first_connection_guard: connection_guard,
+                    forwarder,
+                    method,
+                    endpoint: endpoint.clone(),
+                    base_body: original_body,
+                    headers: original_headers,
+                    extensions: original_extensions,
+                    providers,
+                    config: codex_continue_config,
+                },
+            );
+            return build_codex_folded_stream_response(response, &ctx, &state);
+        }
+    }
+
     process_response(
         response,
         &ctx,
@@ -1475,6 +1525,113 @@ async fn handle_responses_for_app(
         connection_guard,
     )
     .await
+}
+
+fn build_codex_folded_stream_response(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    let mut response_headers = response.headers().clone();
+    strip_hop_by_hop_response_headers(&mut response_headers);
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+
+    let usage_collector = create_codex_folded_usage_collector(ctx, state, status.as_u16());
+    let body = axum::body::Body::from_stream(create_logged_passthrough_stream(
+        response.bytes_stream(),
+        ctx.tag,
+        usage_collector,
+        ctx.streaming_timeout_config(),
+        None,
+    ));
+    builder.body(body).map_err(|e| {
+        log::error!("[Codex] 构建 folded Responses 流失败: {e}");
+        ProxyError::Internal(format!("Failed to build folded responses stream: {e}"))
+    })
+}
+
+fn create_codex_folded_usage_collector(
+    ctx: &RequestContext,
+    state: &ProxyState,
+    status_code: u16,
+) -> Option<SseUsageCollector> {
+    if !usage_logging_enabled(state) {
+        return None;
+    }
+
+    let state = state.clone();
+    let provider_id = ctx.provider.id.clone();
+    let request_model = ctx.request_model.clone();
+    let fallback_model = ctx
+        .outbound_model
+        .clone()
+        .unwrap_or_else(|| ctx.request_model.clone());
+    let app_type_str = ctx.app_type_str;
+    let start_time = ctx.start_time;
+    let session_id = ctx.session_id.clone();
+
+    Some(SseUsageCollector::new(
+        start_time,
+        Some(codex_stream_usage_event_filter),
+        move |events, first_token_ms| {
+            let Some(usage) = TokenUsage::from_codex_stream_events_auto(&events)
+                .filter(TokenUsage::has_billable_tokens)
+            else {
+                log::debug!("[CodexContinue] folded stream usage 全 0 或缺失，跳过 proxy 记录");
+                return;
+            };
+
+            let model = usage
+                .model
+                .clone()
+                .filter(|m| !m.is_empty())
+                .or_else(|| {
+                    events.iter().find_map(|event| {
+                        if event.get("type")?.as_str()? == "response.completed" {
+                            event
+                                .get("response")?
+                                .get("model")?
+                                .as_str()
+                                .filter(|m| !m.is_empty())
+                                .map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_else(|| fallback_model.clone());
+
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let state = state.clone();
+            let provider_id = provider_id.clone();
+            let request_model = request_model.clone();
+            let outbound_model = fallback_model.clone();
+            let session_id = session_id.clone();
+
+            tokio::spawn(async move {
+                log_usage(
+                    &state,
+                    &provider_id,
+                    app_type_str,
+                    &model,
+                    &request_model,
+                    &outbound_model,
+                    usage,
+                    latency_ms,
+                    first_token_ms,
+                    true,
+                    status_code,
+                    Some(session_id),
+                )
+                .await;
+            });
+        },
+    ))
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）

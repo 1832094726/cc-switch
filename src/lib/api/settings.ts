@@ -292,6 +292,16 @@ export const settingsApi = {
     return await invoke("set_optimizer_config", { config });
   },
 
+  async getCodexContinueConfig(): Promise<CodexContinueConfig> {
+    return await invoke("get_codex_continue_config");
+  },
+
+  async setCodexContinueConfig(
+    config: CodexContinueConfig,
+  ): Promise<boolean> {
+    return await invoke("set_codex_continue_config", { config });
+  },
+
   async getLogConfig(): Promise<LogConfig> {
     return await invoke("get_log_config");
   },
@@ -334,6 +344,13 @@ export interface OptimizerConfig {
   thinkingOptimizer: boolean;
   cacheInjection: boolean;
   cacheTtl: string;
+}
+
+export interface CodexContinueConfig {
+  enabled: boolean;
+  maxContinuations: number;
+  step: number;
+  marker: string;
 }
 
 export interface LogConfig {
