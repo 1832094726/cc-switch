@@ -1813,7 +1813,7 @@ mod tests {
             .contains("cc-switch:thinking"));
         assert!(responses_body["input"]
             .to_string()
-            .contains(r#"<cc-switch:tool_result is_error=\"true\">"#));
+            .contains("[cc-switch:tool-result-error]"));
 
         let chat_body = transform::anthropic_to_openai(canonical_body).unwrap();
         assert_eq!(chat_body["model"], "MODEL_PRIVATE_11");
@@ -1840,7 +1840,14 @@ mod tests {
         assert_eq!(chat_body["tool_choice"], "required");
 
         let round_tripped = transform::openai_chat_request_to_anthropic(chat_body).unwrap();
-        assert_eq!(round_tripped["system"], "base system\nworkspace rules");
+        assert_eq!(
+            round_tripped["system"][0]["text"],
+            "base system\nworkspace rules"
+        );
+        assert_eq!(
+            round_tripped["system"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
         assert_eq!(round_tripped["messages"][0]["content"][0]["type"], "image");
         assert_eq!(round_tripped["messages"][1]["content"][0]["type"], "text");
         // Thinking dropped → tool_use is now at index 1 (was index 2)

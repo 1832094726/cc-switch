@@ -177,10 +177,7 @@ struct ToolUseState {
 }
 
 impl AnthropicToChatState {
-    fn handle_anthropic_event(
-        &mut self,
-        event: &Value,
-    ) -> Vec<Bytes> {
+    fn handle_anthropic_event(&mut self, event: &Value) -> Vec<Bytes> {
         let event_type = event.get("type").and_then(|t| t.as_str());
         let mut out: Vec<Bytes> = Vec::new();
 
@@ -205,8 +202,7 @@ impl AnthropicToChatState {
                     "[AnthropicToChat] 上游错误对象(无 type): type={err_type}, message={err_msg}"
                 );
                 if self.upstream_error.is_none() {
-                    self.upstream_error =
-                        Some(format!("Upstream error ({err_type}): {err_msg}"));
+                    self.upstream_error = Some(format!("Upstream error ({err_type}): {err_msg}"));
                 }
                 return out;
             }
@@ -232,7 +228,10 @@ impl AnthropicToChatState {
             }
 
             Some("content_block_start") => {
-                let index = event.get("index").and_then(|i| i.as_u64()).map(|i| i as u32);
+                let index = event
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|i| i as u32);
                 let block = event.get("content_block");
                 let block_type = block
                     .and_then(|b| b.get("type"))
@@ -288,15 +287,18 @@ impl AnthropicToChatState {
             }
 
             Some("content_block_delta") => {
-                let index = event.get("index").and_then(|i| i.as_u64()).map(|i| i as u32);
+                let index = event
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|i| i as u32);
                 let delta = event.get("delta");
-                let delta_type = delta
-                    .and_then(|d| d.get("type"))
-                    .and_then(|t| t.as_str());
+                let delta_type = delta.and_then(|d| d.get("type")).and_then(|t| t.as_str());
 
                 match delta_type {
                     Some("text_delta") => {
-                        if let Some(text) = delta.and_then(|d| d.get("text")).and_then(|v| v.as_str()) {
+                        if let Some(text) =
+                            delta.and_then(|d| d.get("text")).and_then(|v| v.as_str())
+                        {
                             let text = text.to_string();
                             out.push(self.build_chat_chunk(json!({
                                 "delta": {
@@ -306,12 +308,18 @@ impl AnthropicToChatState {
                         }
                     }
                     Some("thinking_delta") => {
-                        if let Some(thinking) = delta.and_then(|d| d.get("thinking")).and_then(|v| v.as_str()) {
+                        if let Some(thinking) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(|v| v.as_str())
+                        {
                             self.pending_reasoning.push_str(thinking);
                         }
                     }
                     Some("input_json_delta") => {
-                        if let Some(partial_json) = delta.and_then(|d| d.get("partial_json")).and_then(|v| v.as_str()) {
+                        if let Some(partial_json) = delta
+                            .and_then(|d| d.get("partial_json"))
+                            .and_then(|v| v.as_str())
+                        {
                             if let Some(i) = index {
                                 let (was_new, tid, tname) = {
                                     if let Some(ts) = self.tool_use_states.get_mut(&i) {
@@ -371,7 +379,10 @@ impl AnthropicToChatState {
             }
 
             Some("content_block_stop") => {
-                let index = event.get("index").and_then(|i| i.as_u64()).map(|i| i as u32);
+                let index = event
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .map(|i| i as u32);
                 if let Some(ref bt) = self.current_content_block_type {
                     match bt.as_str() {
                         "thinking" => {
@@ -421,8 +432,7 @@ impl AnthropicToChatState {
                                 || k == "cache_creation_input_tokens"
                                 || k == "cache_read_input_tokens";
                             if is_prompt_field {
-                                let incoming_zero =
-                                    v.as_i64().map(|n| n == 0).unwrap_or(false);
+                                let incoming_zero = v.as_i64().map(|n| n == 0).unwrap_or(false);
                                 let base_has =
                                     base_obj.get(k).and_then(|x| x.as_i64()).unwrap_or(0) > 0;
                                 if incoming_zero && base_has {
@@ -461,11 +471,8 @@ impl AnthropicToChatState {
                     .and_then(|e| e.get("message"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("upstream returned error event");
-                log::warn!(
-                    "[AnthropicToChat] 上游 error 事件: type={err_type}, message={err_msg}"
-                );
-                self.upstream_error =
-                    Some(format!("Upstream error ({err_type}): {err_msg}"));
+                log::warn!("[AnthropicToChat] 上游 error 事件: type={err_type}, message={err_msg}");
+                self.upstream_error = Some(format!("Upstream error ({err_type}): {err_msg}"));
             }
 
             Some("ping") => {
@@ -528,7 +535,10 @@ impl AnthropicToChatState {
             full["usage"] = usage.clone();
         }
 
-        Bytes::from(format!("data: {}\n\n", serde_json::to_string(&full).unwrap_or_default()))
+        Bytes::from(format!(
+            "data: {}\n\n",
+            serde_json::to_string(&full).unwrap_or_default()
+        ))
     }
 
     fn close_text_block(&mut self, _out: &mut Vec<Bytes>) {

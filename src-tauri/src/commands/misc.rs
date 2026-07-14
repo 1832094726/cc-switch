@@ -3838,11 +3838,7 @@ mod tests {
             let (_dir, sub, bin_path) = setup_sibling("Volta", "codex.cmd", &["volta.exe"]);
             let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
             let volta_full = format!("{}\\volta.exe", sub.to_string_lossy());
-            let expected = format!(
-                "{} update || call {} install @openai/codex",
-                expect_quoted_path(&bin_path),
-                expect_quoted_path(&volta_full)
-            );
+            let expected = format!("{} install @openai/codex", expect_quoted_path(&volta_full));
             assert_eq!(cmd.as_deref(), Some(expected.as_str()));
         }
 
@@ -3855,8 +3851,7 @@ mod tests {
             let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
             let pnpm_full = format!("{}\\pnpm.cmd", sub.to_string_lossy());
             let expected = format!(
-                "{} update || call {} add -g @openai/codex@latest",
-                expect_quoted_path(&bin_path),
+                "{} add -g @openai/codex@latest",
                 expect_quoted_path(&pnpm_full)
             );
             assert_eq!(cmd.as_deref(), Some(expected.as_str()));
@@ -3889,8 +3884,7 @@ mod tests {
             let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
             let npm_full = format!("{}\\npm.cmd", sub.to_string_lossy());
             let expected = format!(
-                "{} update || call {} i -g @openai/codex@latest",
-                expect_quoted_path(&bin_path),
+                "{} i -g @openai/codex@latest",
                 expect_quoted_path(&npm_full)
             );
             assert_eq!(cmd.as_deref(), Some(expected.as_str()));
@@ -3902,8 +3896,7 @@ mod tests {
             // 只是没有包管理器 fallback。
             let (_dir, _sub, bin_path) = setup_sibling("", "codex.cmd", &[]);
             let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
-            let expected = format!("{} update", expect_quoted_path(&bin_path));
-            assert_eq!(cmd.as_deref(), Some(expected.as_str()));
+            assert_eq!(cmd, None);
         }
 
         #[test]
@@ -3978,8 +3971,7 @@ mod tests {
             let cmd = anchored_command_from_paths("codex", &bin_path, &bin_path);
             let npm_full = format!("{}\\npm.cmd", sub.to_string_lossy());
             let expected = format!(
-                "{} update || call {} i -g @openai/codex@latest",
-                expect_quoted_path(&bin_path),
+                "{} i -g @openai/codex@latest",
                 expect_quoted_path(&npm_full)
             );
             assert_eq!(cmd.as_deref(), Some(expected.as_str()));
@@ -4002,8 +3994,7 @@ mod tests {
             // 会让 expected 漏引号、假失败)。
             let npm_full = format!("{}\\npm.cmd", sub.to_string_lossy());
             let expected = format!(
-                "call {} update || call {} i -g @openai/codex@latest",
-                expect_quoted_path(&bin_path),
+                "call {} i -g @openai/codex@latest",
                 expect_quoted_path(&npm_full)
             );
             assert_eq!(batch_line, expected);
