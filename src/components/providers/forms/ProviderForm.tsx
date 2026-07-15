@@ -350,6 +350,16 @@ type LocalProxyRequestOverridesBuildResult = ReturnType<
   typeof buildLocalProxyRequestOverrides
 >;
 
+export function shouldApplyLocalProxyRequestOverridesForApp(
+  appId: AppId,
+  category: ProviderCategory | undefined,
+): boolean {
+  return (
+    (appId === "claude" || appId === "codex" || appId === "devin") &&
+    category !== "official"
+  );
+}
+
 export interface ProviderFormProps {
   appId: AppId;
   providerId?: string;
@@ -1107,7 +1117,7 @@ function ProviderFormFull({
   const [isCommonConfigModalOpen, setIsCommonConfigModalOpen] = useState(false);
 
   const shouldApplyLocalProxyRequestOverrides =
-    (appId === "claude" || appId === "codex") && category !== "official";
+    shouldApplyLocalProxyRequestOverridesForApp(appId, category);
 
   const handleSubmit = async (values: ProviderFormData) => {
     const overridesResult = shouldApplyLocalProxyRequestOverrides

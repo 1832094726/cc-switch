@@ -1,7 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { normalizeCodexCatalogModelsForSave } from "@/components/providers/forms/ProviderForm";
+import {
+  normalizeCodexCatalogModelsForSave,
+  shouldApplyLocalProxyRequestOverridesForApp,
+} from "@/components/providers/forms/ProviderForm";
 
 describe("ProviderForm Codex catalog helpers", () => {
+  it("persists local proxy overrides for non-official Devin providers", () => {
+    expect(shouldApplyLocalProxyRequestOverridesForApp("devin", "custom")).toBe(
+      true,
+    );
+    expect(
+      shouldApplyLocalProxyRequestOverridesForApp("devin", "official"),
+    ).toBe(false);
+  });
+
   it("normalizes catalog rows and removes empty or duplicate models", () => {
     expect(
       normalizeCodexCatalogModelsForSave([
