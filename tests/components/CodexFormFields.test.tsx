@@ -55,8 +55,16 @@ const renderCodexForm = (overrides: Partial<CodexFormFieldsProps> = {}) => {
     onAutoSelectChange: vi.fn(),
     apiFormat: "openai_responses",
     onApiFormatChange: vi.fn(),
+    anthropicAuthField: "ANTHROPIC_AUTH_TOKEN",
+    onAnthropicAuthFieldChange: vi.fn(),
+    impersonateClaudeCode: false,
+    onImpersonateClaudeCodeChange: vi.fn(),
+    maxOutputTokens: "",
+    onMaxOutputTokensChange: vi.fn(),
     codexChatReasoning: {},
     onCodexChatReasoningChange: vi.fn(),
+    promptCacheRouting: "auto",
+    onPromptCacheRoutingChange: vi.fn(),
     catalogModels: [],
     onCatalogModelsChange: vi.fn(),
     speedTestEndpoints: [],
@@ -101,17 +109,19 @@ describe("CodexFormFields", () => {
   it("does not auto-expand advanced options for the default Responses format alone", () => {
     renderCodexForm();
 
-    expect(screen.queryByLabelText("自定义 User-Agent")).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("自定义 User-Agent"),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("高级选项")).toBeInTheDocument();
   });
 
   it("shows Anthropic Messages as a Codex upstream format", () => {
-    renderCodexForm({ apiFormat: "anthropic_messages" });
+    renderCodexForm({ apiFormat: "anthropic" });
 
     expect(screen.getByLabelText("自定义 User-Agent")).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "上游格式" })).toHaveTextContent(
-      "Anthropic Messages",
-    );
+    expect(
+      screen.getByRole("combobox", { name: "上游格式" }),
+    ).toHaveTextContent("Anthropic Messages");
   });
 
   it("renders Codex catalog rows that target Anthropic Messages upstream", () => {
@@ -129,9 +139,9 @@ describe("CodexFormFields", () => {
 
     expect(screen.getByDisplayValue("Claude Sonnet")).toBeInTheDocument();
     expect(screen.getByDisplayValue("claude-sonnet-4-6")).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "上游端点" })).toHaveTextContent(
-      "/v1/messages",
-    );
+    expect(
+      screen.getByRole("combobox", { name: "上游端点" }),
+    ).toHaveTextContent("/v1/messages");
   });
 
   it("uses the JoyCode official model list command and merges fetched models into the catalog", async () => {
@@ -166,14 +176,15 @@ describe("CodexFormFields", () => {
       onCatalogModelsChange,
     });
 
+    fireEvent.click(screen.getByRole("button", { name: "高级选项" }));
     fireEvent.click(
       screen.getByRole("button", { name: /providerForm.fetchModels/ }),
     );
 
     await waitFor(() => {
-      expect(modelFetchApiMock.fetchJoycodeModelsForConfig).toHaveBeenCalledWith(
-        '{ "ptKey": "pt-key", "tenant": "JD" }',
-      );
+      expect(
+        modelFetchApiMock.fetchJoycodeModelsForConfig,
+      ).toHaveBeenCalledWith('{ "ptKey": "pt-key", "tenant": "JD" }');
       expect(onCatalogModelsChange).toHaveBeenCalledWith(
         expect.arrayContaining([
           expect.objectContaining({

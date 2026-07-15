@@ -901,22 +901,22 @@ fn windsurf_joycode_catalog_models(base_url: &str, api_key: &str) -> Vec<Value> 
         devin_catalog_model(
             "MODEL_CLAUDE_4_OPUS_THINKING_BYOK",
             "Claude Opus 4 Thinking BYOK",
-            "GLM-5.1",
-            "/v1/chat/completions",
+            "joycode-claude",
+            "/v1/messages",
             base_url,
             api_key,
-            "bearer",
+            "x-api-key",
             None,
             None,
         ),
         devin_catalog_model(
             "MODEL_CLAUDE_4_OPUS_BYOK",
             "Claude Opus 4 BYOK",
-            "GLM-5.1",
-            "/v1/chat/completions",
+            "joycode-claude",
+            "/v1/messages",
             base_url,
             api_key,
-            "bearer",
+            "x-api-key",
             None,
             None,
         ),
@@ -1072,13 +1072,13 @@ fn merge_devin_catalog_models(settings_config: &mut Value, desired_models: Vec<V
         return false;
     };
 
-    let desired_keys: HashSet<String> = desired_models
+    let mut desired_by_key: HashMap<String, Value> = desired_models
         .iter()
         .filter_map(|model| {
             model
                 .get("model")
                 .and_then(Value::as_str)
-                .map(canonical_catalog_model_key)
+                .map(|name| (canonical_catalog_model_key(name), model.clone()))
         })
         .collect();
 
@@ -1097,12 +1097,16 @@ fn merge_devin_catalog_models(settings_config: &mut Value, desired_models: Vec<V
             .get("model")
             .and_then(Value::as_str)
             .map(canonical_catalog_model_key);
-        if key.as_ref().is_some_and(|key| {
-            !desired_keys.contains(key.as_str()) && is_devin_builtin_catalog_key(key)
-        }) {
-            continue;
-        }
         if let Some(key) = key {
+            if let Some(desired) = desired_by_key.remove(&key) {
+                if seen.insert(key) {
+                    merged.push(desired);
+                }
+                continue;
+            }
+            if is_devin_builtin_catalog_key(&key) {
+                continue;
+            }
             if !seen.insert(key) {
                 continue;
             }
@@ -1118,7 +1122,7 @@ fn merge_devin_catalog_models(settings_config: &mut Value, desired_models: Vec<V
         else {
             continue;
         };
-        if seen.insert(key) {
+        if desired_by_key.remove(&key).is_some() && seen.insert(key) {
             merged.push(item);
         }
     }
@@ -1201,7 +1205,9 @@ fn canonical_catalog_model_key(value: &str) -> String {
 #[cfg(test)]
 mod ensure_official_seed_tests {
     use crate::app_config::AppType;
-    use crate::database::{Database, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID};
+    use crate::database::{
+        Database, CLAUDE_DESKTOP_OFFICIAL_PROVIDER_ID, CODEX_OFFICIAL_PROVIDER_ID,
+    };
 
     #[test]
     fn ensure_inserts_when_missing() {
@@ -1258,6 +1264,25 @@ mod ensure_official_seed_tests {
             after.name, "My Custom Backup",
             "customization must not be overwritten"
         );
+    }
+
+    #[test]
+    fn ensure_recreates_codex_official_seed_after_deletion() {
+        let db = Database::memory().expect("memory db");
+        db.init_default_official_providers().expect("seed");
+        db.delete_provider(AppType::Codex.as_str(), CODEX_OFFICIAL_PROVIDER_ID)
+            .expect("delete Codex official");
+
+        let inserted = db
+            .ensure_official_seed_by_id(CODEX_OFFICIAL_PROVIDER_ID, AppType::Codex)
+            .expect("ensure Codex official");
+        assert!(inserted);
+        let provider = db
+            .get_provider_by_id(CODEX_OFFICIAL_PROVIDER_ID, AppType::Codex.as_str())
+            .expect("query")
+            .expect("Codex official restored");
+        assert_eq!(provider.category.as_deref(), Some("official"));
+        assert_eq!(provider.settings_config["auth"], serde_json::json!({}));
     }
 
     #[test]

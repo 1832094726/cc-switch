@@ -207,19 +207,12 @@ impl StreamCheckService {
         config: &StreamCheckConfig,
         base_url_override: Option<String>,
     ) -> Result<StreamCheckResult, AppError> {
-        let effective = Self::merge_provider_config(provider, config);
-
         let mut last_result: Option<StreamCheckResult> = None;
-        for attempt in 0..=effective.max_retries {
+        for attempt in 0..=config.max_retries {
             let start = Instant::now();
-            let result = Self::check_once(
-                app_type,
-                provider,
-                &effective,
-                base_url_override.clone(),
-                start,
-            )
-            .await?;
+            let result =
+                Self::check_once(app_type, provider, config, base_url_override.clone(), start)
+                    .await?;
 
             if result.success {
                 return Ok(StreamCheckResult {
@@ -229,7 +222,7 @@ impl StreamCheckService {
             }
 
             // 仅超时 / abort 类网络抖动值得重试；连接被拒、DNS 失败等立即返回。
-            if Self::should_retry(&result.message) && attempt < effective.max_retries {
+            if Self::should_retry(&result.message) && attempt < config.max_retries {
                 last_result = Some(result);
                 continue;
             }
@@ -247,7 +240,7 @@ impl StreamCheckService {
             http_status: None,
             model_used: String::new(),
             tested_at: chrono::Utc::now().timestamp(),
-            retry_count: effective.max_retries,
+            retry_count: config.max_retries,
             error_category: None,
         }))
     }
@@ -324,6 +317,12 @@ impl StreamCheckService {
     /// 没有 cc-switch 能可靠探测的目标——这类供应商的连通检测按钮在前端已隐藏
     /// （见 `ProviderCard.tsx`），故此处对其提取失败直接报错即可，不做官方端点回退。
     fn resolve_base_url(app_type: &AppType, provider: &Provider) -> Result<String, AppError> {
+        if provider.category.as_deref() == Some("official") {
+            return Err(AppError::Message(
+                "Official providers do not expose a reachability-check target".to_string(),
+            ));
+        }
+
         match app_type {
             // 累加模式应用的 settings_config 结构与 Claude/Codex/Gemini 不同，
             // 不走 adapter，直接按各自约定提取 base_url。
@@ -2187,5 +2186,10 @@ mod tests {
         // 不会走到这里；不做官方端点回退（避免给忘填地址的第三方误显绿灯）。
         let empty = make_provider(serde_json::json!({ "env": {} }));
         assert!(StreamCheckService::resolve_base_url(&AppType::Claude, &empty).is_err());
+
+        let mut official = make_provider(serde_json::json!({ "auth": {}, "config": "" }));
+        official.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        official.category = Some("official".to_string());
+        assert!(StreamCheckService::resolve_base_url(&AppType::Codex, &official).is_err());
     }
 }
