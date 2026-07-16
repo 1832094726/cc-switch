@@ -272,7 +272,11 @@ pub async fn handle_devin_windsurf_get_chat_message(
 
     let upstream_status = response.status().as_u16();
     let mut upstream_stream = response.bytes_stream();
-    let first_chunk = upstream_stream.next().await.transpose()?;
+    let first_chunk = upstream_stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| ProxyError::ForwardFailed(format!("Failed to read JoyCode SSE: {e}")))?;
     let upstream_stream = match first_chunk {
         Some(first_chunk) if first_chunk.starts_with(&[0x1f, 0x8b]) => {
             // JoyCode gateway can return gzip-compressed SSE without a
@@ -280,7 +284,10 @@ pub async fn handle_devin_windsurf_get_chat_message(
             // attempts to parse SSE frames.
             let mut compressed = first_chunk.to_vec();
             while let Some(chunk) = upstream_stream.next().await {
-                compressed.extend_from_slice(&chunk?);
+                let chunk = chunk.map_err(|e| {
+                    ProxyError::ForwardFailed(format!("Failed to read JoyCode SSE: {e}"))
+                })?;
+                compressed.extend_from_slice(&chunk);
             }
             let decoded = decompress_body("gzip", &compressed)
                 .map_err(|e| {
