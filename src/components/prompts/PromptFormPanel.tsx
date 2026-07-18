@@ -30,6 +30,7 @@ const PromptFormPanel: React.FC<PromptFormPanelProps> = ({
     codex: "AGENTS.md",
     devin: "AGENTS.md",
     gemini: "GEMINI.md",
+    grokbuild: "AGENTS.md",
     opencode: "AGENTS.md",
     openclaw: "AGENTS.md",
     hermes: "AGENTS.md",

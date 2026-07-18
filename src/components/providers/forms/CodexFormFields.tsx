@@ -49,13 +49,14 @@ import type {
   PromptCacheRoutingMode,
   ProviderCategory,
 } from "@/types";
+import type { AppId } from "@/lib/api";
 
 interface EndpointCandidate {
   url: string;
 }
 
 interface CodexFormFieldsProps {
-  appId?: "codex" | "devin";
+  appId?: AppId;
   providerId?: string;
   // API Key
   codexApiKey: string;
@@ -1721,7 +1722,7 @@ export function CodexFormFields({
       {/* 端点测速弹窗 - Codex */}
       {shouldShowSpeedTest && isEndpointModalOpen && (
         <EndpointSpeedTest
-          appId="codex"
+          appId={appId}
           providerId={providerId}
           value={codexBaseUrl}
           onChange={onBaseUrlChange}

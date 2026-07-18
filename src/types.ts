@@ -309,6 +309,7 @@ export interface VisibleApps {
   codex: boolean;
   devin: boolean;
   gemini: boolean;
+  grokbuild: boolean;
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;
@@ -423,6 +424,8 @@ export interface Settings {
   codexConfigDir?: string;
   // 覆盖 Gemini 配置目录（可选）
   geminiConfigDir?: string;
+  // 覆盖 Grok Build 配置目录（可选）
+  grokConfigDir?: string;
   // 覆盖 OpenCode 配置目录（可选）
   opencodeConfigDir?: string;
   // 覆盖 OpenClaw 配置目录（可选）
@@ -520,6 +523,7 @@ export interface McpApps {
   codex: boolean;
   devin?: boolean;
   gemini: boolean;
+  grokbuild?: boolean;
   opencode: boolean;
   openclaw: boolean;
   hermes: boolean;

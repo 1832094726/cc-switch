@@ -177,6 +177,7 @@ export type AppType =
   | "codex"
   | "devin"
   | "gemini"
+  | "grokbuild"
   | "opencode";
 
 export type AppTypeFilter = "all" | AppType;
@@ -186,6 +187,7 @@ export const KNOWN_APP_TYPES: ReadonlyArray<AppType> = [
   "codex",
   "devin",
   "gemini",
+  "grokbuild",
   "opencode",
 ];
 
@@ -205,6 +207,7 @@ export const CACHE_INCLUSIVE_APP_TYPES: ReadonlySet<string> = new Set([
   "codex",
   "devin",
   "gemini",
+  "grokbuild",
 ]);
 
 /** Subset of request-log fields needed to derive cache-normalized input. */

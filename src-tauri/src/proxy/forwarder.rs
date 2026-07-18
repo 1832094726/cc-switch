@@ -1462,9 +1462,9 @@ impl RequestForwarder {
         // Codex upstream conversion mode — computed early because the [1m]-suffix strip
         // below must be skipped on the Anthropic path (the marker has to survive to
         // catalog matching and to the transform's own strip+beta detection).
-        let codex_responses_to_chat = matches!(app_type, AppType::Codex)
+        let codex_responses_to_chat = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_chat(provider, endpoint);
-        let codex_responses_to_anthropic = matches!(app_type, AppType::Codex)
+        let codex_responses_to_anthropic = matches!(app_type, AppType::Codex | AppType::GrokBuild)
             && super::providers::should_convert_codex_responses_to_anthropic(provider, endpoint);
         let codex_official_auth_passthrough = matches!(app_type, AppType::Codex)
             && super::providers::is_codex_official_provider(provider);
@@ -1492,6 +1492,13 @@ impl RequestForwarder {
         // 旧版本生成的这些标签会缓存在客户端对话历史中并被回放，
         // 导致 thinking 内容泄漏到可见对话内容。
         mapped_body = super::copilot_optimizer::strip_thinking_blocks(mapped_body);
+
+        // Grok Build exposes a stable client-side model profile in config.toml.
+        // Route requests to the provider's real upstream model before applying
+        // the optional Responses -> Chat/Anthropic bridge.
+        if matches!(app_type, AppType::GrokBuild) {
+            super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
+        }
 
         if is_copilot {
             mapped_body =
@@ -2084,7 +2091,10 @@ impl RequestForwarder {
             request_body = normalize_joycode_anthropic_thinking(request_body);
         }
 
-        if matches!(app_type, AppType::Codex | AppType::Devin) {
+        if matches!(
+            app_type,
+            AppType::Codex | AppType::Devin | AppType::GrokBuild
+        ) {
             self.apply_media_prevention(&mut request_body, provider);
         }
 
@@ -2783,6 +2793,7 @@ impl RequestForwarder {
                 AppType::ClaudeDesktop => "ClaudeDesktop",
                 AppType::Codex => "Codex",
                 AppType::Gemini => "Gemini",
+                AppType::GrokBuild => "GrokBuild",
                 AppType::OpenCode => "OpenCode",
                 AppType::OpenClaw => "OpenClaw",
                 AppType::Hermes => "Hermes",

@@ -64,6 +64,7 @@ const APP_FILTER_ICON: Record<AppType, string> = {
   codex: "openai",
   devin: "devin",
   gemini: "gemini",
+  grokbuild: "grok",
   opencode: "opencode",
 };
 

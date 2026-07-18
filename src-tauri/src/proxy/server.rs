@@ -483,6 +483,12 @@ impl ProxyServer {
                 "/devin/v1/responses",
                 post(handlers::handle_devin_responses),
             )
+            // Grok Build uses the Responses protocol but has an independent
+            // provider namespace and failover queue.
+            .route(
+                "/grokbuild/v1/responses",
+                post(handlers::handle_grokbuild_responses),
+            )
             // OpenAI Responses Compact API (Codex CLI 远程压缩，透传)
             .route(
                 "/responses/compact",
@@ -503,6 +509,10 @@ impl ProxyServer {
             .route(
                 "/devin/v1/responses/compact",
                 post(handlers::handle_devin_responses_compact),
+            )
+            .route(
+                "/grokbuild/v1/responses/compact",
+                post(handlers::handle_grokbuild_responses_compact),
             )
             // Gemini API (支持带前缀和不带前缀)
             //

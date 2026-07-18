@@ -114,6 +114,7 @@ pub struct ProxyTakeoverStatus {
     pub codex: bool,
     pub gemini: bool,
     pub devin: bool,
+    pub grokbuild: bool,
     pub opencode: bool,
     pub openclaw: bool,
 }

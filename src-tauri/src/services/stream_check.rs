@@ -1883,7 +1883,7 @@ impl StreamCheckService {
                 Self::extract_env_model(provider, "ANTHROPIC_MODEL")
                     .unwrap_or_else(|| config.claude_model.clone())
             }
-            AppType::Codex | AppType::Devin => {
+            AppType::Codex | AppType::GrokBuild | AppType::Devin => {
                 Self::extract_codex_model(provider).unwrap_or_else(|| config.codex_model.clone())
             }
             AppType::Gemini => Self::extract_env_model(provider, "GEMINI_MODEL")
