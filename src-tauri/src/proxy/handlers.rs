@@ -271,8 +271,50 @@ pub async fn handle_devin_windsurf_get_chat_message(
     }
 
     let upstream_status = response.status().as_u16();
+    let mut upstream_stream = response.bytes_stream();
+    let first_chunk = upstream_stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| ProxyError::ForwardFailed(format!("Failed to read JoyCode SSE: {e}")))?;
+    let upstream_stream = match first_chunk {
+        Some(first_chunk) if first_chunk.starts_with(&[0x1f, 0x8b]) => {
+            // JoyCode gateway can return gzip-compressed SSE without a
+            // content-encoding header. Decode it before the Connect-RPC bridge
+            // attempts to parse SSE frames.
+            let mut compressed = first_chunk.to_vec();
+            while let Some(chunk) = upstream_stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    ProxyError::ForwardFailed(format!("Failed to read JoyCode SSE: {e}"))
+                })?;
+                compressed.extend_from_slice(&chunk);
+            }
+            let decoded = decompress_body("gzip", &compressed)
+                .map_err(|e| {
+                    ProxyError::ForwardFailed(format!("Failed to decompress JoyCode SSE: {e}"))
+                })?
+                .ok_or_else(|| {
+                    ProxyError::ForwardFailed(
+                        "JoyCode SSE gzip payload could not be decompressed".to_string(),
+                    )
+                })?;
+            log::info!(
+                "[Devin/Windsurf] Decoded unlabelled gzip upstream SSE: {} -> {} bytes",
+                compressed.len(),
+                decoded.len()
+            );
+            futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(decoded)) })
+                .boxed()
+        }
+        Some(first_chunk) => {
+            futures::stream::once(async move { Ok::<Bytes, std::io::Error>(first_chunk) })
+                .chain(upstream_stream)
+                .boxed()
+        }
+        None => futures::stream::empty().boxed(),
+    };
     let logged_upstream = create_logged_passthrough_stream(
-        response.bytes_stream(),
+        upstream_stream,
         ctx.tag,
         create_usage_collector(&ctx, &state, upstream_status, &DEVIN_PARSER_CONFIG),
         ctx.streaming_timeout_config(),
