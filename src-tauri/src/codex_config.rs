@@ -1294,6 +1294,22 @@ fn set_codex_experimental_bearer_token(config_text: &str, token: &str) -> Result
     Ok(doc.to_string())
 }
 
+fn remove_codex_api_key_auth_preference(config_text: &str) -> Result<String, AppError> {
+    let mut doc = config_text
+        .parse::<DocumentMut>()
+        .map_err(|e| AppError::Message(format!("Invalid Codex config.toml: {e}")))?;
+
+    let forces_api_key = doc
+        .get("preferred_auth_method")
+        .and_then(|item| item.as_str())
+        .is_some_and(|method| method.eq_ignore_ascii_case("apikey"));
+    if forces_api_key {
+        doc.remove("preferred_auth_method");
+    }
+
+    Ok(doc.to_string())
+}
+
 pub fn remove_codex_experimental_bearer_token_if(
     config_text: &str,
     predicate: impl Fn(&str) -> bool,
@@ -1748,7 +1764,10 @@ pub fn prepare_codex_provider_live_config(
         .or_else(|| extract_codex_experimental_bearer_token(config_text));
 
     Ok(match token {
-        Some(token) => set_codex_experimental_bearer_token(config_text, &token)?,
+        Some(token) => {
+            let live_config = set_codex_experimental_bearer_token(config_text, &token)?;
+            remove_codex_api_key_auth_preference(&live_config)?
+        }
         None => config_text.to_string(),
     })
 }
@@ -2251,6 +2270,31 @@ model = "gpt-5"
         assert!(
             parsed.get("model_providers").is_none(),
             "reserved provider tables should not be synthesized"
+        );
+    }
+
+    #[test]
+    fn prepare_provider_live_config_does_not_force_api_key_auth_preference() {
+        let input = r#"model_provider = "custom"
+preferred_auth_method = "apikey"
+
+[model_providers.custom]
+base_url = "https://example.com/v1"
+wire_api = "responses"
+"#;
+
+        let output =
+            prepare_codex_provider_live_config(&json!({"OPENAI_API_KEY": "sk-test"}), input)
+                .expect("prepare live config");
+        let parsed: toml::Value = toml::from_str(&output).expect("parse output");
+
+        assert!(
+            parsed.get("preferred_auth_method").is_none(),
+            "preserved ChatGPT login must not be hidden by an API-key preference"
+        );
+        assert_eq!(
+            extract_codex_experimental_bearer_token(&output).as_deref(),
+            Some("sk-test")
         );
     }
 
